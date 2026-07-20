@@ -118,6 +118,8 @@ The high-level MCP tools are:
 
 ## MCP
 
+Local only. Analysis uses **your machine** CPU/RAM.
+
 ```json
 {
   "mcpServers": {
@@ -128,11 +130,32 @@ The high-level MCP tools are:
 }
 ```
 
-Run locally (uses your machine CPU/RAM):
+### One-click start
+
+| OS | Command |
+|----|---------|
+| macOS | `./deploy/local/start-macos.sh` |
+| Linux | `./deploy/local/start-linux.sh` |
+| Windows | `deploy/local/start-windows.cmd` |
+
+Release packages (GitHub Releases) ship the binary next to the starter:
+
+| Package | Contents |
+|---------|----------|
+| `revx-mcp-macos-arm64` | `revx-engine` + `start.sh` |
+| `revx-mcp-macos-x64` | `revx-engine` + `start.sh` |
+| `revx-mcp-linux-x64` | `revx-engine` + `start.sh` |
+| `revx-mcp-windows-x64` | `revx-engine.exe` + `start.cmd` |
 
 ```bash
-revx-engine mcp http --bind 127.0.0.1:9310 --workspace /path/to/project
+# from a release folder
+./start.sh          # macOS / Linux
+start.cmd           # Windows
 ```
+
+Stop: `./deploy/local/stop-macos.sh` / `stop-linux.sh` / `stop-windows.ps1`
+
+Publish builds: push a tag `v0.1.0` (workflow `.github/workflows/release.yml`).
 
 
 ## Build and smoke

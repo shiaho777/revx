@@ -1,0 +1,128 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            target: aarch64-apple-darwin
+            asset: revx-mcp-macos-arm64
+            starter: start-macos.sh
+            stopper: stop-macos.sh
+            bin: revx-engine
+          - os: macos-13
+            target: x86_64-apple-darwin
+            asset: revx-mcp-macos-x64
+            starter: start-macos.sh
+            stopper: stop-macos.sh
+            bin: revx-engine
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            asset: revx-mcp-linux-x64
+            starter: start-linux.sh
+            stopper: stop-linux.sh
+            bin: revx-engine
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            asset: revx-mcp-windows-x64
+            starter: start-windows.ps1
+            stopper: stop-windows.ps1
+            bin: revx-engine.exe
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+      - name: Install linux deps
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev pkg-config
+      - name: Build
+        shell: bash
+        run: cargo build -p revx-engine --release --target ${{ matrix.target }}
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          out="dist/${{ matrix.asset }}"
+          mkdir -p "$out"
+          bin_src="target/${{ matrix.target }}/release/${{ matrix.bin }}"
+          cp "$bin_src" "$out/${{ matrix.bin }}"
+          if [[ "${{ runner.os }}" != "Windows" ]]; then
+            chmod +x "$out/${{ matrix.bin }}"
+            cp "deploy/local/${{ matrix.starter }}" "$out/start.sh"
+            cp "deploy/local/${{ matrix.stopper }}" "$out/stop.sh"
+            chmod +x "$out/start.sh" "$out/stop.sh"
+          else
+            cp "deploy/local/start-windows.ps1" "$out/start.ps1"
+            cp "deploy/local/start-windows.cmd" "$out/start.cmd"
+            cp "deploy/local/stop-windows.ps1" "$out/stop.ps1"
+          fi
+          cat > "$out/MCP.txt" << TXT
+ReVX local MCP
+
+Start:
+  macOS/Linux: ./start.sh
+  Windows:     start.cmd   (or: powershell -File .\\start.ps1)
+
+Endpoint:
+  http://127.0.0.1:9310/mcp
+
+Codex config:
+  [mcp_servers.revx]
+  url = "http://127.0.0.1:9310/mcp"
+TXT
+          mkdir -p dist
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            powershell -NoProfile -Command "Compress-Archive -Path '$out\\*' -DestinationPath 'dist\\${{ matrix.asset }}.zip' -Force"
+          else
+            tar -C dist -czf "dist/${{ matrix.asset }}.tar.gz" "${{ matrix.asset }}"
+          fi
+          ls -la dist
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Flatten assets
+        run: |
+          mkdir -p release-assets
+          find artifacts -type f \( -name '*.tar.gz' -o -name '*.zip' \) -exec cp {} release-assets/ \;
+          ls -la release-assets
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release-assets/*
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
