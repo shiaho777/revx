@@ -1,0 +1,11 @@
+[package]
+name = "revx-arch-x64"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+hex.workspace = true
+iced-x86.workspace = true
+revx-core = { path = "../revx-core" }

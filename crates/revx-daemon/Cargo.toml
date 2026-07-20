@@ -1,0 +1,29 @@
+[package]
+name = "revx-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[features]
+default = []
+full-loader = ["revx-loader/full"]
+
+[dependencies]
+anyhow.workspace = true
+blake3.workspace = true
+chrono.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+revx-analysis = { path = "../revx-analysis" }
+revx-core = { path = "../revx-core" }
+revx-loader = { path = "../revx-loader", default-features = false }
+revx-workspace = { path = "../revx-workspace", default-features = false }
+
+[dev-dependencies]
+tar.workspace = true
+tempfile.workspace = true
+zip.workspace = true

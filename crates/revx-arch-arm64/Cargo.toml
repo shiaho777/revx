@@ -1,0 +1,12 @@
+[package]
+name = "revx-arch-arm64"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+hex.workspace = true
+revx-core = { path = "../revx-core" }
+yaxpeax-arch.workspace = true
+yaxpeax-arm.workspace = true
