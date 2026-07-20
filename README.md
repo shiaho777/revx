@@ -62,7 +62,7 @@ The public command surface is constrained to the v1 plan:
 - `revx brief <query>`
 - `revx report generate <topic>`
 - `revx trace import <file>`
-- `revx mcp serve`
+- `revx mcp serve|doctor|config|install`
 
 ## Workspace authority
 
@@ -112,6 +112,30 @@ The high-level MCP tools are:
 - `analysis_brief`
 - `trace_import`
 - `trace_query`
+
+## MCP Server deploy
+
+ReVX ships as an **MCP Server** (`revx-engine mcp serve`). An MCP **Host** (Codex / Cursor / Claude Desktop) spawns that process over stdio. The CLI binary is the deploy/entrypoint and human interface, not the Host.
+
+One-click install + config samples:
+
+```bash
+./deploy/mcp/one-click.sh
+```
+
+Then point the Host at:
+
+```bash
+~/.local/bin/revx-engine mcp serve --workspace /path/to/project
+```
+
+Details, host templates, and doctor checks: [deploy/mcp/README.md](deploy/mcp/README.md).
+
+```bash
+revx-engine mcp doctor --workspace .
+revx-engine mcp config --host cursor --workspace .
+revx mcp serve --workspace .   # thin CLI forwards to engine
+```
 
 ## Build and smoke
 
