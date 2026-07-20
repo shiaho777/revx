@@ -1,8 +1,0 @@
-{
-  "mcpServers": {
-    "revx": {
-      "command": "__REVX_ENGINE__",
-      "args": ["mcp", "serve", "--workspace", "__REVX_WORKSPACE__"]
-    }
-  }
-}
