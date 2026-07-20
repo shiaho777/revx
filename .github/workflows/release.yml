@@ -77,20 +77,20 @@ jobs:
             cp "deploy/local/start-windows.cmd" "$out/start.cmd"
             cp "deploy/local/stop-windows.ps1" "$out/stop.ps1"
           fi
-          cat > "$out/MCP.txt" << TXT
-ReVX local MCP
-
-Start:
-  macOS/Linux: ./start.sh
-  Windows:     start.cmd   (or: powershell -File .\\start.ps1)
-
-Endpoint:
-  http://127.0.0.1:9310/mcp
-
-Codex config:
-  [mcp_servers.revx]
-  url = "http://127.0.0.1:9310/mcp"
-TXT
+          {
+            echo 'ReVX local MCP'
+            echo
+            echo 'Start:'
+            echo '  macOS/Linux: ./start.sh'
+            echo '  Windows:     start.cmd'
+            echo
+            echo 'Endpoint:'
+            echo '  http://127.0.0.1:9310/mcp'
+            echo
+            echo 'Codex config:'
+            echo '  [mcp_servers.revx]'
+            echo '  url = "http://127.0.0.1:9310/mcp"'
+          } > "$out/MCP.txt"
           mkdir -p dist
           if [[ "${{ runner.os }}" == "Windows" ]]; then
             powershell -NoProfile -Command "Compress-Archive -Path '$out\\*' -DestinationPath 'dist\\${{ matrix.asset }}.zip' -Force"
