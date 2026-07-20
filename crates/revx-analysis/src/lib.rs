@@ -214,6 +214,37 @@ enum ByteSource {
     },
 }
 
+fn read_file_exact_at(file: &std::fs::File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileExt;
+        return FileExt::read_exact_at(file, buf, offset);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileExt;
+        let mut done = 0usize;
+        while done < buf.len() {
+            let n = file.seek_read(&mut buf[done..], offset.saturating_add(done as u64))?;
+            if n == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "failed to fill whole buffer",
+                ));
+            }
+            done += n;
+        }
+        return Ok(());
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut cloned = file.try_clone()?;
+        cloned.seek(SeekFrom::Start(offset))?;
+        cloned.read_exact(buf)
+    }
+}
+
 struct CodeRegion {
     start: u64,
     end: u64,
@@ -246,8 +277,7 @@ impl CodeRegion {
                 }
                 let size = size.min(region_size - offset);
                 let mut buf = vec![0u8; size];
-                use std::os::unix::fs::FileExt;
-                file.read_exact_at(&mut buf, file_offset.saturating_add(offset as u64))
+                read_file_exact_at(file, &mut buf, file_offset.saturating_add(offset as u64))
                     .ok()?;
                 Some(buf)
             }

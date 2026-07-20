@@ -1,8 +1,38 @@
 use std::env;
 use std::fs::File;
 use std::io::Write;
-use std::os::unix::fs::FileExt;
 use std::path::Path;
+
+fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileExt;
+        return FileExt::read_exact_at(file, buf, offset);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileExt;
+        let mut done = 0usize;
+        while done < buf.len() {
+            let n = file.seek_read(&mut buf[done..], offset.saturating_add(done as u64))?;
+            if n == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "failed to fill whole buffer",
+                ));
+            }
+            done += n;
+        }
+        return Ok(());
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut cloned = file.try_clone()?;
+        cloned.seek(SeekFrom::Start(offset))?;
+        cloned.read_exact(buf)
+    }
+}
 
 const MAX_FUNCS: usize = 16;
 const MAX_WINDOW: usize = 256;
@@ -31,7 +61,7 @@ fn analyze(path: &Path) -> Result<(), String> {
     }
 
     let mut ehdr = [0u8; 64];
-    file.read_exact_at(&mut ehdr, 0).map_err(|e| e.to_string())?;
+    read_exact_at(&file, &mut ehdr, 0).map_err(|e| e.to_string())?;
     if &ehdr[0..4] != b"\x7fELF" {
         return Err("not ELF".into());
     }
@@ -57,7 +87,7 @@ fn analyze(path: &Path) -> Result<(), String> {
     for i in 0..e_shnum {
         let mut sh = [0u8; 64];
         let off = e_shoff.saturating_add(i.saturating_mul(e_shentsize));
-        file.read_exact_at(&mut sh, off).map_err(|e| e.to_string())?;
+        read_exact_at(&file, &mut sh, off).map_err(|e| e.to_string())?;
         let sh_type = u32::from_le_bytes(sh[4..8].try_into().unwrap());
         let sh_addr = u64::from_le_bytes(sh[16..24].try_into().unwrap());
         let sh_offset = u64::from_le_bytes(sh[24..32].try_into().unwrap());
@@ -87,7 +117,7 @@ fn analyze(path: &Path) -> Result<(), String> {
         let str_size = shdrs.get(sh_link as usize).map(|s| s.3).unwrap_or(0) as usize;
         let mut strtab = vec![0u8; str_size.min(256 * 1024)];
         if !strtab.is_empty() {
-            let _ = file.read_exact_at(&mut strtab, str_off);
+            let _ = read_exact_at(&file, &mut strtab, str_off);
         }
         for i in 0..count {
             if exports.len() >= MAX_FUNCS {
@@ -95,7 +125,7 @@ fn analyze(path: &Path) -> Result<(), String> {
             }
             let mut ent = [0u8; 24];
             let off = sh_offset.saturating_add((i as u64).saturating_mul(sh_entsize));
-            if file.read_exact_at(&mut ent, off).is_err() {
+            if read_exact_at(&file, &mut ent, off).is_err() {
                 break;
             }
             let st_name = u32::from_le_bytes(ent[0..4].try_into().unwrap()) as usize;
@@ -184,7 +214,7 @@ fn read_window(
             return None;
         }
         let mut buf = vec![0u8; len];
-        file.read_exact_at(&mut buf, file_off.saturating_add(offset))
+        read_exact_at(&file, &mut buf, file_off.saturating_add(offset))
             .ok()?;
         return Some(buf);
     }
