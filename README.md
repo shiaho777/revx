@@ -115,20 +115,24 @@ The high-level MCP tools are:
 
 
 
+
 ## MCP
 
 ```json
 {
   "mcpServers": {
     "revx": {
-      "url": "https://api.shiaho.sbs/mcp"
+      "url": "http://127.0.0.1:9310/mcp"
     }
   }
 }
 ```
 
-Local stdio: `revx-engine mcp serve --workspace /path/to/project`  
-HTTP: `revx-engine mcp http --bind 127.0.0.1:9310 --workspace /path/to/project`
+Run locally (uses your machine CPU/RAM):
+
+```bash
+revx-engine mcp http --bind 127.0.0.1:9310 --workspace /path/to/project
+```
 
 
 ## Build and smoke
