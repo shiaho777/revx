@@ -42,6 +42,9 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tracing::warn;
 
+mod mcp_http;
+pub use mcp_http::serve_mcp_http;
+
 const IBC_CONTINUUM_LEDGER_CACHE: &str = "ibc_continuum_ledger.json";
 
 #[derive(Clone)]
