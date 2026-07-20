@@ -1,4 +1,3 @@
-mod tui;
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use revx_core::{
@@ -82,7 +81,6 @@ enum Command {
     Daemon(DaemonCommands),
     #[command(subcommand)]
     Mcp(McpCommands),
-    Tui,
 }
 
 #[derive(Args)]
@@ -660,7 +658,6 @@ async fn main() -> Result<()> {
         Command::Daemon(DaemonCommands::Status) => cmd_daemon_status(),
         Command::Daemon(DaemonCommands::Stop) => cmd_daemon_stop(),
         Command::Mcp(McpCommands::Serve) => cmd_mcp_serve().await,
-        Command::Tui => cmd_tui().await,
     }
 }
 
@@ -1201,11 +1198,6 @@ fn cmd_daemon_stop() -> Result<()> {
 async fn cmd_mcp_serve() -> Result<()> {
     let workspace_dir = workspace_parent_from_cwd()?;
     serve_mcp_stdio(workspace_dir).await
-}
-
-async fn cmd_tui() -> Result<()> {
-    let workspace_root = workspace_parent_from_cwd()?;
-    tui::run(workspace_root)
 }
 
 fn workspace_from_cwd() -> Result<Workspace> {
