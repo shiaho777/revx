@@ -583,9 +583,46 @@ enum DaemonCommands {
     Stop,
 }
 
+#[derive(ValueEnum, Clone, Copy, Debug)]
+enum McpHost {
+    Generic,
+    Cursor,
+    Claude,
+    Codex,
+}
+
 #[derive(Subcommand)]
 enum McpCommands {
-    Serve,
+    Serve {
+        #[arg(long, short = 'C')]
+        workspace: Option<PathBuf>,
+        #[arg(long, default_value_t = false)]
+        init: bool,
+    },
+    Doctor {
+        #[arg(long, short = 'C')]
+        workspace: Option<PathBuf>,
+    },
+    Config {
+        #[arg(long, value_enum, default_value_t = McpHost::Generic)]
+        host: McpHost,
+        #[arg(long, short = 'C')]
+        workspace: Option<PathBuf>,
+        #[arg(long)]
+        bin: Option<PathBuf>,
+    },
+    Install {
+        #[arg(long)]
+        prefix: Option<PathBuf>,
+        #[arg(long, short = 'C')]
+        workspace: Option<PathBuf>,
+        #[arg(long, value_enum)]
+        host: Vec<McpHost>,
+        #[arg(long, default_value_t = false)]
+        write_config: bool,
+        #[arg(long, default_value_t = false)]
+        init_workspace: bool,
+    },
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -657,7 +694,22 @@ async fn main() -> Result<()> {
         Command::Daemon(DaemonCommands::Start) => cmd_daemon_start().await,
         Command::Daemon(DaemonCommands::Status) => cmd_daemon_status(),
         Command::Daemon(DaemonCommands::Stop) => cmd_daemon_stop(),
-        Command::Mcp(McpCommands::Serve) => cmd_mcp_serve().await,
+        Command::Mcp(McpCommands::Serve { workspace, init }) => {
+            cmd_mcp_serve(workspace, init).await
+        }
+        Command::Mcp(McpCommands::Doctor { workspace }) => cmd_mcp_doctor(workspace),
+        Command::Mcp(McpCommands::Config {
+            host,
+            workspace,
+            bin,
+        }) => cmd_mcp_config(host, workspace, bin),
+        Command::Mcp(McpCommands::Install {
+            prefix,
+            workspace,
+            host,
+            write_config,
+            init_workspace,
+        }) => cmd_mcp_install(prefix, workspace, host, write_config, init_workspace),
     }
 }
 
@@ -1195,9 +1247,268 @@ fn cmd_daemon_stop() -> Result<()> {
     Ok(())
 }
 
-async fn cmd_mcp_serve() -> Result<()> {
-    let workspace_dir = workspace_parent_from_cwd()?;
-    serve_mcp_stdio(workspace_dir).await
+async fn cmd_mcp_serve(workspace: Option<PathBuf>, init: bool) -> Result<()> {
+    let project = resolve_mcp_project_root(workspace, init)?;
+    serve_mcp_stdio(project).await
+}
+
+fn cmd_mcp_doctor(workspace: Option<PathBuf>) -> Result<()> {
+    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("revx-engine"));
+    println!("revx-engine: {}", exe.display());
+    println!("version: {}", env!("CARGO_PKG_VERSION"));
+    match resolve_mcp_project_root(workspace, false) {
+        Ok(project) => {
+            let revx = project.join(".revx");
+            println!("workspace: {}", project.display());
+            println!("revx_dir: {}", revx.display());
+            println!("project_toml: {}", revx.join("project.toml").exists());
+            println!("state_sqlite: {}", revx.join("state.sqlite").exists());
+            match Workspace::open(&project) {
+                Ok(ws) => match ws.project_config() {
+                    Ok(cfg) => {
+                        println!("schema_version: {}", cfg.schema_version);
+                        println!("project_name: {}", cfg.name);
+                        println!("status: ok");
+                    }
+                    Err(err) => {
+                        println!("status: workspace_open_ok_config_error");
+                        println!("error: {err:#}");
+                    }
+                },
+                Err(err) => {
+                    println!("status: workspace_error");
+                    println!("error: {err:#}");
+                }
+            }
+        }
+        Err(err) => {
+            println!("workspace: unresolved");
+            println!("status: missing_workspace");
+            println!("error: {err:#}");
+            println!("hint: revx-engine mcp serve --workspace <path> --init");
+        }
+    }
+    Ok(())
+}
+
+fn cmd_mcp_config(
+    host: McpHost,
+    workspace: Option<PathBuf>,
+    bin: Option<PathBuf>,
+) -> Result<()> {
+    let engine = resolve_engine_bin(bin)?;
+    let project = match workspace {
+        Some(path) => canonicalize_path(&path)?,
+        None => match resolve_mcp_project_root(None, false) {
+            Ok(path) => path,
+            Err(_) => std::env::current_dir()?,
+        },
+    };
+    print!("{}", render_mcp_host_config(host, &engine, &project));
+    Ok(())
+}
+
+fn cmd_mcp_install(
+    prefix: Option<PathBuf>,
+    workspace: Option<PathBuf>,
+    hosts: Vec<McpHost>,
+    write_config: bool,
+    init_workspace: bool,
+) -> Result<()> {
+    let prefix = expand_user_path(prefix.unwrap_or_else(default_install_prefix))?;
+    let bin_dir = prefix.join("bin");
+    let conf_dir = prefix.join("share/revx/mcp");
+    fs::create_dir_all(&bin_dir)?;
+    fs::create_dir_all(&conf_dir)?;
+
+    let current = std::env::current_exe().context("failed to resolve current executable")?;
+    let engine_dst = bin_dir.join("revx-engine");
+    fs::copy(&current, &engine_dst).with_context(|| {
+        format!(
+            "failed to install {} -> {}",
+            current.display(),
+            engine_dst.display()
+        )
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(&engine_dst)?.permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&engine_dst, perms)?;
+    }
+
+    let project = resolve_mcp_project_root(workspace, init_workspace).unwrap_or_else(|_| {
+        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+    });
+    if init_workspace && !project.join(".revx").exists() {
+        let _ = resolve_mcp_project_root(Some(project.clone()), true)?;
+    }
+
+    let host_list = if hosts.is_empty() {
+        vec![
+            McpHost::Generic,
+            McpHost::Cursor,
+            McpHost::Claude,
+            McpHost::Codex,
+        ]
+    } else {
+        hosts
+    };
+
+    println!("installed: {}", engine_dst.display());
+    println!("workspace: {}", project.display());
+
+    for host in host_list {
+        let body = render_mcp_host_config(host, &engine_dst, &project);
+        let name = match host {
+            McpHost::Generic => "generic.mcp.json",
+            McpHost::Cursor => "cursor.mcp.json",
+            McpHost::Claude => "claude_desktop.mcp.json",
+            McpHost::Codex => "codex.mcp.json",
+        };
+        let path = conf_dir.join(name);
+        if write_config {
+            fs::write(&path, &body)?;
+            println!("config: {}", path.display());
+        } else {
+            println!("--- {} ---", name);
+            print!("{body}");
+        }
+    }
+
+    println!("serve: {} mcp serve --workspace {}", engine_dst.display(), project.display());
+    println!("doctor: {} mcp doctor --workspace {}", engine_dst.display(), project.display());
+    Ok(())
+}
+
+fn default_install_prefix() -> PathBuf {
+    home_dir()
+        .map(|h| h.join(".local"))
+        .unwrap_or_else(|| PathBuf::from(".revx-install"))
+}
+
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("USERPROFILE").map(PathBuf::from))
+}
+
+fn expand_user_path(path: PathBuf) -> Result<PathBuf> {
+    let raw = path.to_string_lossy();
+    if raw == "~" {
+        return home_dir().context("HOME not set");
+    }
+    if let Some(rest) = raw.strip_prefix("~/") {
+        let home = home_dir().context("HOME not set")?;
+        return Ok(home.join(rest));
+    }
+    Ok(path)
+}
+
+fn resolve_engine_bin(bin: Option<PathBuf>) -> Result<PathBuf> {
+    if let Some(path) = bin {
+        return canonicalize_path(&path);
+    }
+    if let Some(path) = std::env::var_os("REVX_ENGINE") {
+        return canonicalize_path(Path::new(&path));
+    }
+    if let Ok(path) = std::env::current_exe() {
+        return canonicalize_path(&path);
+    }
+    Ok(PathBuf::from("revx-engine"))
+}
+
+fn canonicalize_path(path: &Path) -> Result<PathBuf> {
+    if path.exists() {
+        return path
+            .canonicalize()
+            .with_context(|| format!("failed to canonicalize {}", path.display()));
+    }
+    Ok(path.to_path_buf())
+}
+
+fn resolve_mcp_project_root(workspace: Option<PathBuf>, init: bool) -> Result<PathBuf> {
+    let project = if let Some(path) = workspace {
+        let path = expand_user_path(path)?;
+        if path.join(".revx").exists() {
+            canonicalize_path(&path)?
+        } else if path.file_name().and_then(|s| s.to_str()) == Some(".revx") {
+            path.parent()
+                .map(|p| p.to_path_buf())
+                .context("invalid .revx path")?
+        } else {
+            path
+        }
+    } else {
+        match workspace_parent_from_cwd() {
+            Ok(path) => path,
+            Err(_) => std::env::current_dir()?,
+        }
+    };
+
+    let project = if project.exists() {
+        canonicalize_path(&project).unwrap_or(project)
+    } else {
+        project
+    };
+
+    if init && !project.join(".revx").exists() {
+        fs::create_dir_all(&project)?;
+        let name = project
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "revx-project".to_string());
+        Workspace::init(&project, &name, None)?;
+    }
+
+    if !project.join(".revx").exists() {
+        anyhow::bail!(
+            "no revx workspace at {} (missing .revx). Use --workspace and/or --init",
+            project.display()
+        );
+    }
+    Ok(project)
+}
+
+fn render_mcp_host_config(host: McpHost, engine: &Path, workspace: &Path) -> String {
+    let engine_s = engine.display().to_string();
+    let workspace_s = workspace.display().to_string();
+    match host {
+        McpHost::Generic | McpHost::Codex => serde_json::json!({
+            "mcpServers": {
+                "revx": {
+                    "command": engine_s,
+                    "args": ["mcp", "serve", "--workspace", workspace_s],
+                }
+            }
+        })
+        .to_string()
+            + "
+",
+        McpHost::Cursor => serde_json::json!({
+            "mcpServers": {
+                "revx": {
+                    "command": engine_s,
+                    "args": ["mcp", "serve", "--workspace", workspace_s]
+                }
+            }
+        })
+        .to_string()
+            + "
+",
+        McpHost::Claude => serde_json::json!({
+            "mcpServers": {
+                "revx": {
+                    "command": engine_s,
+                    "args": ["mcp", "serve", "--workspace", workspace_s]
+                }
+            }
+        })
+        .to_string()
+            + "
+",
+    }
 }
 
 fn workspace_from_cwd() -> Result<Workspace> {
