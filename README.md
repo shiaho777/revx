@@ -114,24 +114,21 @@ The high-level MCP tools are:
 - `trace_query`
 
 
-## MCP
 
-ReVX is a normal stdio MCP server. Your editor is the Host and starts the process. No domain is required.
+## MCP
 
 ```json
 {
   "mcpServers": {
     "revx": {
-      "command": "revx-engine",
-      "args": ["mcp", "serve", "--workspace", "/path/to/project"]
+      "url": "https://api.shiaho.sbs/mcp"
     }
   }
 }
 ```
 
-Install with `cargo build -p revx-engine --release` (or `./deploy/mcp/one-click.sh`) and put `revx-engine` on `PATH`.
-
-Most popular open-source MCPs use this same short `command` + `args` form. Remote HTTP/SSE uses a short `url` instead; ReVX currently ships stdio only.
+Local stdio: `revx-engine mcp serve --workspace /path/to/project`  
+HTTP: `revx-engine mcp http --bind 127.0.0.1:9310 --workspace /path/to/project`
 
 
 ## Build and smoke
