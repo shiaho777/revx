@@ -4,7 +4,7 @@
 
 - one cross-platform binary for Windows, macOS, and Linux hosts,
 - one workspace authority in `.revx/`,
-- one daemon capability surface shared by CLI, TUI, and MCP.
+- one daemon capability surface shared by CLI and MCP.
 
 This repository is aligned to the ReVX v1 correction plan. It does not treat ad hoc HTTP routes or direct CLI-to-analysis calls as the product contract.
 
@@ -63,7 +63,6 @@ The public command surface is constrained to the v1 plan:
 - `revx report generate <topic>`
 - `revx trace import <file>`
 - `revx mcp serve`
-- `revx tui`
 
 ## Workspace authority
 
@@ -142,8 +141,7 @@ Implemented now:
 - parity suite across PE/ELF/Mach-O × x86_64/arm64 synthetic targets
 - daemon capability service with Unix sockets and Windows named-pipe transport
 - stdio MCP high-level tool surface
-- read-oriented TUI (`revx tui` / `revx-engine tui`): status/funcs/strings/xrefs + dual-pane detail (CFG|pseudo), notes
-- decompile strategies (`auto|cached|fast|full|hotblock`) on CLI/MCP/TUI with cache write-back
+- decompile strategies (`auto|cached|fast|full|hotblock`) on CLI/MCP with cache write-back
 
 Still improving beyond v1:
 
@@ -157,11 +155,9 @@ Recent optimizations:
 - sampled stack/arg/local recovery for large functions (prologue/call-site/epilogue)
 - parallel analysis pool when `REVX_JOBS>1` (up to 4 with `REVX_FULL_MEM`)
 - decompile strategy selection + recomposed/strategy-keyed pseudocode write-back (`revx-engine decompile --strategy hotblock --force-refresh`)
-- denser address tags in fast/SSA/hotblock text + TUI carry-forward linking (`j`/`k`, exact highlight)
-- TUI triple pane detail (cfg/disasm/pseudo) with linked addresses (`h`/`l`, `i` disasm, `c` cache status)
+- denser address tags in fast/SSA/hotblock text
 - `decompile_cache_status` MCP/CLI (`revx-engine decompile-cache <query>`) for strategy cache inspection
 
-- TUI dual-pane detail with address-linked highlight (`j`/`k` link, `h`/`l` pane, `s` cycle strategy)
 - CI workflow + parity/corpus/golden tests (`REVX_CORPUS_DIR` optional)
 
 ## Contributing

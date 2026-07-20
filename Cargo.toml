@@ -37,7 +37,6 @@ iced-x86 = { version = "1.21", default-features = false, features = ["std", "dec
 memmap2 = "0.9"
 object = { version = "0.38", default-features = false, features = ["read_core", "pe", "elf", "macho", "std", "unaligned"] }
 pdb = "0.8"
-ratatui = "0.29"
 rusqlite = { version = "0.37", default-features = false }
 ruzstd = "0.8.2"
 serde = { version = "1", features = ["derive", "rc"] }
