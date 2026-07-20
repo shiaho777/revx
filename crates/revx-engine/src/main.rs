@@ -1510,7 +1510,7 @@ fn resolve_mcp_project_root(workspace: Option<PathBuf>, init: bool) -> Result<Pa
 }
 
 fn render_mcp_host_config(host: McpHost, engine: &Path, workspace: &Path) -> String {
-    let url = std::env::var("REVX_MCP_URL").unwrap_or_else(|_| "https://api.shiaho.sbs/mcp".to_string());
+    let url = std::env::var("REVX_MCP_URL").unwrap_or_else(|_| "http://127.0.0.1:9310/mcp".to_string());
     let engine_s = engine.display().to_string();
     let workspace_s = workspace.display().to_string();
     match host {
