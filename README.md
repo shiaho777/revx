@@ -131,6 +131,8 @@ Then point the Host at:
 
 Details, host templates, and doctor checks: [deploy/mcp/README.md](deploy/mcp/README.md).
 
+Official Host invocation (local + remote production SSH): [deploy/mcp/OFFICIAL.md](deploy/mcp/OFFICIAL.md).
+
 ```bash
 revx-engine mcp doctor --workspace .
 revx-engine mcp config --host cursor --workspace .

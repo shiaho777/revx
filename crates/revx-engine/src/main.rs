@@ -1323,13 +1323,21 @@ fn cmd_mcp_install(
 
     let current = std::env::current_exe().context("failed to resolve current executable")?;
     let engine_dst = bin_dir.join("revx-engine");
-    fs::copy(&current, &engine_dst).with_context(|| {
-        format!(
-            "failed to install {} -> {}",
-            current.display(),
-            engine_dst.display()
-        )
-    })?;
+    let same = current
+        .canonicalize()
+        .ok()
+        .zip(engine_dst.canonicalize().ok())
+        .map(|(a, b)| a == b)
+        .unwrap_or(false);
+    if !same {
+        fs::copy(&current, &engine_dst).with_context(|| {
+            format!(
+                "failed to install {} -> {}",
+                current.display(),
+                engine_dst.display()
+            )
+        })?;
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
