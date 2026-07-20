@@ -1,0 +1,10 @@
+[package]
+name = "revx"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+serde_json = { workspace = true }
+revx-query = { path = "../revx-query" }

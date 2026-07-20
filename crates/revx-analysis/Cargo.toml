@@ -1,0 +1,23 @@
+[package]
+name = "revx-analysis"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[features]
+default = ["arch-arm64", "arch-x64"]
+arch-arm64 = ["dep:revx-arch-arm64"]
+arch-x64 = ["dep:revx-arch-x64"]
+
+[dependencies]
+memmap2.workspace = true
+object = { workspace = true }
+serde.workspace = true
+serde_json.workspace = true
+revx-arch-arm64 = { path = "../revx-arch-arm64", optional = true }
+revx-arch-x64 = { path = "../revx-arch-x64", optional = true }
+revx-core = { path = "../revx-core" }
+
+[dev-dependencies]
+revx-loader = { path = "../revx-loader" }

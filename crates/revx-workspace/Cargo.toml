@@ -1,0 +1,32 @@
+[package]
+name = "revx-workspace"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[features]
+default = []
+sqlite-bundled = ["rusqlite/bundled"]
+
+[dependencies]
+anyhow.workspace = true
+blake3.workspace = true
+bzip2.workspace = true
+chrono.workspace = true
+crc32fast.workspace = true
+flate2.workspace = true
+hex.workspace = true
+rusqlite.workspace = true
+ruzstd.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tar.workspace = true
+toml.workspace = true
+uuid.workspace = true
+zip.workspace = true
+revx-core = { path = "../revx-core" }
+
+[dev-dependencies]
+revx-loader = { path = "../revx-loader" }
+tempfile.workspace = true

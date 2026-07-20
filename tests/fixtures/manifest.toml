@@ -1,0 +1,91 @@
+version = 1
+
+[[fixtures]]
+id = "synthetic_elf_x64"
+path = "SYNTHETIC:elf_x64"
+format = "elf"
+arch = "x86_64"
+stripped = true
+
+[[fixtures.probes]]
+function = "main"
+kind = "branch"
+expect_regions = ["if", "return"]
+min_arguments = 0
+min_locals = 0
+expect_type_names = []
+
+[[fixtures]]
+id = "synthetic_elf_arm64"
+path = "SYNTHETIC:elf_arm64"
+format = "elf"
+arch = "arm64"
+stripped = true
+
+[[fixtures.probes]]
+function = "main"
+kind = "branch"
+expect_regions = ["if", "return"]
+min_arguments = 0
+min_locals = 0
+expect_type_names = []
+
+[[fixtures]]
+id = "synthetic_macho_x64"
+path = "SYNTHETIC:macho_x64"
+format = "macho"
+arch = "x86_64"
+stripped = true
+
+[[fixtures.probes]]
+function = "main"
+kind = "branch"
+expect_regions = ["return"]
+min_arguments = 0
+min_locals = 0
+expect_type_names = []
+
+[[fixtures]]
+id = "synthetic_macho_arm64"
+path = "SYNTHETIC:macho_arm64"
+format = "macho"
+arch = "arm64"
+stripped = true
+
+[[fixtures.probes]]
+function = "main"
+kind = "branch"
+expect_regions = ["return"]
+min_arguments = 0
+min_locals = 0
+expect_type_names = []
+
+[[fixtures]]
+id = "synthetic_pe_x64"
+path = "SYNTHETIC:pe_x64"
+format = "pe"
+arch = "x86_64"
+stripped = true
+
+[[fixtures.probes]]
+function = "main"
+kind = "branch"
+expect_regions = ["return"]
+min_arguments = 0
+min_locals = 0
+expect_type_names = []
+
+[[fixtures]]
+id = "synthetic_pe_arm64"
+path = "SYNTHETIC:pe_arm64"
+format = "pe"
+arch = "arm64"
+stripped = true
+
+[[fixtures.probes]]
+function = "main"
+kind = "branch"
+expect_regions = ["return"]
+min_arguments = 0
+min_locals = 0
+expect_type_names = []
