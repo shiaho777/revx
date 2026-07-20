@@ -113,31 +113,26 @@ The high-level MCP tools are:
 - `trace_import`
 - `trace_query`
 
-## MCP Server deploy
 
-ReVX ships as an **MCP Server** (`revx-engine mcp serve`). An MCP **Host** (Codex / Cursor / Claude Desktop) spawns that process over stdio. The CLI binary is the deploy/entrypoint and human interface, not the Host.
+## MCP
 
-One-click install + config samples:
+ReVX is a normal stdio MCP server. Your editor is the Host and starts the process. No domain is required.
 
-```bash
-./deploy/mcp/one-click.sh
+```json
+{
+  "mcpServers": {
+    "revx": {
+      "command": "revx-engine",
+      "args": ["mcp", "serve", "--workspace", "/path/to/project"]
+    }
+  }
+}
 ```
 
-Then point the Host at:
+Install with `cargo build -p revx-engine --release` (or `./deploy/mcp/one-click.sh`) and put `revx-engine` on `PATH`.
 
-```bash
-~/.local/bin/revx-engine mcp serve --workspace /path/to/project
-```
+Most popular open-source MCPs use this same short `command` + `args` form. Remote HTTP/SSE uses a short `url` instead; ReVX currently ships stdio only.
 
-Details, host templates, and doctor checks: [deploy/mcp/README.md](deploy/mcp/README.md).
-
-Official Host invocation (local + remote production SSH): [deploy/mcp/OFFICIAL.md](deploy/mcp/OFFICIAL.md).
-
-```bash
-revx-engine mcp doctor --workspace .
-revx-engine mcp config --host cursor --workspace .
-revx mcp serve --workspace .   # thin CLI forwards to engine
-```
 
 ## Build and smoke
 
