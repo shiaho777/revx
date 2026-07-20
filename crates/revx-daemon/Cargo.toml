@@ -21,7 +21,7 @@ uuid.workspace = true
 revx-analysis = { path = "../revx-analysis" }
 revx-core = { path = "../revx-core" }
 revx-loader = { path = "../revx-loader", default-features = false }
-revx-workspace = { path = "../revx-workspace", default-features = false }
+revx-workspace = { path = "../revx-workspace", default-features = false, features = ["sqlite-bundled"] }
 
 [dev-dependencies]
 tar.workspace = true

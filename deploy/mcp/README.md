@@ -94,3 +94,12 @@ Merge into Codex MCP server settings. Template: `templates/codex.mcp.json`.
 - stdout is the MCP protocol stream; logs must stay on stderr
 - workspace path is the project directory that contains `.revx/`
 - optional long-lived analysis daemon (`revx daemon start`) is separate from MCP stdio lifecycle
+
+
+## Official production invocation
+
+See **[OFFICIAL.md](OFFICIAL.md)** for the supported Host configs:
+
+- remote SSH MCP to the production server (`124.222.209.226`)
+- local stdio MCP
+- workspace path rules and security notes
