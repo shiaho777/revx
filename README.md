@@ -172,39 +172,6 @@ cargo run -p revx -- func main
 cargo run -p revx -- brief ActiveDesk
 ```
 
-## Current v1 boundary
-
-Implemented now:
-
-- canonical workspace state with artifact indirection
-- PE/ELF/Mach-O normalization
-- x86_64 and arm64 decode/reference extraction moved into dedicated arch crates (both enabled by default)
-- function recovery, CFG block splitting, xrefs, callgraph slice, strings, evidence, pseudocode
-- stronger stack/arg/local recovery (SysV vs Win64, def-before-use arg masks, stack args/locals)
-- richer type import/inference from debug hints, known libc signatures, and usage patterns
-- deterministic region structuring (if/loop/switch/return) for fast + SSA paths
-- parity suite across PE/ELF/Mach-O × x86_64/arm64 synthetic targets
-- daemon capability service with Unix sockets and Windows named-pipe transport
-- stdio MCP high-level tool surface
-- decompile strategies (`auto|cached|fast|full|hotblock`) on CLI/MCP with cache write-back
-
-Still improving beyond v1:
-
-- even higher-fidelity structuring on multi-thousand-instruction monsters
-- broader public corpus CI (currently: synthetic matrix + optional real SO smoke)
-
-Recent optimizations:
-
-- adaptive SSA/linear/heavy limits (`REVX_FULL_MEM` boosts 4×; Full default 2× when not lean)
-- hot-block multi-window SSA for oversized functions (score entry/calls/loops/xrefs)
-- sampled stack/arg/local recovery for large functions (prologue/call-site/epilogue)
-- parallel analysis pool when `REVX_JOBS>1` (up to 4 with `REVX_FULL_MEM`)
-- decompile strategy selection + recomposed/strategy-keyed pseudocode write-back (`revx-engine decompile --strategy hotblock --force-refresh`)
-- denser address tags in fast/SSA/hotblock text
-- `decompile_cache_status` MCP/CLI (`revx-engine decompile-cache <query>`) for strategy cache inspection
-
-- CI workflow + parity/corpus/golden tests (`REVX_CORPUS_DIR` optional)
-
 ## Contributing
 
 Issue → PR into `main` → CI (**ci / test**) green → merge (Issue closes via `Fixes #N`). See [CONTRIBUTING.md](CONTRIBUTING.md); coding agents: [AGENTS.md](AGENTS.md).
