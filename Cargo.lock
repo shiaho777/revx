@@ -273,6 +273,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d9c4f5dac5e15c24eb999c26181a6ca40b39fe946cbe4c263c7209467bc83af2"
 
 [[package]]
+name = "foldhash"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
+
+[[package]]
 name = "funty"
 version = "2.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -329,7 +335,16 @@ version = "0.15.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9229cfe53dfd69f0609a49f65461bd93001ea1ef889cd5529dd176593f5338a1"
 dependencies = [
- "foldhash",
+ "foldhash 0.1.5",
+]
+
+[[package]]
+name = "hashbrown"
+version = "0.16.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "841d1cc9bed7f9236f321df977030373f4a4163ae1a7dbfe1a51a2c1a51d9100"
+dependencies = [
+ "foldhash 0.2.0",
 ]
 
 [[package]]
@@ -507,6 +522,9 @@ version = "0.38.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "271638cd5fa9cca89c4c304675ca658efc4e64a66c716b7cfe1afb4b9611dbbc"
 dependencies = [
+ "crc32fast",
+ "hashbrown 0.16.1",
+ "indexmap",
  "memchr",
 ]
 
@@ -587,6 +605,7 @@ dependencies = [
  "revx-arch-x64",
  "revx-core",
  "revx-loader",
+ "revx-testkit",
  "serde",
  "serde_json",
 ]
@@ -630,6 +649,7 @@ dependencies = [
  "revx-analysis",
  "revx-core",
  "revx-loader",
+ "revx-testkit",
  "revx-workspace",
  "serde",
  "serde_json",
@@ -675,6 +695,7 @@ dependencies = [
  "object",
  "pdb",
  "revx-core",
+ "revx-testkit",
  "rusqlite",
  "ruzstd",
  "serde_json",
@@ -698,6 +719,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "revx-testkit"
+version = "0.1.0"
+dependencies = [
+ "revx-core",
+]
+
+[[package]]
 name = "revx-workspace"
 version = "0.1.0"
 dependencies = [
@@ -718,6 +746,7 @@ dependencies = [
  "tempfile",
  "toml",
  "uuid",
+ "xz2",
  "zip",
 ]
 

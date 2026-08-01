@@ -306,7 +306,7 @@ impl ReferenceKind {
     }
 
     /// Parse a string into a ReferenceKind. Falls back to `Data` for unknown kinds.
-    pub fn from_str(s: &str) -> Self {
+    pub fn parse(s: &str) -> Self {
         match s {
             "call" => ReferenceKind::Call,
             "indirect_call" => ReferenceKind::IndirectCall,
@@ -1888,7 +1888,6 @@ pub struct TraceQueryResponse {
     pub artifact: Option<ArtifactHandle>,
 }
 
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AnalysisBriefRequest {
     pub query: String,
@@ -2013,6 +2012,7 @@ pub enum CapabilityRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "capability", content = "payload", rename_all = "snake_case")]
+#[allow(clippy::large_enum_variant)]
 pub enum CapabilityResponse {
     ProjectOpen(ProjectOpenResponse),
     ProjectStatus(ProjectStatusResponse),

@@ -217,10 +217,9 @@ impl<'a> CompoundFile<'a> {
                     name: entry.name.clone(),
                     size: entry.stream_size,
                     start_sector: entry.start_sector,
-                    storage_path: path
-                        .rsplit_once('/')
-                        .map(|(storage, _)| (!storage.is_empty()).then_some(storage.to_string()))
-                        .flatten(),
+                    storage_path: path.rsplit_once('/').and_then(|(storage, _)| {
+                        (!storage.is_empty()).then_some(storage.to_string())
+                    }),
                 })
             })
             .collect()
@@ -645,10 +644,9 @@ fn assign_child_paths(
         if matches!(
             entries[index].entry_type,
             CompoundEntryType::Storage | CompoundEntryType::RootStorage
-        ) {
-            if let Some(grandchild) = entries[index].child {
-                assign_child_paths(entries, grandchild, &path, Some(index), visited);
-            }
+        ) && let Some(grandchild) = entries[index].child
+        {
+            assign_child_paths(entries, grandchild, &path, Some(index), visited);
         }
     }
 }
@@ -681,7 +679,7 @@ fn collect_child_indices_inner(
 
 fn decode_directory_name(entry: &[u8]) -> Option<String> {
     let name_len = read_le_u16(entry, 64).ok()? as usize;
-    if name_len < 2 || name_len > 64 {
+    if !(2..=64).contains(&name_len) {
         return None;
     }
     let raw = entry.get(..name_len.saturating_sub(2))?;

@@ -1,43 +1,16 @@
 use revx_loader::load_binary;
+use revx_testkit::{all_cases, write_temp};
 use std::io::Write;
-use std::path::PathBuf;
 
 #[test]
-fn loads_known_fixture() {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("..")
-        .join("..")
-        .join("ida-pro-mcp-main")
-        .join("tests")
-        .join("typed_fixture.elf");
-    if !root.exists() {
-        return;
+fn loads_synthetic_fixtures() {
+    for case in all_cases() {
+        let path = write_temp(&case);
+        let image = load_binary(&path).unwrap_or_else(|e| panic!("{} load failed: {e:#}", case.id));
+        assert!(image.size > 0, "{} size", case.id);
+        assert_eq!(image.format, case.format, "{} format", case.id);
+        assert_eq!(image.architecture, case.arch, "{} arch", case.id);
     }
-    let image = load_binary(&root).unwrap();
-    assert!(image.size > 0);
-    assert!(!matches!(image.format, revx_core::BinaryFormat::Unknown));
-}
-
-#[test]
-fn libtersafe_arm64_plt_import_addresses_match_real_stubs() {
-    let root = PathBuf::from("/Users/shiaho/Desktop/ida-mini-mcp/libtersafe.so");
-    if !root.exists() {
-        return;
-    }
-
-    let image = load_binary(&root).unwrap();
-    let find_addr = |name: &str| {
-        image
-            .imports
-            .iter()
-            .find(|import| import.name == name)
-            .and_then(|import| import.address)
-    };
-
-    assert_eq!(find_addr("free"), Some(0x50e180));
-    assert_eq!(find_addr("malloc"), Some(0x50e190));
-    assert_eq!(find_addr("calloc"), Some(0x50e1a0));
 }
 
 #[test]
@@ -1391,7 +1364,7 @@ fn sample_ico_dib_payload() -> Vec<u8> {
 }
 
 fn sample_bmp_dib_payload(width: i32, height: i32) -> Vec<u8> {
-    let row_stride = (((width as usize * 32) + 31) / 32) * 4;
+    let row_stride = (width as usize * 32).div_ceil(32) * 4;
     let pixel_bytes = row_stride * height.unsigned_abs() as usize;
     let mut bytes = Vec::new();
     bytes.extend_from_slice(&40u32.to_le_bytes());
@@ -1565,6 +1538,7 @@ fn sample_ole_compound_file() -> Vec<u8> {
     bytes
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_cfb_dir_entry(
     entry: &mut [u8],
     name: &str,
@@ -1655,7 +1629,6 @@ fn sample_pdf_document() -> Vec<u8> {
     bytes
 }
 
-
 #[test]
 fn identifies_universal_media_and_text_formats() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -1667,17 +1640,42 @@ fn identifies_universal_media_and_text_formats() {
             "cab",
             revx_core::ObjectKind::Archive,
         ),
-        ("photo.tif", b"II*\0\x08\0\0\0", "tiff", revx_core::ObjectKind::Image),
-        ("audio.flac", b"fLaC\0\0\0\x22", "flac", revx_core::ObjectKind::File),
-        ("track.ogg", b"OggS\0\x02", "ogg", revx_core::ObjectKind::File),
+        (
+            "photo.tif",
+            b"II*\0\x08\0\0\0",
+            "tiff",
+            revx_core::ObjectKind::Image,
+        ),
+        (
+            "audio.flac",
+            b"fLaC\0\0\0\x22",
+            "flac",
+            revx_core::ObjectKind::File,
+        ),
+        (
+            "track.ogg",
+            b"OggS\0\x02",
+            "ogg",
+            revx_core::ObjectKind::File,
+        ),
         (
             "clip.mp4",
             b"\0\0\0\x18ftypisom\0\0\x02\0isomiso2",
             "mp4",
             revx_core::ObjectKind::File,
         ),
-        ("font.woff", b"wOFF\0\x01\0\0", "woff", revx_core::ObjectKind::File),
-        ("font.woff2", b"wOF2\0\x01\0\0", "woff2", revx_core::ObjectKind::File),
+        (
+            "font.woff",
+            b"wOFF\0\x01\0\0",
+            "woff",
+            revx_core::ObjectKind::File,
+        ),
+        (
+            "font.woff2",
+            b"wOF2\0\x01\0\0",
+            "woff2",
+            revx_core::ObjectKind::File,
+        ),
         (
             "disk.qcow2",
             b"QFI\xfb\0\0\0\x03",

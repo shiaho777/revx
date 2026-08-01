@@ -10,6 +10,7 @@ members = [
     "crates/revx-micro",
     "crates/revx-query",
     "crates/revx-engine",
+    "crates/revx-testkit",
     "crates/revx-workspace",
 ]
 resolver = "2"

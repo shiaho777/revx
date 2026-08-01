@@ -24,6 +24,8 @@ revx-loader = { path = "../revx-loader", default-features = false }
 revx-workspace = { path = "../revx-workspace", default-features = false, features = ["sqlite-bundled"] }
 
 [dev-dependencies]
+revx-testkit = { path = "../revx-testkit" }
+revx-loader = { path = "../revx-loader", features = ["containers"] }
 tar.workspace = true
 tempfile.workspace = true
 zip.workspace = true

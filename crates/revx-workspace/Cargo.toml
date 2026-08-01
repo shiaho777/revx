@@ -28,5 +28,6 @@ zip.workspace = true
 revx-core = { path = "../revx-core" }
 
 [dev-dependencies]
-revx-loader = { path = "../revx-loader" }
+revx-loader = { path = "../revx-loader", features = ["containers"] }
 tempfile.workspace = true
+xz2.workspace = true

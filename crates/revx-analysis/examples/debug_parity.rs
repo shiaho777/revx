@@ -1,15 +1,15 @@
-
-use object::write::{Object as WriteObject, StandardSection, Symbol, SymbolKind, SymbolScope, SymbolSection};
+use object::write::{
+    Object as WriteObject, StandardSection, Symbol, SymbolKind, SymbolScope, SymbolSection,
+};
 use object::{Architecture as ObjArch, BinaryFormat as ObjFmt, Endianness};
-use revx_loader::load_binary;
 use revx_analysis::analyze;
 use revx_core::AnalysisProfile;
+use revx_loader::load_binary;
 use std::fs;
 
 fn main() {
     let code = vec![
-        0x89, 0xff, 0x85, 0xff, 0x74, 0x03, 0x31, 0xc0, 0xc3,
-        0xb8, 0x01, 0x00, 0x00, 0x00, 0xc3,
+        0x89, 0xff, 0x85, 0xff, 0x74, 0x03, 0x31, 0xc0, 0xc3, 0xb8, 0x01, 0x00, 0x00, 0x00, 0xc3,
     ];
     let mut obj = WriteObject::new(ObjFmt::Elf, ObjArch::X86_64, Endianness::Little);
     let section = obj.section_id(StandardSection::Text);
@@ -29,9 +29,30 @@ fn main() {
     fs::write(&path, &bytes).unwrap();
     let image = load_binary(&path).unwrap();
     println!("format={:?} arch={:?}", image.format, image.architecture);
-    println!("sections={:?}", image.sections.iter().map(|s| (&s.name, s.address, s.size, &s.kind)).collect::<Vec<_>>());
-    println!("segments={:?}", image.segments.iter().map(|s| (&s.name, s.address, s.size, &s.permissions)).collect::<Vec<_>>());
-    println!("symbols={:?}", image.symbols.iter().map(|s| (&s.name, s.address, &s.kind)).collect::<Vec<_>>());
+    println!(
+        "sections={:?}",
+        image
+            .sections
+            .iter()
+            .map(|s| (&s.name, s.address, s.size, &s.kind))
+            .collect::<Vec<_>>()
+    );
+    println!(
+        "segments={:?}",
+        image
+            .segments
+            .iter()
+            .map(|s| (&s.name, s.address, s.size, &s.permissions))
+            .collect::<Vec<_>>()
+    );
+    println!(
+        "symbols={:?}",
+        image
+            .symbols
+            .iter()
+            .map(|s| (&s.name, s.address, &s.kind))
+            .collect::<Vec<_>>()
+    );
     println!("entry={:?}", image.entry);
     let bundle = analyze(image, AnalysisProfile::Fast);
     println!("funcs={}", bundle.survey.summary.function_count);

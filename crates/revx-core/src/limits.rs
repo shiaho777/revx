@@ -18,9 +18,7 @@ pub fn env_rss_kb() -> u64 {
 
 pub fn micro_mode() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| {
-        std::env::var_os("REVX_MICRO").is_some() || env_rss_kb() <= 1024
-    })
+    *ON.get_or_init(|| std::env::var_os("REVX_MICRO").is_some() || env_rss_kb() <= 1024)
 }
 
 pub fn lean_mode() -> bool {

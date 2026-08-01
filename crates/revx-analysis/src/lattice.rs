@@ -1,6 +1,7 @@
 use revx_core::{
     AgentClaim, AgentNextAction, AgentSemanticLattice, CaseLexeme, CausalChain, FlagBehaviorEdge,
-    IbcStep, LatticeQuality, PseudocodeRegion, Reference, ReferenceKind, RegionKind, SemanticAnchor,
+    IbcStep, LatticeQuality, PseudocodeRegion, Reference, ReferenceKind, RegionKind,
+    SemanticAnchor,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -124,22 +125,22 @@ pub fn build_agent_semantic_lattice(
             );
             call_kind_hits.entry(kind).or_default().push(id.clone());
 
-            if kind == "env" {
-                if let Some(lit) = extract_quoted_literals(line).into_iter().next() {
-                    env_vars.push((id.clone(), call.clone(), lit.clone()));
-                    claims.push(make_claim(
-                        claims.len() + 1,
-                        format!("reads environment variable `{lit}` via `{call}`"),
-                        "env",
-                        0.93,
-                        vec![id.clone()],
-                        path_stack.last().cloned(),
-                        Some(format!(
-                            "show `{call}` result is unused or overwritten without side effect"
-                        )),
-                        probe_set(address, "decompile_function", "confirm env use site"),
-                    ));
-                }
+            if kind == "env"
+                && let Some(lit) = extract_quoted_literals(line).into_iter().next()
+            {
+                env_vars.push((id.clone(), call.clone(), lit.clone()));
+                claims.push(make_claim(
+                    claims.len() + 1,
+                    format!("reads environment variable `{lit}` via `{call}`"),
+                    "env",
+                    0.93,
+                    vec![id.clone()],
+                    path_stack.last().cloned(),
+                    Some(format!(
+                        "show `{call}` result is unused or overwritten without side effect"
+                    )),
+                    probe_set(address, "decompile_function", "confirm env use site"),
+                ));
             }
             if kind == "tty" {
                 tty_ids.push(id.clone());
@@ -188,15 +189,18 @@ pub fn build_agent_semantic_lattice(
                     Some(format!(
                         "no jump-table/switch near `{call}` result comparisons"
                     )),
-                    probe_set(address, "disassemble_function", "verify option dispatch table"),
+                    probe_set(
+                        address,
+                        "disassemble_function",
+                        "verify option dispatch table",
+                    ),
                 ));
             }
-            if call.eq_ignore_ascii_case("strcmp") || call.eq_ignore_ascii_case("strncmp") {
-                if let Some(lit) = extract_quoted_literals(line).into_iter().next() {
-                    if is_mode_token(&lit) {
-                        strcmp_modes.push((id.clone(), lit));
-                    }
-                }
+            if (call.eq_ignore_ascii_case("strcmp") || call.eq_ignore_ascii_case("strncmp"))
+                && let Some(lit) = extract_quoted_literals(line).into_iter().next()
+                && is_mode_token(&lit)
+            {
+                strcmp_modes.push((id.clone(), lit));
             }
         }
     }
@@ -204,7 +208,7 @@ pub fn build_agent_semantic_lattice(
     if !switch_hits.is_empty() {
         let mut anchor_ids: Vec<String> = switch_hits.iter().map(|(id, _)| id.clone()).collect();
         if let Some(ids) = call_kind_hits.get("cli") {
-            anchor_ids.extend(ids.iter().cloned().take(2));
+            anchor_ids.extend(ids.iter().take(2).cloned());
         }
         claims.push(make_claim(
             claims.len() + 1,
@@ -222,7 +226,11 @@ pub fn build_agent_semantic_lattice(
             anchor_ids,
             None,
             Some("br/jump-table is indirect call, not switch".to_string()),
-            probe_set(address, "disassemble_function", "confirm jump-table targets"),
+            probe_set(
+                address,
+                "disassemble_function",
+                "confirm jump-table targets",
+            ),
         ));
     }
 
@@ -230,7 +238,7 @@ pub fn build_agent_semantic_lattice(
         for (oid, opt) in optstrings.iter().take(2) {
             let flags = summarize_optstring(opt);
             let mut anchors_ids = vec![oid.clone()];
-            anchors_ids.extend(cli_ids.iter().cloned().take(2));
+            anchors_ids.extend(cli_ids.iter().take(2).cloned());
             claims.push(make_claim(
                 claims.len() + 1,
                 format!("exposes CLI flag lexicon `{flags}`"),
@@ -302,7 +310,10 @@ pub fn build_agent_semantic_lattice(
         {
             format!("formats or templates messages using {sample}")
         } else if unique_lits.iter().any(|lit| {
-            lit.contains('/') || lit.ends_with(".so") || lit.contains("PATH") || lit.contains("HOME")
+            lit.contains('/')
+                || lit.ends_with(".so")
+                || lit.contains("PATH")
+                || lit.contains("HOME")
         }) {
             format!("binds behavior to path/config literals {sample}")
         } else {
@@ -345,7 +356,11 @@ pub fn build_agent_semantic_lattice(
             ids.clone(),
             None,
             Some(format!("{kind} APIs are present but not on hot path")),
-            probe_set(address, "function_profile", &format!("expand {kind} call graph")),
+            probe_set(
+                address,
+                "function_profile",
+                &format!("expand {kind} call graph"),
+            ),
         ));
     }
 
@@ -393,7 +408,10 @@ pub fn build_agent_semantic_lattice(
                 1,
                 format!(
                     "returns `{}`",
-                    truncate(return_hits.first().map(String::as_str).unwrap_or("value"), 48)
+                    truncate(
+                        return_hits.first().map(String::as_str).unwrap_or("value"),
+                        48
+                    )
                 ),
                 "behavior",
                 0.65,
@@ -478,7 +496,10 @@ pub fn build_agent_semantic_lattice(
                 &surface,
                 None,
                 0.9,
-                &format!("code={} slot={:?} takes_arg={}", ch.code, ch.slot, ch.takes_arg),
+                &format!(
+                    "code={} slot={:?} takes_arg={}",
+                    ch.code, ch.slot, ch.takes_arg
+                ),
             );
             anchor_ids.push(id);
         }
@@ -495,7 +516,11 @@ pub fn build_agent_semantic_lattice(
             unique_preserve(&anchor_ids),
             None,
             Some("optstring/switch bias mapping is wrong or table is not char-coded".to_string()),
-            probe_set(address, "disassemble_function", "verify case targets match lexicon"),
+            probe_set(
+                address,
+                "disassemble_function",
+                "verify case targets match lexicon",
+            ),
         ));
         let mut deduped: Vec<AgentClaim> = Vec::new();
         for mut claim in claims {
@@ -538,7 +563,11 @@ pub fn build_agent_semantic_lattice(
         &optstrings,
     );
     if !case_lexicon.is_empty() {
-        let glyphs: String = case_lexicon.iter().take(16).map(|c| c.glyph.as_str()).collect();
+        let glyphs: String = case_lexicon
+            .iter()
+            .take(16)
+            .map(|c| c.glyph.as_str())
+            .collect();
         let steps = claims
             .iter()
             .filter(|c| c.kind == "case" || c.kind == "cli" || c.intent.contains("jump table"))
@@ -622,7 +651,13 @@ pub fn build_agent_semantic_lattice(
         None
     };
 
-    let thesis = synthesize_thesis(function_name, &claims, &chains, &string_hits, &call_kind_hits);
+    let thesis = synthesize_thesis(
+        function_name,
+        &claims,
+        &chains,
+        &string_hits,
+        &call_kind_hits,
+    );
     let (investigation_bytecode, ibc) = compile_investigation_program(
         function_name,
         address,
@@ -703,11 +738,7 @@ pub fn fuse_semantic_lattices(
     if pieces.len() == 1 {
         let mut one = pieces[0].2.clone();
         project_flag_behavior_graph(&mut one, pieces);
-        one.method = if one.behavior_graph.is_empty() {
-            "casl-v5-fbg".to_string()
-        } else {
-            "casl-v5-fbg".to_string()
-        };
+        one.method = "casl-v5-fbg".to_string();
         return one;
     }
 
@@ -761,9 +792,10 @@ pub fn fuse_semantic_lattices(
                     || c.intent.contains("jump table")
                     || c.intent.contains("CLI option")
             })
-            || lattice.chains.iter().any(|c| {
-                c.narrative.contains("getopt") || c.narrative.contains("jump table")
-            });
+            || lattice
+                .chains
+                .iter()
+                .any(|c| c.narrative.contains("getopt") || c.narrative.contains("jump table"));
         for case in &lattice.case_lexicon {
             let worth = case.target.is_some() || dispatcher_like;
             if !worth {
@@ -816,30 +848,30 @@ pub fn fuse_semantic_lattices(
                     .filter(|c| matches!(c.kind.as_str(), "case" | "case_bind" | "cli"))
                     .count()
         });
-        if let Some((_, _, primary_l)) = primary {
-            if !primary_l.case_lexicon.is_empty() {
-                let mut preferred = primary_l.case_lexicon.clone();
-                for case in fused_cases {
-                    if let Some(existing) = preferred
-                        .iter_mut()
-                        .find(|c| c.code == case.code && c.glyph == case.glyph)
-                    {
-                        if existing.target.is_none() && case.target.is_some() {
-                            existing.target = case.target;
-                            existing.target_name = case.target_name;
-                        }
-                        if existing.meaning.is_none() {
-                            existing.meaning = case.meaning;
-                        }
-                        if case.takes_arg {
-                            existing.takes_arg = true;
-                        }
-                    } else if case.target.is_some() {
-                        preferred.push(case);
+        if let Some((_, _, primary_l)) = primary
+            && !primary_l.case_lexicon.is_empty()
+        {
+            let mut preferred = primary_l.case_lexicon.clone();
+            for case in fused_cases {
+                if let Some(existing) = preferred
+                    .iter_mut()
+                    .find(|c| c.code == case.code && c.glyph == case.glyph)
+                {
+                    if existing.target.is_none() && case.target.is_some() {
+                        existing.target = case.target;
+                        existing.target_name = case.target_name;
                     }
+                    if existing.meaning.is_none() {
+                        existing.meaning = case.meaning;
+                    }
+                    if case.takes_arg {
+                        existing.takes_arg = true;
+                    }
+                } else if case.target.is_some() {
+                    preferred.push(case);
                 }
-                fused_cases = preferred;
             }
+            fused_cases = preferred;
         }
     }
 
@@ -936,10 +968,7 @@ pub fn fuse_semantic_lattices(
                     .claims
                     .iter()
                     .filter(|c| {
-                        matches!(
-                            c.kind.as_str(),
-                            "flag_orbit" | "case_bind" | "case" | "cli"
-                        )
+                        matches!(c.kind.as_str(), "flag_orbit" | "case_bind" | "case" | "cli")
                     })
                     .map(|c| c.id.clone())
                     .take(5)
@@ -947,10 +976,8 @@ pub fn fuse_semantic_lattices(
             },
         );
     }
-    let pieces_ref: Vec<(String, &AgentSemanticLattice)> = pieces
-        .iter()
-        .map(|(n, _, l)| (n.clone(), l))
-        .collect();
+    let pieces_ref: Vec<(String, &AgentSemanticLattice)> =
+        pieces.iter().map(|(n, _, l)| (n.clone(), l)).collect();
     let field = interfere_cognitive_fields(&pieces_ref, &fused);
     apply_cognitive_field_to_lattice(&mut fused, &field);
     inject_diffraction_residuals_into_lattice(&mut fused, &field);
@@ -962,13 +989,7 @@ pub fn finalize_pseudocode_unit(
     address: u64,
     unit: revx_core::PseudocodeUnit,
 ) -> revx_core::PseudocodeUnit {
-    finalize_pseudocode_unit_with_context(
-        function_name,
-        address,
-        unit,
-        &[],
-        &HashMap::new(),
-    )
+    finalize_pseudocode_unit_with_context(function_name, address, unit, &[], &HashMap::new())
 }
 
 pub fn finalize_pseudocode_unit_with_context(
@@ -978,12 +999,8 @@ pub fn finalize_pseudocode_unit_with_context(
     references: &[Reference],
     symbols: &HashMap<u64, String>,
 ) -> revx_core::PseudocodeUnit {
-    let mut lattice = build_agent_semantic_lattice(
-        function_name,
-        address,
-        &unit.text,
-        &unit.regions,
-    );
+    let mut lattice =
+        build_agent_semantic_lattice(function_name, address, &unit.text, &unit.regions);
     bind_case_targets(&mut lattice, references, symbols);
     unit.semantic_lattice = Some(lattice);
     unit
@@ -1014,7 +1031,7 @@ fn bind_case_targets(
     }
     let prior_codes: BTreeSet<u32> = lattice.case_lexicon.iter().map(|c| c.code).collect();
     let mut physical_seeded = 0usize;
-    for (code, _target) in &map {
+    for code in map.keys() {
         if prior_codes.contains(code) {
             continue;
         }
@@ -1036,11 +1053,9 @@ fn bind_case_targets(
         physical_seeded += 1;
     }
     if physical_seeded > 0 {
-        lattice.case_lexicon.sort_by(|a, b| {
-            a.code
-                .cmp(&b.code)
-                .then_with(|| a.glyph.cmp(&b.glyph))
-        });
+        lattice
+            .case_lexicon
+            .sort_by(|a, b| a.code.cmp(&b.code).then_with(|| a.glyph.cmp(&b.glyph)));
     }
     let linguistic: BTreeSet<u32> = prior_codes;
     let physical: BTreeSet<u32> = map.keys().copied().collect();
@@ -1063,10 +1078,10 @@ fn bind_case_targets(
                 .get(&target)
                 .cloned()
                 .or_else(|| Some(format!("sub_{target:x}")));
-            if case.meaning.is_none() {
-                if let Some(name) = case.target_name.as_deref() {
-                    case.meaning = infer_meaning_from_handler(name, &case.glyph);
-                }
+            if case.meaning.is_none()
+                && let Some(name) = case.target_name.as_deref()
+            {
+                case.meaning = infer_meaning_from_handler(name, &case.glyph);
             }
             bound += 1;
         }
@@ -1145,7 +1160,12 @@ fn bind_case_targets(
         .collect::<Vec<_>>()
         .join(", ");
     let mut anchor_ids = Vec::new();
-    for case in lattice.case_lexicon.iter().filter(|c| c.target.is_some()).take(8) {
+    for case in lattice
+        .case_lexicon
+        .iter()
+        .filter(|c| c.target.is_some())
+        .take(8)
+    {
         let surface = format!(
             "case '{}' @ {}",
             c_escape_glyph(&case.glyph),
@@ -1203,9 +1223,7 @@ fn bind_case_targets(
         0,
         CausalChain {
             id: "x6".to_string(),
-            narrative: format!(
-                "option char -> jump-table slot -> handler ({bound} bound cases)"
-            ),
+            narrative: format!("option char -> jump-table slot -> handler ({bound} bound cases)"),
             confidence: 0.96,
             steps: lattice
                 .claims
@@ -1221,10 +1239,10 @@ fn bind_case_targets(
                 .collect(),
         },
     );
-    if let Some(chain) = lattice.chains.first() {
-        if chain.confidence >= 0.9 {
-            lattice.thesis = truncate(&chain.narrative, 220);
-        }
+    if let Some(chain) = lattice.chains.first()
+        && chain.confidence >= 0.9
+    {
+        lattice.thesis = truncate(&chain.narrative, 220);
     }
     let address = lattice
         .ibc
@@ -1233,7 +1251,7 @@ fn bind_case_targets(
             s.args
                 .get("query")
                 .and_then(|v| v.as_str())
-                .and_then(|q| normalize_query_addr(q))
+                .and_then(normalize_query_addr)
         })
         .unwrap_or(0);
     let name = lattice
@@ -1328,7 +1346,11 @@ pub fn format_semantic_lattice(lattice: &AgentSemanticLattice) -> String {
             lattice.case_lexicon.len(),
             lattice.case_lexicon.iter().filter(|c| c.takes_arg).count()
         ));
-        let bound_n = lattice.case_lexicon.iter().filter(|c| c.target.is_some()).count();
+        let bound_n = lattice
+            .case_lexicon
+            .iter()
+            .filter(|c| c.target.is_some())
+            .count();
         let resonance = lattice
             .claims
             .iter()
@@ -1337,9 +1359,7 @@ pub fn format_semantic_lattice(lattice: &AgentSemanticLattice) -> String {
         lines.push(format!(
             "bound_targets: {bound_n}/{}{}",
             lattice.case_lexicon.len(),
-            resonance
-                .map(|r| format!(" | {r}"))
-                .unwrap_or_default()
+            resonance.map(|r| format!(" | {r}")).unwrap_or_default()
         ));
         for case in lattice.case_lexicon.iter().take(12) {
             lines.push(format!(
@@ -1420,14 +1440,14 @@ pub fn format_semantic_lattice(lattice: &AgentSemanticLattice) -> String {
                     .unwrap_or_default()
             ));
         }
-        if let Some(step) = lattice.ibc.first() {
-            if let Some(tool) = &step.tool {
-                lines.push(format!(
-                    "EXECUTE IBC[0]: `{}` args={}",
-                    tool,
-                    truncate(&step.args.to_string(), 160)
-                ));
-            }
+        if let Some(step) = lattice.ibc.first()
+            && let Some(tool) = &step.tool
+        {
+            lines.push(format!(
+                "EXECUTE IBC[0]: `{}` args={}",
+                tool,
+                truncate(&step.args.to_string(), 160)
+            ));
         }
     } else if !lattice.investigation_bytecode.is_empty() {
         lines.push("### Investigation Bytecode".to_string());
@@ -1485,6 +1505,7 @@ pub fn format_semantic_lattice(lattice: &AgentSemanticLattice) -> String {
     lines.join("\n")
 }
 
+#[allow(clippy::too_many_arguments)]
 fn synthesize_causal_chains(
     address: u64,
     claims: &[AgentClaim],
@@ -1521,7 +1542,8 @@ fn synthesize_causal_chains(
         if let Some(id) = claim_id(&|c| c.intent.contains("CLI option dispatch")) {
             steps.push(id);
         }
-        if let Some(id) = claim_id(&|c| c.intent.contains("jump table") || c.intent.contains("switch"))
+        if let Some(id) =
+            claim_id(&|c| c.intent.contains("jump table") || c.intent.contains("switch"))
         {
             steps.push(id);
         }
@@ -1755,7 +1777,12 @@ fn compile_investigation_program(
             &mut ibc,
             &mut pc,
             "TRACE_CHAIN",
-            format!("{} conf={:.2} {}", chain.id, chain.confidence, truncate(&chain.narrative, 72)),
+            format!(
+                "{} conf={:.2} {}",
+                chain.id,
+                chain.confidence,
+                truncate(&chain.narrative, 72)
+            ),
             Some("decompile_function".to_string()),
             serde_json::json!({ "query": format!("0x{address:x}") }),
             chain.steps.first().cloned(),
@@ -1847,7 +1874,8 @@ pub fn lattice_ibc_plan(
         .take(max_steps.max(1))
         .enumerate()
         .map(|(i, step)| {
-            let mut action = ibc_step_to_action(step, fallback_address, 99u8.saturating_sub(i as u8));
+            let mut action =
+                ibc_step_to_action(step, fallback_address, 99u8.saturating_sub(i as u8));
             if i == 0 {
                 action.reason = format!("EXECUTE NOW | {}", action.reason);
             }
@@ -1885,7 +1913,6 @@ pub fn advance_ibc_cursor(lattice: &mut AgentSemanticLattice) -> Option<IbcStep>
     }
     Some(step)
 }
-
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct IbcContinuumState {
@@ -1943,11 +1970,7 @@ pub fn ibc_program_fingerprint(lattice: &AgentSemanticLattice) -> String {
         .iter()
         .take(16)
         .map(|s| {
-            let q = s
-                .args
-                .get("query")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let q = s.args.get("query").and_then(|v| v.as_str()).unwrap_or("");
             format!("{}:{}:{}", s.op, s.tool.as_deref().unwrap_or("-"), q)
         })
         .collect::<Vec<_>>()
@@ -2012,13 +2035,10 @@ pub fn observe_ibc_execution(
         }
     }
     let warp = lattice.ibc.iter().find(|s| {
-        s.pc >= lattice.ibc_pc
-            && s.tool.is_some()
-            && tools_compatible(s.tool.as_deref(), tool)
-            && {
-                let step_q = s.args.get("query").and_then(|v| v.as_str()).unwrap_or("");
-                !step_q.is_empty() && queries_compatible(step_q, query)
-            }
+        s.pc >= lattice.ibc_pc && s.tool.is_some() && tools_compatible(s.tool.as_deref(), tool) && {
+            let step_q = s.args.get("query").and_then(|v| v.as_str()).unwrap_or("");
+            !step_q.is_empty() && queries_compatible(step_q, query)
+        }
     });
     if let Some(step) = warp {
         lattice.ibc_pc = step.pc;
@@ -2072,10 +2092,7 @@ pub fn continuum_on_visit_ns(
                 && s.tool.is_some()
                 && tools_compatible(s.tool.as_deref(), tool)
                 && queries_compatible(
-                    s.args
-                        .get("query")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or(""),
+                    s.args.get("query").and_then(|v| v.as_str()).unwrap_or(""),
                     &query,
                 )
         });
@@ -2142,7 +2159,7 @@ pub fn continuum_on_visit_ns(
             focus_name: name.to_string(),
             lattice: fresh,
             witnesses: Vec::new(),
-                orbit_hypotheses: BTreeMap::new(),
+            orbit_hypotheses: BTreeMap::new(),
             cognitive_field: CognitiveField::default(),
             epoch: 1,
             updated_unix_ms: now_ms,
@@ -2246,11 +2263,10 @@ pub fn continuum_ledger_on_visit(
     name: &str,
     fresh: AgentSemanticLattice,
 ) -> IbcObserveNote {
-    continuum_ledger_on_visit_with_observation(
-        ledger, namespace, tool, address, name, fresh, None,
-    )
+    continuum_ledger_on_visit_with_observation(ledger, namespace, tool, address, name, fresh, None)
 }
 
+#[allow(clippy::unnecessary_sort_by)]
 pub fn continuum_ledger_on_visit_with_observation(
     ledger: &mut IbcContinuumLedger,
     namespace: &str,
@@ -2269,15 +2285,8 @@ pub fn continuum_ledger_on_visit_with_observation(
         namespace.trim().to_string()
     };
     let prior = ledger.sessions.get(&ns).cloned();
-    let (state, mut observe) = continuum_on_visit_ns(
-        prior.as_ref(),
-        &ns,
-        tool,
-        address,
-        name,
-        fresh,
-        observation,
-    );
+    let (state, mut observe) =
+        continuum_on_visit_ns(prior.as_ref(), &ns, tool, address, name, fresh, observation);
     ledger.active_namespace = ns.clone();
     if let Some(step_note) = observe.advanced.as_ref() {
         let gw = format!(
@@ -2314,7 +2323,11 @@ pub fn continuum_ledger_on_visit_with_observation(
         }
     }
     observe.durable = true;
-    observe.note = format!("{} | ledger_sessions={}", observe.note, ledger.sessions.len());
+    observe.note = format!(
+        "{} | ledger_sessions={}",
+        observe.note,
+        ledger.sessions.len()
+    );
     observe
 }
 
@@ -2406,7 +2419,7 @@ pub fn continuum_brief_lines(state: &IbcContinuumState) -> Vec<String> {
                         truncate(&r.question, 80)
                     ));
                 }
-                if let Some(ev) = field_ref.collapse_events.iter().rev().next() {
+                if let Some(ev) = field_ref.collapse_events.iter().next_back() {
                     lines.push(format!("last_collapse: {}", truncate(ev, 100)));
                 }
             }
@@ -2430,7 +2443,7 @@ pub fn continuum_brief_lines(state: &IbcContinuumState) -> Vec<String> {
                     "proof_chain: links={} proven={proven} refuted={refuted} probed={probed}",
                     field_ref.proof_chain.len()
                 ));
-                if let Some(link) = field_ref.proof_chain.iter().rev().next() {
+                if let Some(link) = field_ref.proof_chain.iter().next_back() {
                     lines.push(format!(
                         "proof_tail: [{}] {} => {}",
                         link.verdict,
@@ -2460,7 +2473,6 @@ pub fn continuum_brief_lines(state: &IbcContinuumState) -> Vec<String> {
     lines
 }
 
-
 pub fn force_advance_ibc(lattice: &mut AgentSemanticLattice) -> Option<IbcStep> {
     advance_ibc_cursor(lattice)
 }
@@ -2485,12 +2497,20 @@ pub fn forge_orbit_hypothesis_drafts(state: &IbcContinuumState) -> Vec<OrbitHypo
         .take(2)
         .map(|l| format!("[{}] {} {}", l.verdict, l.orbit_key, l.summary))
         .collect::<Vec<_>>()
-        .join("
-");
+        .join(
+            "
+",
+        );
     let mut drafts = Vec::new();
     for edge in state.lattice.behavior_graph.iter().take(12) {
         let key = format!("{}:{}", edge.code, edge.glyph);
-        let tags = edge.behaviors.iter().take(6).cloned().collect::<Vec<_>>().join(",");
+        let tags = edge
+            .behaviors
+            .iter()
+            .take(6)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(",");
         let handler = edge
             .handler_name
             .clone()
@@ -2500,7 +2520,11 @@ pub fn forge_orbit_hypothesis_drafts(state: &IbcContinuumState) -> Vec<OrbitHypo
             "orbit '{}' → {} ⟦{}⟧",
             c_escape_glyph(&edge.glyph),
             handler,
-            if tags.is_empty() { "opaque".to_string() } else { tags.clone() }
+            if tags.is_empty() {
+                "opaque".to_string()
+            } else {
+                tags.clone()
+            }
         );
         let confute = state
             .lattice
@@ -2511,7 +2535,13 @@ pub fn forge_orbit_hypothesis_drafts(state: &IbcContinuumState) -> Vec<OrbitHypo
             .unwrap_or_else(|| {
                 "handler effects are incidental rather than caused by this flag".to_string()
             });
-        let effects = edge.effects.iter().take(5).cloned().collect::<Vec<_>>().join("\n- ");
+        let effects = edge
+            .effects
+            .iter()
+            .take(5)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n- ");
         let conjugate = field
             .conjugates
             .iter()
@@ -2533,7 +2563,12 @@ pub fn forge_orbit_hypothesis_drafts(state: &IbcContinuumState) -> Vec<OrbitHypo
             .standing_waves
             .iter()
             .find(|w| w.intent.contains(&edge.glyph) || w.kind == "flag_orbit")
-            .map(|w| format!("standing_wave: amp={:.2} polarity={}", w.amplitude, w.polarity))
+            .map(|w| {
+                format!(
+                    "standing_wave: amp={:.2} polarity={}",
+                    w.amplitude, w.polarity
+                )
+            })
             .unwrap_or_else(|| "standing_wave: local".to_string());
         let notes = format!(
             "CASL/PCCF orbit hypothesis (ns={ns} epoch={})\nfocus={}@0x{:x}\nfield_mode={} entropy={:.2}\n{wave}\nglyph='{}' code={}\nhandler={}\nbehaviors=[{tags}]\nconfute: {confute}\n{conjugate}\neffects:\n- {effects}\nproof_chain:\n{proof_tail}\nwitness_tail:\n{}",
@@ -2573,7 +2608,13 @@ pub fn forge_orbit_hypothesis_drafts(state: &IbcContinuumState) -> Vec<OrbitHypo
         });
     }
     if drafts.is_empty() {
-        for case in state.lattice.case_lexicon.iter().filter(|c| c.target.is_some()).take(8) {
+        for case in state
+            .lattice
+            .case_lexicon
+            .iter()
+            .filter(|c| c.target.is_some())
+            .take(8)
+        {
             let key = format!("{}:{}", case.code, case.glyph);
             let handler = case
                 .target_name
@@ -2625,7 +2666,6 @@ pub fn continuum_ledger_summary(ledger: &IbcContinuumLedger) -> String {
         ledger.global_witnesses.len()
     )
 }
-
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
 pub struct CognitiveField {
@@ -2755,11 +2795,15 @@ fn field_entropy(lattice: &AgentSemanticLattice, waves: &[StandingWave], nulls: 
     let wave_energy: f32 =
         waves.iter().map(|w| w.amplitude).sum::<f32>() / (waves.len().max(1) as f32);
     let null_pen = (nulls as f32 * 0.08).min(0.4);
-    ((1.0 - cov) * 0.45 + amb * 0.35 + (1.0 - wave_energy.min(1.0)) * 0.2 + null_pen).clamp(0.0, 1.0)
+    ((1.0 - cov) * 0.45 + amb * 0.35 + (1.0 - wave_energy.min(1.0)) * 0.2 + null_pen)
+        .clamp(0.0, 1.0)
 }
 
 fn field_mode(entropy: f32, waves: &[StandingWave], nulls: usize, escalate: bool) -> String {
-    let constructive = waves.iter().filter(|w| w.polarity == "constructive").count();
+    let constructive = waves
+        .iter()
+        .filter(|w| w.polarity == "constructive")
+        .count();
     let contested = waves.iter().filter(|w| w.polarity == "contested").count();
     if escalate && entropy >= 0.55 {
         "sparse".to_string()
@@ -2787,9 +2831,10 @@ pub fn compile_phase_conjugates(lattice: &AgentSemanticLattice) -> Vec<PhaseConj
         ) {
             continue;
         }
-        let conjugate = claim.confutation.clone().unwrap_or_else(|| {
-            format!("observation contradicts: {}", truncate(&claim.intent, 80))
-        });
+        let conjugate = claim
+            .confutation
+            .clone()
+            .unwrap_or_else(|| format!("observation contradicts: {}", truncate(&claim.intent, 80)));
         let (tool, query) = if let Some(probe) = claim.probes.first() {
             (
                 probe.tool.clone(),
@@ -2970,10 +3015,11 @@ pub fn interfere_cognitive_fields(
                 continue;
             }
             let key = claim_resonance_key(claim);
-            cross
-                .entry(key)
-                .or_default()
-                .push((name.clone(), claim.confidence, claim.intent.clone()));
+            cross.entry(key).or_default().push((
+                name.clone(),
+                claim.confidence,
+                claim.intent.clone(),
+            ));
         }
     }
     for (_key, group) in cross {
@@ -3032,7 +3078,10 @@ pub fn interfere_cognitive_fields(
     base
 }
 
-pub fn apply_cognitive_field_to_lattice(lattice: &mut AgentSemanticLattice, field: &CognitiveField) {
+pub fn apply_cognitive_field_to_lattice(
+    lattice: &mut AgentSemanticLattice,
+    field: &CognitiveField,
+) {
     lattice.claims.retain(|c| {
         !matches!(
             c.kind.as_str(),
@@ -3169,8 +3218,7 @@ pub fn apply_cognitive_field_to_lattice(lattice: &mut AgentSemanticLattice, fiel
                     280,
                 );
             } else if !lattice.thesis.starts_with('[') {
-                lattice.thesis =
-                    truncate(&format!("[{}] {}", field.mode, lattice.thesis), 280);
+                lattice.thesis = truncate(&format!("[{}] {}", field.mode, lattice.thesis), 280);
             }
         }
     } else if field.mode == "contested" {
@@ -3188,10 +3236,10 @@ pub fn apply_cognitive_field_to_lattice(lattice: &mut AgentSemanticLattice, fiel
             280,
         );
     }
-    if !field.standing_waves.is_empty() || !field.conjugates.is_empty() {
-        if lattice.method.starts_with("casl") {
-            lattice.method = "casl-v6-pccf".to_string();
-        }
+    if (!field.standing_waves.is_empty() || !field.conjugates.is_empty())
+        && lattice.method.starts_with("casl")
+    {
+        lattice.method = "casl-v6-pccf".to_string();
     }
     if let Some(probe) = field.conjugates.first() {
         let already = lattice.ibc.iter().any(|s| {
@@ -3232,16 +3280,15 @@ pub fn apply_cognitive_field_to_lattice(lattice: &mut AgentSemanticLattice, fiel
     }
 }
 
-
 pub fn synthesize_observation_corpus(
     lattice: &AgentSemanticLattice,
     extra: Option<&str>,
 ) -> String {
     let mut parts = Vec::new();
-    if let Some(extra) = extra {
-        if !extra.trim().is_empty() {
-            parts.push(truncate(extra, 4000));
-        }
+    if let Some(extra) = extra
+        && !extra.trim().is_empty()
+    {
+        parts.push(truncate(extra, 4000));
     }
     if !lattice.thesis.is_empty() {
         parts.push(lattice.thesis.clone());
@@ -3345,7 +3392,7 @@ pub fn project_diffraction_residuals(
             question: format!(
                 "Does `{}` {} collapse claim {}? true=[{}] false=[{}]",
                 probe.tool,
-                probe.query.as_ref().map(|q| q.as_str()).unwrap_or("-"),
+                probe.query.as_deref().unwrap_or("-"),
                 truncate(&probe.claim_intent, 64),
                 truncate(&probe.expected_true, 36),
                 truncate(&probe.expected_false, 36)
@@ -3363,9 +3410,11 @@ pub fn project_diffraction_residuals(
     if lattice.quality.escalate {
         residuals.push(DiffractionResidual {
             id: format!("r{}", residuals.len() + 1),
-            question: lattice.quality.escalate_reason.clone().unwrap_or_else(|| {
-                "sparse lattice requires profile/disassemble escalation".into()
-            }),
+            question: lattice
+                .quality
+                .escalate_reason
+                .clone()
+                .unwrap_or_else(|| "sparse lattice requires profile/disassemble escalation".into()),
             information_value: 0.7,
             probe_tool: "function_profile".to_string(),
             probe_query: None,
@@ -3456,10 +3505,11 @@ pub fn inject_diffraction_residuals_into_lattice(
     for (idx, claim) in lattice.claims.iter_mut().enumerate() {
         claim.id = format!("c{}", idx + 1);
     }
-    if !field.residuals.is_empty() || !field.collapse_events.is_empty() {
-        if lattice.method.starts_with("casl") && !lattice.method.contains("v8") {
-            lattice.method = "casl-v7-odc".to_string();
-        }
+    if (!field.residuals.is_empty() || !field.collapse_events.is_empty())
+        && lattice.method.starts_with("casl")
+        && !lattice.method.contains("v8")
+    {
+        lattice.method = "casl-v7-odc".to_string();
     }
 }
 
@@ -3549,9 +3599,11 @@ pub fn collapse_cognitive_field(
                 }
             }
         }
-        if let Some(wave) = field.standing_waves.iter_mut().find(|w| {
-            w.sources.contains(&probe.claim_id) || w.intent == probe.claim_intent
-        }) {
+        if let Some(wave) = field
+            .standing_waves
+            .iter_mut()
+            .find(|w| w.sources.contains(&probe.claim_id) || w.intent == probe.claim_intent)
+        {
             match polarity {
                 "true" => {
                     wave.amplitude = (wave.amplitude + 0.07 + true_score * 0.05).min(0.995);
@@ -3643,7 +3695,7 @@ pub fn format_cognitive_field_lines(field: &CognitiveField) -> Vec<String> {
             probe.claim_id,
             probe.information_gain,
             probe.tool,
-            probe.query.as_ref().map(|q| q.as_str()).unwrap_or("-"),
+            probe.query.as_deref().unwrap_or("-"),
             truncate(&probe.expected_true, 40),
             truncate(&probe.expected_false, 40)
         ));
@@ -3659,11 +3711,7 @@ pub fn format_cognitive_field_lines(field: &CognitiveField) -> Vec<String> {
             residual.polarity,
             residual.information_value,
             residual.probe_tool,
-            residual
-                .probe_query
-                .as_ref()
-                .map(|q| q.as_str())
-                .unwrap_or("-"),
+            residual.probe_query.as_deref().unwrap_or("-"),
             truncate(&residual.question, 100)
         ));
     }
@@ -3674,7 +3722,7 @@ pub fn format_cognitive_field_lines(field: &CognitiveField) -> Vec<String> {
         lines.push(format!(
             "EXECUTE CONJUGATE: `{}` {} // max information gain {:.2}",
             probe.tool,
-            probe.query.as_ref().map(|q| q.as_str()).unwrap_or(""),
+            probe.query.as_deref().unwrap_or(""),
             probe.information_gain
         ));
     }
@@ -3682,11 +3730,7 @@ pub fn format_cognitive_field_lines(field: &CognitiveField) -> Vec<String> {
         lines.push(format!(
             "EXECUTE RESIDUAL: `{}` {} // iv={:.2} {}",
             residual.probe_tool,
-            residual
-                .probe_query
-                .as_ref()
-                .map(|q| q.as_str())
-                .unwrap_or(""),
+            residual.probe_query.as_deref().unwrap_or(""),
             residual.information_value,
             truncate(&residual.question, 80)
         ));
@@ -3718,7 +3762,6 @@ pub fn format_cognitive_field_lines(field: &CognitiveField) -> Vec<String> {
     }
     lines
 }
-
 
 pub fn parse_collapse_verdict(event: &str) -> Option<CollapseVerdict> {
     let raw = event.trim();
@@ -3821,10 +3864,10 @@ pub fn match_verdict_to_orbit_key(
             return Some(key);
         }
     }
-    if let Some((key, _)) = state.orbit_hypotheses.iter().next() {
-        if verdict.polarity == "true" || verdict.polarity == "false" {
-            return Some(key.clone());
-        }
+    if let Some((key, _)) = state.orbit_hypotheses.iter().next()
+        && (verdict.polarity == "true" || verdict.polarity == "false")
+    {
+        return Some(key.clone());
     }
     None
 }
@@ -3988,10 +4031,10 @@ pub fn seal_plan_from_proof_chain(
             .rev()
             .find_map(|e| {
                 let v = parse_collapse_verdict(e)?;
-                if v.claim_id == link.claim_id || e.contains(&link.orbit_key) {
-                    Some(v)
-                } else if match_verdict_to_orbit_key(&v, state).as_deref()
-                    == Some(link.orbit_key.as_str())
+                if v.claim_id == link.claim_id
+                    || e.contains(&link.orbit_key)
+                    || match_verdict_to_orbit_key(&v, state).as_deref()
+                        == Some(link.orbit_key.as_str())
                 {
                     Some(v)
                 } else {
@@ -4113,10 +4156,14 @@ pub fn detect_and_attach_orbit_conflicts(lattice: &mut AgentSemanticLattice) {
                 "split orbit on '{}': {} handlers {:?}",
                 c_escape_glyph(glyph),
                 handlers.len(),
-                handlers.iter().take(4).map(|h| format!("0x{h:x}")).collect::<Vec<_>>()
+                handlers
+                    .iter()
+                    .take(4)
+                    .map(|h| format!("0x{h:x}"))
+                    .collect::<Vec<_>>()
             ));
         }
-        let mut tag_sets: Vec<BTreeSet<String>> = edges
+        let tag_sets: Vec<BTreeSet<String>> = edges
             .iter()
             .map(|e| e.behaviors.iter().cloned().collect())
             .collect();
@@ -4157,7 +4204,10 @@ pub fn detect_and_attach_orbit_conflicts(lattice: &mut AgentSemanticLattice) {
             }
         }
         if edge.handler.is_some()
-            && edge.behaviors.iter().any(|t| t == "opaque" || t == "opaque_handler")
+            && edge
+                .behaviors
+                .iter()
+                .any(|t| t == "opaque" || t == "opaque_handler")
             && edge.confidence >= 0.9
         {
             conflicts.push(format!(
@@ -4266,7 +4316,6 @@ fn ibc_step_to_action(step: &IbcStep, fallback_address: u64, priority: u8) -> Ag
     }
 }
 
-
 fn project_flag_behavior_graph(
     lattice: &mut AgentSemanticLattice,
     pieces: &[(String, u64, AgentSemanticLattice)],
@@ -4289,19 +4338,19 @@ fn project_flag_behavior_graph(
         let mut effects: Vec<String> = Vec::new();
         let mut confidence = 0.72f32;
         let mut handler_lattice: Option<&AgentSemanticLattice> = None;
-        if let Some(target) = case.target {
-            if let Some(h) = by_addr.get(&target) {
-                handler_lattice = Some(*h);
-            }
+        if let Some(target) = case.target
+            && let Some(h) = by_addr.get(&target)
+        {
+            handler_lattice = Some(*h);
         }
-        if handler_lattice.is_none() {
-            if let Some(name) = case.target_name.as_ref() {
-                let key = name.to_ascii_lowercase();
-                if let Some(h) = by_name.get(&key) {
-                    handler_lattice = Some(*h);
-                } else if let Some(h) = by_name.get(key.trim_start_matches('_')) {
-                    handler_lattice = Some(*h);
-                }
+        if handler_lattice.is_none()
+            && let Some(name) = case.target_name.as_ref()
+        {
+            let key = name.to_ascii_lowercase();
+            if let Some(h) = by_name.get(&key) {
+                handler_lattice = Some(*h);
+            } else if let Some(h) = by_name.get(key.trim_start_matches('_')) {
+                handler_lattice = Some(*h);
             }
         }
         if let Some(h) = handler_lattice {
@@ -4335,14 +4384,20 @@ fn project_flag_behavior_graph(
         if behaviors.is_empty() {
             behaviors.insert("opaque_handler".to_string());
         }
-        let handler_name = case.target_name.clone().or_else(|| {
-            case.target.map(|t| format!("sub_{t:x}"))
-        });
+        let handler_name = case
+            .target_name
+            .clone()
+            .or_else(|| case.target.map(|t| format!("sub_{t:x}")));
         let orbit = Some(format!(
             "'{}'→{}⟦{}⟧",
             c_escape_glyph(&case.glyph),
             handler_name.as_deref().unwrap_or("?"),
-            behaviors.iter().cloned().take(4).collect::<Vec<_>>().join("+")
+            behaviors
+                .iter()
+                .take(4)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("+")
         ));
         edges.push(FlagBehaviorEdge {
             glyph: case.glyph.clone(),
@@ -4492,7 +4547,9 @@ fn mine_handler_signature(lattice: &AgentSemanticLattice) -> (Vec<String>, Vec<S
         if intent_l.contains("terminal") || intent_l.contains("isatty") {
             tags.insert("tty".to_string());
         }
-        if intent_l.contains("socket") || intent_l.contains("connect") || intent_l.contains("network")
+        if intent_l.contains("socket")
+            || intent_l.contains("connect")
+            || intent_l.contains("network")
         {
             tags.insert("net".to_string());
             score = score.max(0.9);
@@ -4624,13 +4681,13 @@ fn compile_fbg_investigation_program(
     let mut ibc = Vec::new();
     let mut pc = 0u16;
     let push = |ops: &mut Vec<String>,
-                    ibc: &mut Vec<IbcStep>,
-                    pc: &mut u16,
-                    op: &str,
-                    detail: String,
-                    tool: Option<String>,
-                    args: serde_json::Value,
-                    claim_id: Option<String>| {
+                ibc: &mut Vec<IbcStep>,
+                pc: &mut u16,
+                op: &str,
+                detail: String,
+                tool: Option<String>,
+                args: serde_json::Value,
+                claim_id: Option<String>| {
         ops.push(format!("{op} {detail}"));
         ibc.push(IbcStep {
             pc: *pc,
@@ -4665,13 +4722,21 @@ fn compile_fbg_investigation_program(
         );
     }
     if !case_lexicon.is_empty() {
-        let compact: String = case_lexicon.iter().take(20).map(|c| c.glyph.as_str()).collect();
+        let compact: String = case_lexicon
+            .iter()
+            .take(20)
+            .map(|c| c.glyph.as_str())
+            .collect();
         push(
             &mut ops,
             &mut ibc,
             &mut pc,
             "MAP_CASES",
-            format!("lexicon=`{}` n={}", truncate(&compact, 40), case_lexicon.len()),
+            format!(
+                "lexicon=`{}` n={}",
+                truncate(&compact, 40),
+                case_lexicon.len()
+            ),
             Some("disassemble_function".to_string()),
             serde_json::json!({ "query": format!("0x{address:x}") }),
             claims
@@ -4712,7 +4777,12 @@ fn compile_fbg_investigation_program(
                 "'{}' -> {} tags=[{}]",
                 c_escape_glyph(&edge.glyph),
                 edge.handler_name.as_deref().unwrap_or("handler"),
-                edge.behaviors.iter().take(4).cloned().collect::<Vec<_>>().join(",")
+                edge.behaviors
+                    .iter()
+                    .take(4)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(",")
             ),
             Some("decompile_function".to_string()),
             serde_json::json!({ "query": format!("0x{target:x}") }),
@@ -4742,7 +4812,12 @@ fn compile_fbg_investigation_program(
             serde_json::json!({ "query": format!("0x{address:x}") }),
             claims
                 .iter()
-                .find(|c| matches!(c.kind.as_str(), "case_resonance" | "case_bind" | "flag_orbit"))
+                .find(|c| {
+                    matches!(
+                        c.kind.as_str(),
+                        "case_resonance" | "case_bind" | "flag_orbit"
+                    )
+                })
                 .map(|c| c.id.clone()),
         );
     }
@@ -4766,7 +4841,10 @@ fn compile_fbg_investigation_program(
             ),
             Some("function_profile".to_string()),
             serde_json::json!({ "query": format!("0x{address:x}") }),
-            claims.iter().find(|c| c.kind == "flag_orbit").map(|c| c.id.clone()),
+            claims
+                .iter()
+                .find(|c| c.kind == "flag_orbit")
+                .map(|c| c.id.clone()),
         );
     }
     for chain in chains.iter().take(2) {
@@ -4775,7 +4853,12 @@ fn compile_fbg_investigation_program(
             &mut ibc,
             &mut pc,
             "TRACE_CHAIN",
-            format!("{} conf={:.2} {}", chain.id, chain.confidence, truncate(&chain.narrative, 72)),
+            format!(
+                "{} conf={:.2} {}",
+                chain.id,
+                chain.confidence,
+                truncate(&chain.narrative, 72)
+            ),
             Some("decompile_function".to_string()),
             serde_json::json!({ "query": format!("0x{address:x}") }),
             chain.steps.first().cloned(),
@@ -4794,6 +4877,7 @@ fn compile_fbg_investigation_program(
     (ops, ibc)
 }
 
+#[allow(clippy::useless_conversion)]
 fn recover_case_lexicon(
     switch_hits: &[(String, String)],
     optstrings: &[(String, String)],
@@ -4811,26 +4895,27 @@ fn recover_case_lexicon(
     }
     if bias.is_none() {
         for line in text.lines() {
-            if let Some((scrutinee, bd)) = extract_switch(line) {
-                if let Some((b, _)) = parse_switch_bias_bound(&format!("switch({scrutinee}) bound={bd}")) {
-                    bias = Some(b);
-                    if !bd.is_empty() {
-                        if let Ok(v) = bd.parse::<u32>() {
-                            bound = Some(v);
-                        }
-                    }
-                    break;
+            if let Some((scrutinee, bd)) = extract_switch(line)
+                && let Some((b, _)) =
+                    parse_switch_bias_bound(&format!("switch({scrutinee}) bound={bd}"))
+            {
+                bias = Some(b);
+                if !bd.is_empty()
+                    && let Ok(v) = bd.parse::<u32>()
+                {
+                    bound = Some(v);
                 }
+                break;
             }
         }
     }
 
     let mut from_text_cases: Vec<CaseLexeme> = Vec::new();
     for line in text.lines() {
-        if let Some(lex) = parse_case_label_line(line) {
-            if !from_text_cases.iter().any(|c| c.code == lex.code) {
-                from_text_cases.push(lex);
-            }
+        if let Some(lex) = parse_case_label_line(line)
+            && !from_text_cases.iter().any(|c| c.code == lex.code)
+        {
+            from_text_cases.push(lex);
         }
     }
 
@@ -4841,7 +4926,10 @@ fn recover_case_lexicon(
 
     let mut out: Vec<CaseLexeme> = Vec::new();
     for item in from_opt.into_iter().chain(from_text_cases.into_iter()) {
-        if !out.iter().any(|c| c.code == item.code && c.glyph == item.glyph) {
+        if !out
+            .iter()
+            .any(|c| c.code == item.code && c.glyph == item.glyph)
+        {
             out.push(item);
         }
     }
@@ -4890,11 +4978,11 @@ fn optstring_to_cases(opt: &str, bias: Option<u32>, bound: Option<u32>) -> Vec<C
         let takes_arg = i + 1 < chars.len() && chars[i + 1] == ':';
         let code = c as u32;
         let slot = bias.map(|b| code.saturating_sub(b));
-        if let (Some(b), Some(bd)) = (bias, bound) {
-            if code < b || code.saturating_sub(b) > bd {
-                i += 1 + takes_arg as usize;
-                continue;
-            }
+        if let (Some(b), Some(bd)) = (bias, bound)
+            && (code < b || code.saturating_sub(b) > bd)
+        {
+            i += 1 + takes_arg as usize;
+            continue;
         }
         out.push(CaseLexeme {
             glyph: c.to_string(),
@@ -4902,7 +4990,7 @@ fn optstring_to_cases(opt: &str, bias: Option<u32>, bound: Option<u32>) -> Vec<C
             takes_arg,
             slot,
             meaning: guess_flag_meaning(c),
-                    target: None,
+            target: None,
             target_name: None,
         });
         i += 1 + takes_arg as usize;
@@ -4928,7 +5016,7 @@ fn parse_case_label_line(line: &str) -> Option<CaseLexeme> {
             takes_arg: false,
             slot: None,
             meaning: guess_flag_meaning(ch),
-                    target: None,
+            target: None,
             target_name: None,
         });
     }
@@ -4945,13 +5033,12 @@ fn parse_case_label_line(line: &str) -> Option<CaseLexeme> {
             takes_arg: false,
             slot: None,
             meaning: None,
-                    target: None,
+            target: None,
             target_name: None,
         });
     }
     None
 }
-
 
 fn infer_meaning_from_handler(name: &str, glyph: &str) -> Option<String> {
     let lower = name.to_ascii_lowercase();
@@ -4977,10 +5064,10 @@ fn infer_meaning_from_handler(name: &str, glyph: &str) -> Option<String> {
     if lower.contains("long") && g == "l" {
         return Some("long listing format".to_string());
     }
-    if let Some(ch) = g.chars().next() {
-        if let Some(m) = guess_flag_meaning(ch) {
-            return Some(m);
-        }
+    if let Some(ch) = g.chars().next()
+        && let Some(m) = guess_flag_meaning(ch)
+    {
+        return Some(m);
     }
     if lower.contains(&format!("_{g}"))
         || lower.contains(&format!("flag_{g}"))
@@ -5012,11 +5099,11 @@ fn close_case_slots(lattice: &mut AgentSemanticLattice) {
     }
     for case in &mut lattice.case_lexicon {
         if case.slot.is_none() {
-            if let Some(target) = case.target {
-                if let Some(idx) = ordered.iter().position(|(_, t)| *t == target) {
-                    case.slot = Some(idx as u32);
-                    continue;
-                }
+            if let Some(target) = case.target
+                && let Some(idx) = ordered.iter().position(|(_, t)| *t == target)
+            {
+                case.slot = Some(idx as u32);
+                continue;
             }
             if case.code >= min_code {
                 case.slot = Some(case.code.saturating_sub(min_code));
@@ -5072,10 +5159,10 @@ fn synthesize_thesis(
     strings: &[(String, String)],
     call_kinds: &BTreeMap<&'static str, Vec<String>>,
 ) -> String {
-    if let Some(chain) = chains.first() {
-        if chain.confidence >= 0.88 {
-            return truncate(&chain.narrative, 220);
-        }
+    if let Some(chain) = chains.first()
+        && chain.confidence >= 0.88
+    {
+        return truncate(&chain.narrative, 220);
     }
     let mut parts = Vec::new();
     for claim in claims.iter().take(2) {
@@ -5103,6 +5190,7 @@ fn synthesize_thesis(
     truncate(&parts.join("; "), 220)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn make_claim(
     index: usize,
     intent: String,
@@ -5163,10 +5251,10 @@ fn push_anchor(
     {
         return existing.id.clone();
     }
-    if !seen.insert(key) {
-        if let Some(existing) = anchors.iter().rev().find(|a| a.kind == kind) {
-            return existing.id.clone();
-        }
+    if !seen.insert(key)
+        && let Some(existing) = anchors.iter().rev().find(|a| a.kind == kind)
+    {
+        return existing.id.clone();
     }
     let id = format!("a{}", anchors.len() + 1);
     anchors.push(SemanticAnchor {
@@ -5210,6 +5298,7 @@ fn collect_signal_lines(text: &str, regions: &[PseudocodeRegion]) -> Vec<String>
     out
 }
 
+#[allow(clippy::question_mark)]
 fn extract_if_condition(line: &str) -> Option<String> {
     let t = line.trim();
     let rest = if let Some(r) = t.strip_prefix("if (") {
@@ -5322,10 +5411,10 @@ fn extract_call_names(line: &str) -> Vec<String> {
         }
         i += 1;
     }
-    if out.is_empty() {
-        if let Some(one) = extract_call_name_legacy(work) {
-            out.push(one);
-        }
+    if out.is_empty()
+        && let Some(one) = extract_call_name_legacy(work)
+    {
+        out.push(one);
     }
     out
 }
@@ -5416,14 +5505,16 @@ fn extract_quoted_literals(text: &str) -> Vec<String> {
 fn parse_addr_comment(line: &str) -> Option<u64> {
     let idx = line.rfind("// 0x").or_else(|| line.rfind("//0x"))?;
     let rest = line[idx..].trim_start_matches('/').trim_start_matches(' ');
-    let hex = rest.trim_start_matches("//").trim().trim_start_matches("0x");
+    let hex = rest
+        .trim_start_matches("//")
+        .trim()
+        .trim_start_matches("0x");
     let token = hex
         .split(|c: char| !c.is_ascii_hexdigit())
         .next()
         .unwrap_or("");
     u64::from_str_radix(token, 16).ok()
 }
-
 
 fn extract_cli_optstring(line: &str) -> Option<String> {
     let mut best: Option<String> = None;
@@ -5459,8 +5550,7 @@ fn is_soft_optstring(s: &str) -> bool {
         return false;
     }
     let alpha = s.chars().filter(|c| c.is_ascii_alphabetic()).count();
-    alpha >= 1
-        && alpha <= 32
+    (1..=32).contains(&alpha)
         && (s.contains(':') || s.starts_with('+') || s.starts_with('-') || alpha <= 12)
 }
 
@@ -5477,7 +5567,14 @@ fn looks_like_optstring(s: &str) -> bool {
     }
     let alnum = s
         .chars()
-        .filter(|c| c.is_ascii_alphanumeric() || *c == ':' || *c == '+' || *c == '-' || *c == '@' || *c == '%')
+        .filter(|c| {
+            c.is_ascii_alphanumeric()
+                || *c == ':'
+                || *c == '+'
+                || *c == '-'
+                || *c == '@'
+                || *c == '%'
+        })
         .count();
     if alnum < s.len().saturating_mul(8) / 10 {
         return false;
@@ -5549,31 +5646,73 @@ fn classify_api(name: &str) -> &'static str {
     }
     if matches!(
         base,
-        "open" | "openat" | "fopen" | "fdopen" | "read" | "write" | "fread" | "fwrite"
-            | "close" | "fclose" | "pread" | "pwrite" | "mmap" | "munmap" | "stat" | "fstat"
-            | "lstat" | "access" | "unlink" | "rename" | "mkdir" | "opendir" | "readdir"
+        "open"
+            | "openat"
+            | "fopen"
+            | "fdopen"
+            | "read"
+            | "write"
+            | "fread"
+            | "fwrite"
+            | "close"
+            | "fclose"
+            | "pread"
+            | "pwrite"
+            | "mmap"
+            | "munmap"
+            | "stat"
+            | "fstat"
+            | "lstat"
+            | "access"
+            | "unlink"
+            | "rename"
+            | "mkdir"
+            | "opendir"
+            | "readdir"
     ) || base.starts_with("stdio")
     {
         return "io";
     }
     if matches!(
         base,
-        "socket" | "connect" | "bind" | "listen" | "accept" | "send" | "recv" | "sendto"
-            | "recvfrom" | "getaddrinfo" | "poll" | "select"
+        "socket"
+            | "connect"
+            | "bind"
+            | "listen"
+            | "accept"
+            | "send"
+            | "recv"
+            | "sendto"
+            | "recvfrom"
+            | "getaddrinfo"
+            | "poll"
+            | "select"
     ) {
         return "net";
     }
     if matches!(
         base,
-        "malloc" | "calloc" | "realloc" | "free" | "memcpy" | "memmove" | "memset" | "memcmp"
-            | "strdup" | "strndup"
+        "malloc"
+            | "calloc"
+            | "realloc"
+            | "free"
+            | "memcpy"
+            | "memmove"
+            | "memset"
+            | "memcmp"
+            | "strdup"
+            | "strndup"
     ) {
         return "mem";
     }
     if matches!(
         base,
-        "pthread_mutex_lock" | "pthread_mutex_unlock" | "pthread_create" | "pthread_join"
-            | "sem_wait" | "sem_post"
+        "pthread_mutex_lock"
+            | "pthread_mutex_unlock"
+            | "pthread_create"
+            | "pthread_join"
+            | "sem_wait"
+            | "sem_post"
     ) || base.starts_with("pthread_")
     {
         return "sync";
@@ -5590,8 +5729,16 @@ fn classify_api(name: &str) -> &'static str {
     }
     if matches!(
         base,
-        "fork" | "vfork" | "execve" | "execl" | "execlp" | "execvp" | "system" | "posix_spawn"
-            | "waitpid" | "kill"
+        "fork"
+            | "vfork"
+            | "execve"
+            | "execl"
+            | "execlp"
+            | "execvp"
+            | "system"
+            | "posix_spawn"
+            | "waitpid"
+            | "kill"
     ) {
         return "proc";
     }
@@ -5637,7 +5784,11 @@ int main(int argc, char **argv) {
 }
 "#;
         let lattice = build_agent_semantic_lattice("main", 0x1000, text, &[]);
-        assert!(lattice.method.starts_with("casl-v"), "method={}", lattice.method);
+        assert!(
+            lattice.method.starts_with("casl-v"),
+            "method={}",
+            lattice.method
+        );
         assert!(!lattice.thesis.is_empty());
         assert!(
             lattice
@@ -5648,10 +5799,9 @@ int main(int argc, char **argv) {
             lattice.anchors
         );
         assert!(
-            lattice
-                .claims
-                .iter()
-                .any(|c| c.kind == "control" || c.intent.contains("CLI") || c.intent.contains("getopt")),
+            lattice.claims.iter().any(|c| c.kind == "control"
+                || c.intent.contains("CLI")
+                || c.intent.contains("getopt")),
             "expected cli claim: {:?}",
             lattice.claims
         );
@@ -5698,7 +5848,10 @@ int main(int argc, char **argv) {
             lattice.case_lexicon
         );
         assert!(
-            lattice.case_lexicon.iter().any(|c| c.glyph == "A" || c.glyph == "a" || c.glyph == "@"),
+            lattice
+                .case_lexicon
+                .iter()
+                .any(|c| c.glyph == "A" || c.glyph == "a" || c.glyph == "@"),
             "expected flag glyphs: {:?}",
             lattice.case_lexicon
         );
@@ -5709,7 +5862,10 @@ int main(int argc, char **argv) {
         assert!(rendered.contains("## Semantic Lattice"));
         assert!(rendered.contains("### Claims"));
         assert!(rendered.contains("### Anchors"));
-        assert!(rendered.contains("### Causal Chains") || rendered.contains("### Investigation Bytecode"));
+        assert!(
+            rendered.contains("### Causal Chains")
+                || rendered.contains("### Investigation Bytecode")
+        );
     }
 
     #[test]
@@ -5720,7 +5876,6 @@ int main(int argc, char **argv) {
         assert!(!lattice.claims.is_empty());
         assert!(!lattice.investigation_bytecode.is_empty());
     }
-
 
     #[test]
     fn casl_fuses_flag_behavior_orbits() {
@@ -5768,10 +5923,7 @@ int main() {
                 ("handle_b".into(), 0x3000, handle_b),
             ],
         );
-        assert!(
-            !fused.behavior_graph.is_empty(),
-            "empty behavior graph"
-        );
+        assert!(!fused.behavior_graph.is_empty(), "empty behavior graph");
         assert!(
             fused.behavior_graph.iter().any(|e| {
                 e.glyph == "a"
@@ -5782,9 +5934,10 @@ int main() {
             fused.behavior_graph
         );
         assert!(
-            fused.behavior_graph.iter().any(|e| {
-                e.glyph == "b" && e.behaviors.iter().any(|b| b == "net")
-            }),
+            fused
+                .behavior_graph
+                .iter()
+                .any(|e| { e.glyph == "b" && e.behaviors.iter().any(|b| b == "net") }),
             "orbit b missing net: {:?}",
             fused.behavior_graph
         );
@@ -5808,14 +5961,28 @@ int main() {
             "int helper(){ _socket(2,1,0); return 0; }",
             &[],
         );
-        let fused = fuse_semantic_lattices("cli+net", &[("main".into(), 0x1000, a), ("helper".into(), 0x2000, b)]);
+        let fused = fuse_semantic_lattices(
+            "cli+net",
+            &[("main".into(), 0x1000, a), ("helper".into(), 0x2000, b)],
+        );
         assert!(fused.method.contains("casl-v"), "method={}", fused.method);
         assert!(
             fused.thesis.contains("main")
-                || fused.claims.iter().any(|c| c.id.contains("main") || c.intent.contains("main"))
-                || fused.investigation_bytecode.iter().any(|op| op.contains("main"))
+                || fused
+                    .claims
+                    .iter()
+                    .any(|c| c.id.contains("main") || c.intent.contains("main"))
+                || fused
+                    .investigation_bytecode
+                    .iter()
+                    .any(|op| op.contains("main"))
         );
-        assert!(fused.claims.iter().any(|c| c.id.contains("helper") || c.intent.contains("helper")));
+        assert!(
+            fused
+                .claims
+                .iter()
+                .any(|c| c.id.contains("helper") || c.intent.contains("helper"))
+        );
         assert!(!fused.investigation_bytecode.is_empty());
     }
 
@@ -5851,11 +6018,19 @@ int main() {
         let drafts = forge_orbit_hypothesis_drafts(&state);
         assert!(!drafts.is_empty());
         assert!(drafts[0].title.contains("handle_a") || drafts[0].title.contains("'a'"));
-        assert!(drafts[0].evidence_ids.iter().any(|e| e.contains("casl:orbit")));
+        assert!(
+            drafts[0]
+                .evidence_ids
+                .iter()
+                .any(|e| e.contains("casl:orbit"))
+        );
         assert!(drafts[0].notes.contains("confute") || drafts[0].notes.contains("conjugate"));
-        assert!(drafts[0].notes.contains("field_mode") || drafts[0].notes.contains("CASL/PCCF") || drafts[0].notes.contains("standing_wave"));
+        assert!(
+            drafts[0].notes.contains("field_mode")
+                || drafts[0].notes.contains("CASL/PCCF")
+                || drafts[0].notes.contains("standing_wave")
+        );
     }
-
 
     #[test]
     fn casl_projects_cognitive_field_and_conjugates() {
@@ -5877,7 +6052,11 @@ int main(int argc, char **argv) {
 }
 "#;
         let lattice = build_agent_semantic_lattice("main", 0x1000, text, &[]);
-        assert!(lattice.method == "casl-v6-pccf" || lattice.method == "casl-v7-odc", "{}", lattice.method);
+        assert!(
+            lattice.method == "casl-v6-pccf" || lattice.method == "casl-v7-odc",
+            "{}",
+            lattice.method
+        );
         let field = project_cognitive_field(&lattice);
         assert!(!field.mode.is_empty());
         assert!(!field.standing_waves.is_empty() || !field.conjugates.is_empty());
@@ -5967,21 +6146,25 @@ int main() {
                 ("helper".into(), 0x2000, b.clone()),
             ],
         );
-        assert!(fused.method == "casl-v6-pccf" || fused.method == "casl-v7-odc", "{}", fused.method);
+        assert!(
+            fused.method == "casl-v6-pccf" || fused.method == "casl-v7-odc",
+            "{}",
+            fused.method
+        );
         let pieces = vec![("main".into(), &a), ("helper".into(), &b)];
         let field = interfere_cognitive_fields(&pieces, &fused);
         assert!(!field.standing_waves.is_empty());
-        let multi = field.standing_waves.iter().any(|w| {
-            w.sources.len() >= 2 || w.kind == "interference" || w.amplitude >= 0.7
-        });
+        let multi = field
+            .standing_waves
+            .iter()
+            .any(|w| w.sources.len() >= 2 || w.kind == "interference" || w.amplitude >= 0.7);
         assert!(multi || !field.conjugates.is_empty());
     }
 
-    
-    
     #[test]
     fn casl_pcos_parses_collapse_and_seals_notes() {
-        let event = "c3:reads environment via decompile_function 0x1000 => true (t=0.60/f=0.00/i=0.45)";
+        let event =
+            "c3:reads environment via decompile_function 0x1000 => true (t=0.60/f=0.00/i=0.45)";
         let v = parse_collapse_verdict(event).expect("parse");
         assert_eq!(v.polarity, "true");
         assert_eq!(v.claim_id, "c3");
@@ -5992,7 +6175,10 @@ int main() {
         assert!(notes.contains("### PCOS VERDICT e3 97:a"));
         assert!(notes.contains("polarity=true"));
         let notes2 = apply_verdict_to_hypothesis_notes(&notes, &v, 3, "97:a");
-        assert_eq!(notes.matches("### PCOS VERDICT").count(), notes2.matches("### PCOS VERDICT").count());
+        assert_eq!(
+            notes.matches("### PCOS VERDICT").count(),
+            notes2.matches("### PCOS VERDICT").count()
+        );
     }
 
     #[test]
@@ -6035,16 +6221,17 @@ int main(int argc, char **argv) {
         };
         state.cognitive_field = project_cognitive_field(&state.lattice);
         state.cognitive_field.collapse_events.push(
-            "c2:flag orbit 'a' via decompile_function 0x2000 => true (t=0.70/f=0.00/i=0.50)"
-                .into(),
+            "c2:flag orbit 'a' via decompile_function 0x2000 => true (t=0.70/f=0.00/i=0.50)".into(),
         );
         state.cognitive_field.proof_chain = compose_proof_chain(&state);
         assert!(!state.cognitive_field.proof_chain.is_empty());
-        assert!(state
-            .cognitive_field
-            .proof_chain
-            .iter()
-            .any(|l| l.orbit_key == "97:a" && l.hypothesis_id.as_deref() == Some("hyp-1")));
+        assert!(
+            state
+                .cognitive_field
+                .proof_chain
+                .iter()
+                .any(|l| l.orbit_key == "97:a" && l.hypothesis_id.as_deref() == Some("hyp-1"))
+        );
         inject_proof_chain_into_lattice(&mut state.lattice, &state.cognitive_field);
         assert!(state.lattice.claims.iter().any(|c| c.kind == "proof_chain"));
         assert!(
@@ -6063,11 +6250,15 @@ int main(int argc, char **argv) {
         state.lattice.method = "casl-v8-pcos".into();
         let field_lines = format_cognitive_field_lines(&state.cognitive_field);
         let joined = field_lines.join("\n");
-        assert!(joined.contains("Proof Chain") || joined.contains("LINK") || !state.cognitive_field.proof_chain.is_empty());
+        assert!(
+            joined.contains("Proof Chain")
+                || joined.contains("LINK")
+                || !state.cognitive_field.proof_chain.is_empty()
+        );
         let _ = rendered;
     }
 
-#[test]
+    #[test]
     fn casl_observation_collapse_and_residuals() {
         let src = r#"
 int main() {
@@ -6093,10 +6284,7 @@ int main() {
         assert!(
             state.lattice.method == "casl-v7-odc"
                 || state.lattice.claims.iter().any(|c| {
-                    matches!(
-                        c.kind.as_str(),
-                        "diffraction_residual" | "collapse_verdict"
-                    )
+                    matches!(c.kind.as_str(), "diffraction_residual" | "collapse_verdict")
                 })
         );
         let rendered = format_semantic_lattice(&state.lattice);
@@ -6143,7 +6331,7 @@ int main() {
         assert_eq!(s1.namespace, "persist-ns");
     }
 
-#[test]
+    #[test]
     fn casl_continuum_ledger_isolates_namespaces() {
         let mut ledger = IbcContinuumLedger::default();
         let a = build_agent_semantic_lattice(
@@ -6158,22 +6346,10 @@ int main() {
             "int main_b(){ _getopt_long(0,0,\"+b:\",0); return 0; }",
             &[],
         );
-        let n1 = continuum_ledger_on_visit(
-            &mut ledger,
-            "binA",
-            "function_profile",
-            0x1000,
-            "main_a",
-            a,
-        );
-        let n2 = continuum_ledger_on_visit(
-            &mut ledger,
-            "binB",
-            "function_profile",
-            0x2000,
-            "main_b",
-            b,
-        );
+        let n1 =
+            continuum_ledger_on_visit(&mut ledger, "binA", "function_profile", 0x1000, "main_a", a);
+        let n2 =
+            continuum_ledger_on_visit(&mut ledger, "binB", "function_profile", 0x2000, "main_b", b);
         assert_eq!(ledger.sessions.len(), 2);
         assert_eq!(ledger.active_namespace, "binB");
         assert!(n1.namespace == "binA" || n1.note.contains("binA"));
@@ -6193,7 +6369,11 @@ int main() {
         );
         assert_eq!(ledger.active_namespace, "binA");
         assert!(
-            ledger.sessions.get("binA").map(|s| s.epoch >= 1).unwrap_or(false),
+            ledger
+                .sessions
+                .get("binA")
+                .map(|s| s.epoch >= 1)
+                .unwrap_or(false),
             "binA epoch missing: {:?}",
             ledger.sessions.get("binA").map(|s| s.epoch)
         );
@@ -6204,12 +6384,7 @@ int main() {
 
     #[test]
     fn casl_continuum_state_roundtrips_json() {
-        let lattice = build_agent_semantic_lattice(
-            "main",
-            0x1000,
-            "int main(){ return 0; }",
-            &[],
-        );
+        let lattice = build_agent_semantic_lattice("main", 0x1000, "int main(){ return 0; }", &[]);
         let (state, _) = continuum_on_visit_ns(
             None,
             "elf:/bin/ls",
@@ -6268,18 +6443,19 @@ int main() {
         );
         let mut main_l = build_agent_semantic_lattice("main", 0x1000, dispatcher, &[]);
         bind_case_targets(&mut main_l, &refs, &symbols);
-        let (state0, note0) = continuum_on_visit(
-            None,
-            "function_profile",
-            0x1000,
-            "main",
-            main_l.clone(),
-        );
+        let (state0, note0) =
+            continuum_on_visit(None, "function_profile", 0x1000, "main", main_l.clone());
         assert!(
             note0.advanced.is_some() || note0.note.contains("ADVANCED"),
             "first visit should advance: {} ibc0={:?}",
             note0.note,
-            state0.lattice.ibc.iter().take(3).map(|s| (&s.op, s.pc, &s.tool)).collect::<Vec<_>>()
+            state0
+                .lattice
+                .ibc
+                .iter()
+                .take(3)
+                .map(|s| (&s.op, s.pc, &s.tool))
+                .collect::<Vec<_>>()
         );
         let (state1, _note1) = continuum_on_visit(
             Some(&state0),
@@ -6292,7 +6468,9 @@ int main() {
             .lattice
             .ibc
             .iter()
-            .find(|s| s.pc >= state1.lattice.ibc_pc && s.tool.as_deref() == Some("decompile_function"))
+            .find(|s| {
+                s.pc >= state1.lattice.ibc_pc && s.tool.as_deref() == Some("decompile_function")
+            })
             .cloned()
             .expect("pending decompile step");
         let q = step
@@ -6309,7 +6487,9 @@ int main() {
             build_agent_semantic_lattice("handle", addr, "int handle(){ return 0; }", &[]),
         );
         assert!(
-            note2.advanced.is_some() || state2.witnesses.len() >= 2 || note2.note.contains("ADVANCED"),
+            note2.advanced.is_some()
+                || state2.witnesses.len() >= 2
+                || note2.note.contains("ADVANCED"),
             "expected advance/witness: {} witnesses={:?} pc={}",
             note2.note,
             state2.witnesses,
@@ -6349,7 +6529,10 @@ int main() {
         ];
         detect_and_attach_orbit_conflicts(&mut lattice);
         assert!(
-            lattice.contradictions.iter().any(|c| c.contains("split orbit") || c.contains("exclusive")),
+            lattice
+                .contradictions
+                .iter()
+                .any(|c| c.contains("split orbit") || c.contains("exclusive")),
             "contradictions={:?}",
             lattice.contradictions
         );
@@ -6420,7 +6603,10 @@ int main() {
         symbols.insert(0x2010u64, "handle_b".to_string());
         bind_case_targets(&mut lattice, &refs, &symbols);
         assert!(
-            lattice.case_lexicon.iter().any(|c| c.glyph == "a" && c.target == Some(0x2000)),
+            lattice
+                .case_lexicon
+                .iter()
+                .any(|c| c.glyph == "a" && c.target == Some(0x2000)),
             "a bound: {:?}",
             lattice.case_lexicon
         );
@@ -6449,5 +6635,4 @@ int main() {
         assert!(!plan.is_empty());
         assert!(plan[0].reason.contains("EXECUTE NOW"));
     }
-
 }

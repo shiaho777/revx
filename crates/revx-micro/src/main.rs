@@ -7,7 +7,7 @@ fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<()
     #[cfg(unix)]
     {
         use std::os::unix::fs::FileExt;
-        return FileExt::read_exact_at(file, buf, offset);
+        FileExt::read_exact_at(file, buf, offset)
     }
     #[cfg(windows)]
     {
@@ -214,8 +214,7 @@ fn read_window(
             return None;
         }
         let mut buf = vec![0u8; len];
-        read_exact_at(&file, &mut buf, file_off.saturating_add(offset))
-            .ok()?;
+        read_exact_at(file, &mut buf, file_off.saturating_add(offset)).ok()?;
         return Some(buf);
     }
     None

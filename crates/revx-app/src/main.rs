@@ -35,19 +35,13 @@ fn run() -> Result<(), String> {
         "funcs" => {
             let limit = parse_usize_flag(&args[1..], "--limit", 200);
             let offset = parse_usize_flag(&args[1..], "--offset", 0);
-            let query = free_args(&args[1..])
-                .into_iter()
-                .next()
-                .unwrap_or_default();
+            let query = free_args(&args[1..]).into_iter().next().unwrap_or_default();
             cmd_funcs(&query, limit, offset)
         }
         "strings" => {
             let limit = parse_usize_flag(&args[1..], "--limit", 200);
             let offset = parse_usize_flag(&args[1..], "--offset", 0);
-            let pattern = free_args(&args[1..])
-                .into_iter()
-                .next()
-                .unwrap_or_default();
+            let pattern = free_args(&args[1..]).into_iter().next().unwrap_or_default();
             cmd_strings(&pattern, limit, offset)
         }
         "xrefs" => {
@@ -193,7 +187,6 @@ fn cmd_strings(pattern: &str, limit: usize, offset: usize) -> Result<(), String>
     }}))
 }
 
-
 fn cmd_xrefs(target: &str) -> Result<(), String> {
     let ws = workspace_from_cwd()?;
     let refs = ws.find_references(target).map_err(|e| e.to_string())?;
@@ -272,12 +265,12 @@ fn resolve_engine() -> Result<PathBuf, String> {
     if let Some(path) = env::var_os("REVX_ENGINE") {
         return Ok(PathBuf::from(path));
     }
-    if let Ok(exe) = env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let candidate = dir.join("revx-engine");
-            if candidate.exists() {
-                return Ok(candidate);
-            }
+    if let Ok(exe) = env::current_exe()
+        && let Some(dir) = exe.parent()
+    {
+        let candidate = dir.join("revx-engine");
+        if candidate.exists() {
+            return Ok(candidate);
         }
     }
     Ok(PathBuf::from("revx-engine"))
@@ -301,17 +294,16 @@ fn workspace_from_cwd() -> Result<QueryWorkspace, String> {
 fn parse_usize_flag(args: &[String], flag: &str, default: usize) -> usize {
     let mut i = 0;
     while i < args.len() {
-        if args[i] == flag {
-            if let Some(v) = args.get(i + 1) {
-                if let Ok(n) = v.parse() {
-                    return n;
-                }
-            }
+        if args[i] == flag
+            && let Some(v) = args.get(i + 1)
+            && let Ok(n) = v.parse()
+        {
+            return n;
         }
-        if let Some(rest) = args[i].strip_prefix(&format!("{flag}=")) {
-            if let Ok(n) = rest.parse() {
-                return n;
-            }
+        if let Some(rest) = args[i].strip_prefix(&format!("{flag}="))
+            && let Ok(n) = rest.parse()
+        {
+            return n;
         }
         i += 1;
     }

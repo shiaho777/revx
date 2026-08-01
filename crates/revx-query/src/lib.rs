@@ -8,6 +8,17 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const PROJECT_SCHEMA_VERSION: u32 = 4;
 
+type FunctionLookupRow = (
+    String,
+    u64,
+    u64,
+    Option<String>,
+    Option<String>,
+    String,
+    String,
+    String,
+);
+
 #[derive(Clone)]
 pub struct QueryWorkspace {
     root: PathBuf,
@@ -306,12 +317,11 @@ impl QueryWorkspace {
             preview.evidence_count = count.max(0) as usize;
             if let Ok(mut id_stmt) = conn.prepare(
                 "SELECT id FROM evidence WHERE subject LIKE ?1 OR id LIKE ?1 ORDER BY id LIMIT 32",
-            ) {
-                if let Ok(ids) = id_stmt.query_map([&pattern], |r| r.get::<_, String>(0)) {
-                    preview.evidence_ids = ids
-                        .collect::<std::result::Result<Vec<_>, _>>()
-                        .unwrap_or_default();
-                }
+            ) && let Ok(ids) = id_stmt.query_map([&pattern], |r| r.get::<_, String>(0))
+            {
+                preview.evidence_ids = ids
+                    .collect::<std::result::Result<Vec<_>, _>>()
+                    .unwrap_or_default();
             }
         }
         if let Some(summary) = preview.summary.as_object_mut() {
@@ -334,14 +344,18 @@ impl QueryWorkspace {
                 "SELECT from_addr, to_addr, kind FROM code_references WHERE (from_addr >= ?1 AND from_addr < ?2) OR (to_addr >= ?1 AND to_addr < ?2) ORDER BY from_addr ASC, to_addr ASC",
             )?;
             let rows = stmt.query_map(params![start, end], map_reference)?;
-            return rows.collect::<std::result::Result<Vec<_>, _>>().map_err(Into::into);
+            return rows
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(Into::into);
         }
         if let Some(address) = parse_address(query) {
             let mut stmt = conn.prepare(
                 "SELECT from_addr, to_addr, kind FROM code_references WHERE from_addr = ?1 OR to_addr = ?1 ORDER BY from_addr ASC, to_addr ASC",
             )?;
             let rows = stmt.query_map([address as i64], map_reference)?;
-            return rows.collect::<std::result::Result<Vec<_>, _>>().map_err(Into::into);
+            return rows
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(Into::into);
         }
         Ok(Vec::new())
     }
@@ -353,8 +367,16 @@ impl QueryWorkspace {
         if !table_exists(&conn, "functions")? {
             return Ok(None);
         }
-        let Some((name, address, size, snapshot_path, pseudo_path, stack_json, evidence_json, warnings_json)) =
-            self.lookup_function_row(&conn, query)?
+        let Some((
+            name,
+            address,
+            size,
+            snapshot_path,
+            pseudo_path,
+            stack_json,
+            evidence_json,
+            warnings_json,
+        )) = self.lookup_function_row(&conn, query)?
         else {
             return Ok(None);
         };
@@ -367,15 +389,15 @@ impl QueryWorkspace {
         let locals = read_json_file::<serde_json::Value>(&self.root, snapshot_path.as_deref())
             .and_then(|v| v.get("locals").cloned())
             .unwrap_or_else(|| serde_json::json!([]));
-        let mut pseudocode = read_json_file::<serde_json::Value>(&self.root, snapshot_path.as_deref())
-            .and_then(|v| v.get("pseudocode").cloned())
-            .filter(|v| !v.is_null());
-        if pseudocode.is_none() {
-            if let Some(path) = pseudo_path.as_deref().filter(|p| !p.is_empty()) {
-                if snapshot_path.as_deref() != Some(path) {
-                    pseudocode = read_json_file::<serde_json::Value>(&self.root, Some(path));
-                }
-            }
+        let mut pseudocode =
+            read_json_file::<serde_json::Value>(&self.root, snapshot_path.as_deref())
+                .and_then(|v| v.get("pseudocode").cloned())
+                .filter(|v| !v.is_null());
+        if pseudocode.is_none()
+            && let Some(path) = pseudo_path.as_deref().filter(|p| !p.is_empty())
+            && snapshot_path.as_deref() != Some(path)
+        {
+            pseudocode = read_json_file::<serde_json::Value>(&self.root, Some(path));
         }
         Ok(Some(FunctionDetail {
             name,
@@ -391,11 +413,7 @@ impl QueryWorkspace {
         }))
     }
 
-    fn lookup_function_range(
-        &self,
-        conn: &Connection,
-        query: &str,
-    ) -> Result<Option<(u64, u64)>> {
+    fn lookup_function_range(&self, conn: &Connection, query: &str) -> Result<Option<(u64, u64)>> {
         if let Some(address) = parse_address(query) {
             let row = conn
                 .query_row(
@@ -421,18 +439,7 @@ impl QueryWorkspace {
         &self,
         conn: &Connection,
         query: &str,
-    ) -> Result<
-        Option<(
-            String,
-            u64,
-            u64,
-            Option<String>,
-            Option<String>,
-            String,
-            String,
-            String,
-        )>,
-    > {
+    ) -> Result<Option<FunctionLookupRow>> {
         let map = |row: &rusqlite::Row<'_>| {
             Ok((
                 row.get::<_, String>(0)?,
@@ -465,7 +472,6 @@ impl QueryWorkspace {
             .optional()?;
         Ok(row)
     }
-
 }
 
 fn open_db_if_present(path: &Path) -> Result<Option<Connection>> {
@@ -578,7 +584,10 @@ fn parse_address(query: &str) -> Option<u64> {
     q.parse::<u64>().ok()
 }
 
-fn read_json_file<T: serde::de::DeserializeOwned>(root: &Path, relative: Option<&str>) -> Option<T> {
+fn read_json_file<T: serde::de::DeserializeOwned>(
+    root: &Path,
+    relative: Option<&str>,
+) -> Option<T> {
     let relative = relative.filter(|p| !p.is_empty())?;
     let path = root.join(relative);
     if !path.is_file() {
@@ -637,7 +646,8 @@ fn parse_project_toml(raw: &str) -> Result<ProjectConfig> {
         }
     }
     Ok(ProjectConfig {
-        schema_version: schema_version.ok_or_else(|| QueryError("missing schema_version".into()))?,
+        schema_version: schema_version
+            .ok_or_else(|| QueryError("missing schema_version".into()))?,
         name: name.ok_or_else(|| QueryError("missing name".into()))?,
         created_at: created_at.ok_or_else(|| QueryError("missing created_at".into()))?,
         primary_binary,

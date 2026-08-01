@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
 use bzip2::read::BzDecoder;
 use chrono::{DateTime, Utc};
-use revx_core::utc_now;
 use flate2::read::GzDecoder;
+use revx_core::utc_now;
 use revx_core::{
     AgentInteractionBrief, AgentNextAction, AnalysisBundle, AnalysisProfile, AnalysisRunState,
     AnalysisStatusResponse, AnalysisSummary, ArtifactHandle, ArtifactListResponse,
@@ -10,14 +10,14 @@ use revx_core::{
     CompoundFile, DebugImportStatus, Evidence, EvidenceGraphEdge, EvidenceGraphNode,
     EvidenceGraphResponse, EvidenceProvenance, Function, FunctionOverview, FunctionSearchHit,
     Hypothesis, ObjectAnalysisStatus, ObjectAnalysisSummary, ObjectAnalyzeResponse,
-    ObjectAnalyzerKind, ObjectCarveSignaturesResponse, ObjectContentMatch,
-    ObjectContentSearchMode, ObjectContentSearchResponse, ObjectEdge, ObjectEdgeKind,
-    ObjectExtractRangeResponse, ObjectGraph, ObjectKind, ObjectMaterializeResponse,
-    ObjectPluginDefinition, ObjectProfileResponse, ObjectSearchHit, ObjectSignatureCarve,
-    ObjectSignatureHit, ObjectSignatureScanResponse, PROJECT_SCHEMA_VERSION, ProjectConfig,
-    PseudocodeUnit, Reference, Report, SearchBytesResponse, StringLiteral, Survey,
-    SymbolicConstraint, SymbolicSolveResponse, SymbolicSolveStatus, SymbolicVariable, TraceEvent,
-    TypeDef, TypeSource, UniversalObject, Variable, is_compound_file,
+    ObjectAnalyzerKind, ObjectCarveSignaturesResponse, ObjectContentMatch, ObjectContentSearchMode,
+    ObjectContentSearchResponse, ObjectEdge, ObjectEdgeKind, ObjectExtractRangeResponse,
+    ObjectGraph, ObjectKind, ObjectMaterializeResponse, ObjectPluginDefinition,
+    ObjectProfileResponse, ObjectSearchHit, ObjectSignatureCarve, ObjectSignatureHit,
+    ObjectSignatureScanResponse, PROJECT_SCHEMA_VERSION, ProjectConfig, PseudocodeUnit, Reference,
+    Report, SearchBytesResponse, StringLiteral, Survey, SymbolicConstraint, SymbolicSolveResponse,
+    SymbolicSolveStatus, SymbolicVariable, TraceEvent, TypeDef, TypeSource, UniversalObject,
+    Variable, is_compound_file,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use ruzstd::decoding::StreamingDecoder as ZstdDecoder;
@@ -30,11 +30,13 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use uuid::Uuid;
 
+type PeExpandCandidate = (u8, usize, usize, String, String, Option<Vec<u8>>);
+
 fn sqlite_heap_limits() -> (i64, i64, i64) {
     if revx_core::micro_mode() {
         (64 * 1024, 256 * 1024, -8)
     } else if revx_core::lean_mode() {
-        (256 * 1024, 1024 * 1024, -16)
+        (4 * 1024 * 1024, 64 * 1024 * 1024, -64)
     } else {
         (1024 * 1024, 8 * 1024 * 1024, -64)
     }
@@ -88,9 +90,8 @@ fn restore_after_analysis_ingest_pragmas(conn: &Connection) -> Result<()> {
 /// Per-database-path schema initialization (once per path per process).
 static SCHEMA_READY: OnceLock<std::sync::Mutex<BTreeSet<PathBuf>>> = OnceLock::new();
 /// Process-wide free-list of SQLite connections keyed by absolute DB path.
-static CONNECTION_POOL: OnceLock<
-    std::sync::Mutex<BTreeMap<PathBuf, Vec<Connection>>>,
-> = OnceLock::new();
+static CONNECTION_POOL: OnceLock<std::sync::Mutex<BTreeMap<PathBuf, Vec<Connection>>>> =
+    OnceLock::new();
 
 fn ensure_pragmas(conn: &Connection, _db_path: &Path) -> Result<()> {
     apply_performance_pragmas(conn)
@@ -143,13 +144,13 @@ impl PooledConnection {
     fn checkout(db_path: &Path) -> Result<Self> {
         let key = canonicalize_db_path(db_path);
         let mut pool = connection_pool().lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(slot) = pool.get_mut(&key) {
-            if let Some(conn) = slot.pop() {
-                return Ok(Self {
-                    key,
-                    conn: Some(conn),
-                });
-            }
+        if let Some(slot) = pool.get_mut(&key)
+            && let Some(conn) = slot.pop()
+        {
+            return Ok(Self {
+                key,
+                conn: Some(conn),
+            });
         }
         drop(pool);
         Ok(Self {
@@ -303,7 +304,10 @@ impl Workspace {
             created_at: utc_now(),
             primary_binary: primary_binary.map(ToOwned::to_owned),
         };
-        fs::write(revx_root.join("project.toml"), toml::to_string_pretty(&cfg)?)?;
+        fs::write(
+            revx_root.join("project.toml"),
+            toml::to_string_pretty(&cfg)?,
+        )?;
         let _conn = open_connection(&revx_root.join("state.sqlite"))?;
         Ok(Self { root: revx_root })
     }
@@ -366,7 +370,7 @@ impl Workspace {
             },
         };
         let conn = self.connection()?;
-                let artifact = self.write_json_artifact("application/json", &survey)?;
+        let artifact = self.write_json_artifact("application/json", &survey)?;
         upsert_binary_record(&conn, &survey, &artifact, None)?;
         conn.execute(
             "DELETE FROM binary_imports WHERE binary_id = ?1",
@@ -414,7 +418,7 @@ impl Workspace {
         let db_path = self.root.join("state.sqlite");
         let conn = open_connection(&db_path)?;
         apply_analysis_ingest_pragmas(&conn)?;
-                conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
+        conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
 
         let run_id = Uuid::new_v4().to_string();
         let started_at = utc_now();
@@ -485,7 +489,7 @@ impl Workspace {
         let db_path = self.root.join("state.sqlite");
         let conn = open_connection(&db_path)?;
         apply_analysis_ingest_pragmas(&conn)?;
-                conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
+        conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
 
         let run_id = Uuid::new_v4().to_string();
         let started_at = utc_now();
@@ -546,7 +550,7 @@ impl Workspace {
 
     pub fn save_trace_events(&self, events: &[TraceEvent]) -> Result<TraceImportMaterial> {
         let conn = self.connection()?;
-                let artifact = self.write_json_artifact("application/json", events)?;
+        let artifact = self.write_json_artifact("application/json", events)?;
         let mut evidence_ids = Vec::new();
         for (index, event) in events.iter().enumerate() {
             conn.execute(
@@ -615,7 +619,7 @@ impl Workspace {
         response.artifact = artifact.clone();
 
         let conn = self.connection()?;
-                insert_evidence_record(
+        insert_evidence_record(
             &conn,
             Evidence {
                 id: evidence_id,
@@ -668,7 +672,7 @@ impl Workspace {
         let path = self.root.join("reports").join(format!("{}.md", report.id));
         fs::write(&path, &report.body)?;
         let conn = self.connection()?;
-                conn.execute(
+        conn.execute(
             "INSERT OR REPLACE INTO reports(id, topic, evidence_ids_json, artifact_hash, artifact_path, artifact_size)
              VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
             params![
@@ -689,7 +693,7 @@ impl Workspace {
 
     pub fn save_object_graph(&self, graph: &ObjectGraph) -> Result<(ArtifactHandle, Vec<String>)> {
         let conn = self.connection()?;
-                let artifact = self.write_json_artifact("application/json", graph)?;
+        let artifact = self.write_json_artifact("application/json", graph)?;
         let now = utc_now().to_rfc3339();
         conn.execute(
             "DELETE FROM object_edges WHERE graph_root_id = ?1",
@@ -843,7 +847,7 @@ impl Workspace {
         source: &str,
     ) -> Result<String> {
         let conn = self.connection()?;
-                conn.execute(
+        conn.execute(
             "DELETE FROM object_edges
              WHERE graph_root_id = ?1 AND from_id = ?2 AND to_id = ?3 AND kind_json = ?4",
             params![
@@ -907,7 +911,7 @@ impl Workspace {
         limit: usize,
     ) -> Result<Vec<ObjectSearchHit>> {
         let conn = self.connection()?;
-                let capped_limit = limit.clamp(1, 1000);
+        let capped_limit = limit.clamp(1, 1000);
         let kind_json = kind
             .map(|value| serde_json::to_string(&value))
             .transpose()?;
@@ -1064,7 +1068,7 @@ impl Workspace {
         let preview_text = text_preview(preview);
 
         let conn = self.connection()?;
-                insert_evidence_record(
+        insert_evidence_record(
             &conn,
             Evidence {
                 id: evidence_id.clone(),
@@ -1154,7 +1158,7 @@ impl Workspace {
         let preview_text = text_preview(preview);
 
         let conn = self.connection()?;
-                insert_evidence_record(
+        insert_evidence_record(
             &conn,
             Evidence {
                 id: evidence_id.clone(),
@@ -1266,7 +1270,7 @@ impl Workspace {
         let evidence_id = format!("object_signatures:{}:{}", object.id, artifact.hash_blake3);
 
         let conn = self.connection()?;
-                insert_evidence_record(
+        insert_evidence_record(
             &conn,
             Evidence {
                 id: evidence_id.clone(),
@@ -1447,7 +1451,7 @@ impl Workspace {
             format!("object_carves:{}:{}", object.id, carve_artifact.hash_blake3);
 
         let conn = self.connection()?;
-                let subject = object.path.clone().unwrap_or_else(|| object.id.clone());
+        let subject = object.path.clone().unwrap_or_else(|| object.id.clone());
         insert_evidence_record(
             &conn,
             Evidence {
@@ -1565,8 +1569,7 @@ impl Workspace {
                 &self.root,
             ));
         }
-        if dig_depth < MAX_AUTO_DIG_DEPTH && should_auto_dig_object(&object, &selected, &analyses)
-        {
+        if dig_depth < MAX_AUTO_DIG_DEPTH && should_auto_dig_object(&object, &selected, &analyses) {
             match self.auto_dig_embedded_objects(
                 &object,
                 &materialized.bytes,
@@ -1591,15 +1594,14 @@ impl Workspace {
         }
         if dig_depth < MAX_AUTO_DIG_DEPTH
             && should_auto_expand_object(&object, &selected, &analyses)
-        {
-            if let Some(expand) = self.auto_expand_high_value_payloads(
+            && let Some(expand) = self.auto_expand_high_value_payloads(
                 &object,
                 &materialized.bytes,
                 &materialized.source,
                 dig_depth,
-            )? {
-                analyses.push(expand);
-            }
+            )?
+        {
+            analyses.push(expand);
         }
 
         let artifact = self.write_json_artifact(
@@ -1763,7 +1765,10 @@ impl Workspace {
                 continue;
             }
             let end = hit.offset.saturating_add(length);
-            if occupied_ranges.iter().any(|(start, stop)| hit.offset < *stop && end > *start) {
+            if occupied_ranges
+                .iter()
+                .any(|(start, stop)| hit.offset < *stop && end > *start)
+            {
                 continue;
             }
             occupied_ranges.push((hit.offset, end));
@@ -1831,10 +1836,7 @@ impl Workspace {
             let mut child = lightweight_carved_object(object, hit, carved, &artifact);
             let artifact_path = self.root.join(&artifact.relative_path);
             if let Some(existing) = self.resolve_object(&child.id).ok().flatten() {
-                if existing
-                    .flags
-                    .iter()
-                    .any(|flag| flag == "virtual")
+                if existing.flags.iter().any(|flag| flag == "virtual")
                     || existing
                         .path
                         .as_deref()
@@ -1849,11 +1851,11 @@ impl Workspace {
                         child.flags.push(flag);
                     }
                 }
-                if let Some(map) = existing.metadata.as_object() {
-                    if let Some(meta) = child.metadata.as_object_mut() {
-                        for (key, value) in map {
-                            meta.entry(key.clone()).or_insert(value.clone());
-                        }
+                if let Some(map) = existing.metadata.as_object()
+                    && let Some(meta) = child.metadata.as_object_mut()
+                {
+                    for (key, value) in map {
+                        meta.entry(key.clone()).or_insert(value.clone());
                     }
                 }
             } else {
@@ -1886,14 +1888,13 @@ impl Workspace {
                     "dig_depth": dig_depth + 1,
                 }),
             };
-            let edge_evidence =
-                self.insert_object_edge(&object.id, edge, "auto_dig_embedded")?;
+            let edge_evidence = self.insert_object_edge(&object.id, edge, "auto_dig_embedded")?;
             evidence_ids.push(edge_evidence);
             child_ids.push(child_id.clone());
 
             let mut child_analysis_summary = serde_json::Value::Null;
             let mut child_analyzers = Vec::new();
-            if dig_depth + 1 <= MAX_AUTO_DIG_DEPTH {
+            if dig_depth < MAX_AUTO_DIG_DEPTH {
                 match self.analyze_object_inner(
                     &child_id,
                     Some(child_seed_analyzers(&child, carved)),
@@ -1923,9 +1924,7 @@ impl Workspace {
                         });
                     }
                     Err(err) => {
-                        warnings.push(format!(
-                            "child {child_id} recursive analysis failed: {err}"
-                        ));
+                        warnings.push(format!("child {child_id} recursive analysis failed: {err}"));
                         child_analysis_summary = serde_json::json!({
                             "status": "failed",
                             "error": err.to_string(),
@@ -1990,12 +1989,11 @@ impl Workspace {
                 "max_carve_bytes": max_carve_bytes,
                 "dig_depth": dig_depth,
                 "max_auto_dig_depth": MAX_AUTO_DIG_DEPTH,
-                "recursive_child_analysis": dig_depth + 1 <= MAX_AUTO_DIG_DEPTH,
+                "recursive_child_analysis": dig_depth < MAX_AUTO_DIG_DEPTH,
             }),
             evidence_ids,
         }))
     }
-
 
     pub fn auto_expand_high_value_payloads(
         &self,
@@ -2052,8 +2050,8 @@ impl Workspace {
                             }
                         }
                     }
-                    if expanded.is_empty() {
-                        if let Some((child_id, item)) = self.materialize_expanded_child(
+                    if expanded.is_empty()
+                        && let Some((child_id, item)) = self.materialize_expanded_child(
                             object,
                             &decompressed,
                             &format!("decompressed.{}", compressed.format()),
@@ -2064,10 +2062,10 @@ impl Workspace {
                             dig_depth,
                             &mut evidence_ids,
                             &mut warnings,
-                        )? {
-                            child_ids.push(child_id);
-                            expanded.push(item);
-                        }
+                        )?
+                    {
+                        child_ids.push(child_id);
+                        expanded.push(item);
                     }
                 }
                 Ok(decompressed) => {
@@ -2084,9 +2082,7 @@ impl Workspace {
             }
         }
 
-        if is_tar_bytes(bytes)
-            || matches!(object.format.as_deref(), Some("tar"))
-        {
+        if is_tar_bytes(bytes) || matches!(object.format.as_deref(), Some("tar")) {
             match self.expand_tar_high_value_members(
                 object,
                 bytes,
@@ -2181,7 +2177,8 @@ impl Workspace {
             }
         }
 
-        if matches!(object.format.as_deref(), Some("macho" | "macho_fat")) || is_macho_fat_bytes(bytes)
+        if matches!(object.format.as_deref(), Some("macho" | "macho_fat"))
+            || is_macho_fat_bytes(bytes)
         {
             match self.expand_macho_fat_slices(
                 object,
@@ -2233,12 +2230,13 @@ impl Workspace {
                 "warnings": warnings,
                 "dig_depth": dig_depth,
                 "max_auto_dig_depth": MAX_AUTO_DIG_DEPTH,
-                "recursive_child_analysis": dig_depth + 1 <= MAX_AUTO_DIG_DEPTH,
+                "recursive_child_analysis": dig_depth < MAX_AUTO_DIG_DEPTH,
             }),
             evidence_ids,
         }))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn expand_zip_high_value_members(
         &self,
         object: &UniversalObject,
@@ -2251,8 +2249,8 @@ impl Workspace {
         warnings: &mut Vec<String>,
     ) -> Result<Vec<(String, serde_json::Value)>> {
         let cursor = std::io::Cursor::new(bytes);
-        let mut archive = zip::ZipArchive::new(cursor)
-            .context("failed to parse ZIP for high-value expand")?;
+        let mut archive =
+            zip::ZipArchive::new(cursor).context("failed to parse ZIP for high-value expand")?;
         let mut ranked = Vec::new();
         for index in 0..archive.len() {
             let file = match archive.by_index(index) {
@@ -2270,7 +2268,8 @@ impl Workspace {
             if size == 0 || size > max_member_bytes {
                 continue;
             }
-            let Some(priority) = high_value_zip_member_priority(&name, object.format.as_deref()) else {
+            let Some(priority) = high_value_zip_member_priority(&name, object.format.as_deref())
+            else {
                 continue;
             };
             ranked.push((priority, size, index, name));
@@ -2319,6 +2318,7 @@ impl Workspace {
         Ok(out)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn expand_tar_high_value_members(
         &self,
         object: &UniversalObject,
@@ -2437,7 +2437,7 @@ impl Workspace {
         Ok(out)
     }
 
-
+    #[allow(clippy::too_many_arguments)]
     fn expand_pe_high_value_payloads(
         &self,
         object: &UniversalObject,
@@ -2453,27 +2453,29 @@ impl Workspace {
         let Some(layout) = pe_expand_layout(bytes) else {
             return Ok(out);
         };
-        let mut candidates: Vec<(u8, usize, usize, String, String, Option<Vec<u8>>)> = Vec::new();
+        let mut candidates: Vec<PeExpandCandidate> = Vec::new();
 
-        if let Some((offset, size)) = layout.overlay {
-            if size > 0 && size <= max_member_bytes && offset < bytes.len() {
-                let end = (offset + size).min(bytes.len());
-                let slice = &bytes[offset..end];
-                if !slice.is_empty()
-                    && (cheap_high_value_magic_score(slice).is_some()
-                        || scan_embedded_signatures(slice, 16)
-                            .iter()
-                            .any(|hit| hit.confidence >= 0.85))
-                {
-                    candidates.push((
-                        100u8,
-                        size,
-                        offset,
-                        format!("overlay@{offset:#x}"),
-                        "pe_overlay".to_string(),
-                        None,
-                    ));
-                }
+        if let Some((offset, size)) = layout.overlay
+            && size > 0
+            && size <= max_member_bytes
+            && offset < bytes.len()
+        {
+            let end = (offset + size).min(bytes.len());
+            let slice = &bytes[offset..end];
+            if !slice.is_empty()
+                && (cheap_high_value_magic_score(slice).is_some()
+                    || scan_embedded_signatures(slice, 16)
+                        .iter()
+                        .any(|hit| hit.confidence >= 0.85))
+            {
+                candidates.push((
+                    100u8,
+                    size,
+                    offset,
+                    format!("overlay@{offset:#x}"),
+                    "pe_overlay".to_string(),
+                    None,
+                ));
             }
         }
 
@@ -2500,11 +2502,9 @@ impl Workspace {
             ));
         }
 
-        for item in collect_dotnet_manifest_resource_expand_candidates(
-            bytes,
-            max_member_bytes,
-            warnings,
-        ) {
+        for item in
+            collect_dotnet_manifest_resource_expand_candidates(bytes, max_member_bytes, warnings)
+        {
             candidates.push((
                 item.priority,
                 item.size,
@@ -2556,6 +2556,7 @@ impl Workspace {
         Ok(out)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn expand_ar_high_value_members(
         &self,
         object: &UniversalObject,
@@ -2645,6 +2646,7 @@ impl Workspace {
         Ok(out)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn expand_macho_fat_slices(
         &self,
         object: &UniversalObject,
@@ -2716,6 +2718,7 @@ impl Workspace {
         Ok(out)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn materialize_expanded_child(
         &self,
         parent: &UniversalObject,
@@ -2733,27 +2736,26 @@ impl Workspace {
         let content_type = media_type.to_string();
         let prehash = blake3::hash(bytes).to_hex().to_string();
         let id = format!("obj:{prehash}");
-        if let Ok(Some(existing)) = self.resolve_object(&id) {
-            if existing.flags.iter().any(|flag| flag == "expanded")
-                && existing
-                    .metadata
-                    .get("expand_kind")
-                    .and_then(|value| value.as_str())
-                    == Some(expand_kind)
-            {
-                let item = serde_json::json!({
-                    "child_object_id": existing.id,
-                    "entry_name": entry_name,
-                    "expand_kind": expand_kind,
-                    "format": existing.format,
-                    "size": existing.size,
-                    "confidence": confidence,
-                    "reused": true,
-                    "hash_blake3": prehash,
-                    "magic": bytes.iter().take(16).map(|byte| format!("{byte:02x}")).collect::<Vec<_>>().join(""),
-                });
-                return Ok(Some((existing.id, item)));
-            }
+        if let Ok(Some(existing)) = self.resolve_object(&id)
+            && existing.flags.iter().any(|flag| flag == "expanded")
+            && existing
+                .metadata
+                .get("expand_kind")
+                .and_then(|value| value.as_str())
+                == Some(expand_kind)
+        {
+            let item = serde_json::json!({
+                "child_object_id": existing.id,
+                "entry_name": entry_name,
+                "expand_kind": expand_kind,
+                "format": existing.format,
+                "size": existing.size,
+                "confidence": confidence,
+                "reused": true,
+                "hash_blake3": prehash,
+                "magic": bytes.iter().take(16).map(|byte| format!("{byte:02x}")).collect::<Vec<_>>().join(""),
+            });
+            return Ok(Some((existing.id, item)));
         }
         let artifact = self.write_artifact_bytes(&content_type, bytes)?;
         let hash = artifact.hash_blake3.clone();
@@ -2815,7 +2817,6 @@ impl Workspace {
             .map(|object| object.display_name.clone())
             .filter(|value| !value.is_empty())
             .unwrap_or(display_name);
-        let mut flags = flags;
         if let Some(existing) = &existing {
             for flag in &existing.flags {
                 if !flags.iter().any(|item| item == flag) {
@@ -2837,13 +2838,12 @@ impl Workspace {
             "magic": bytes.iter().take(16).map(|byte| format!("{byte:02x}")).collect::<Vec<_>>().join(""),
             "high_value_magic": cheap_high_value_magic_score(bytes).is_some(),
         });
-        if let Some(existing) = &existing {
-            if let Some(map) = existing.metadata.as_object() {
-                if let Some(meta) = metadata.as_object_mut() {
-                    for (key, value) in map {
-                        meta.entry(key.clone()).or_insert(value.clone());
-                    }
-                }
+        if let Some(existing) = &existing
+            && let Some(map) = existing.metadata.as_object()
+            && let Some(meta) = metadata.as_object_mut()
+        {
+            for (key, value) in map {
+                meta.entry(key.clone()).or_insert(value.clone());
             }
         }
         let child = UniversalObject {
@@ -2906,7 +2906,7 @@ impl Workspace {
 
         let mut child_analysis_summary = serde_json::Value::Null;
         let mut child_analyzers = Vec::new();
-        if dig_depth + 1 <= MAX_AUTO_DIG_DEPTH {
+        if dig_depth < MAX_AUTO_DIG_DEPTH {
             match self.analyze_object_inner(
                 &child_id,
                 Some(child_seed_analyzers(&child, bytes)),
@@ -2979,7 +2979,8 @@ impl Workspace {
                 continue;
             }
             for key in ["dug", "expanded"] {
-                let Some(items) = analysis.details.get(key).and_then(|value| value.as_array()) else {
+                let Some(items) = analysis.details.get(key).and_then(|value| value.as_array())
+                else {
                     continue;
                 };
                 for item in items {
@@ -3038,22 +3039,24 @@ impl Workspace {
                     if ranked.iter().any(|(existing, _, _, _)| existing == id) {
                         continue;
                     }
-                    if let Ok(Some(object)) = self.resolve_object(id) {
-                        if object.flags.iter().any(|flag| flag == "native_binary_candidate")
+                    if let Ok(Some(object)) = self.resolve_object(id)
+                        && (object
+                            .flags
+                            .iter()
+                            .any(|flag| flag == "native_binary_candidate")
                             || (matches!(object.kind, ObjectKind::Binary)
                                 && matches!(
                                     object.format.as_deref(),
                                     Some("elf" | "pe" | "macho" | "macho_fat")
-                                ))
-                        {
-                            let format_rank = match object.format.as_deref() {
-                                Some("elf") => 4u8,
-                                Some("pe") => 3,
-                                Some("macho" | "macho_fat") => 2,
-                                _ => 1,
-                            };
-                            ranked.push((id.to_string(), format_rank, 0.9, object.size));
-                        }
+                                )))
+                    {
+                        let format_rank = match object.format.as_deref() {
+                            Some("elf") => 4u8,
+                            Some("pe") => 3,
+                            Some("macho" | "macho_fat") => 2,
+                            _ => 1,
+                        };
+                        ranked.push((id.to_string(), format_rank, 0.9, object.size));
                     }
                 }
             }
@@ -3083,7 +3086,6 @@ impl Workspace {
         )?;
         Ok(count > 0)
     }
-
 
     pub fn list_object_plugins(&self) -> Result<Vec<ObjectPluginDefinition>> {
         let plugin_dir = self.root.join("plugins");
@@ -3135,7 +3137,7 @@ impl Workspace {
 
     pub fn latest_survey(&self) -> Result<Option<Survey>> {
         let conn = self.connection()?;
-                let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare(
             "SELECT survey_artifact_path FROM binaries ORDER BY last_analysis_at DESC LIMIT 1",
         )?;
         let path: Option<String> = stmt.query_row([], |row| row.get(0)).optional()?;
@@ -3148,7 +3150,7 @@ impl Workspace {
         binary_id: Option<&str>,
     ) -> Result<Option<(Survey, ArtifactHandle)>> {
         let conn = self.connection()?;
-                let sql = if binary_id.is_some() {
+        let sql = if binary_id.is_some() {
             "SELECT survey_artifact_hash, survey_artifact_path, survey_artifact_size FROM binaries WHERE id = ?1 LIMIT 1"
         } else {
             "SELECT survey_artifact_hash, survey_artifact_path, survey_artifact_size FROM binaries ORDER BY last_analysis_at DESC LIMIT 1"
@@ -3183,7 +3185,7 @@ impl Workspace {
         binary_id: Option<&str>,
     ) -> Result<Option<SurveyPreviewRecord>> {
         let conn = self.connection()?;
-                let sql = if binary_id.is_some() {
+        let sql = if binary_id.is_some() {
             "SELECT id, path, format, architecture, function_count, import_count, export_count, string_count, typed_function_count, structured_pseudocode_count, survey_artifact_hash, survey_artifact_path, survey_artifact_size
              FROM binaries WHERE id = ?1 LIMIT 1"
         } else {
@@ -3202,7 +3204,7 @@ impl Workspace {
 
     pub fn latest_binary_id(&self) -> Result<Option<String>> {
         let conn = self.connection()?;
-                conn.query_row(
+        conn.query_row(
             "SELECT id FROM binaries ORDER BY last_analysis_at DESC LIMIT 1",
             [],
             |row| row.get(0),
@@ -3213,7 +3215,7 @@ impl Workspace {
 
     pub fn binary_record_list(&self) -> Result<Vec<BinaryRecord>> {
         let conn = self.connection()?;
-                let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare(
             "SELECT id, path, format, architecture, last_analysis_at, function_count, import_count, export_count, string_count, typed_function_count, structured_pseudocode_count FROM binaries ORDER BY path ASC",
         )?;
         let rows = stmt.query_map([], |row| {
@@ -3243,7 +3245,7 @@ impl Workspace {
 
     pub fn analysis_status(&self, run_id: Option<&str>) -> Result<Option<AnalysisStatusResponse>> {
         let conn = self.connection()?;
-                let sql = if run_id.is_some() {
+        let sql = if run_id.is_some() {
             "SELECT id, binary_id, profile, status, created_at, completed_at, summary_json FROM analysis_runs WHERE id = ?1 LIMIT 1"
         } else {
             "SELECT id, binary_id, profile, status, created_at, completed_at, summary_json FROM analysis_runs ORDER BY created_at DESC LIMIT 1"
@@ -3267,7 +3269,8 @@ impl Workspace {
 
     pub fn function_ranges(&self) -> Result<Vec<(u64, u64)>> {
         let conn = self.connection()?;
-                let mut stmt = conn.prepare_cached("SELECT address, size FROM functions ORDER BY address ASC")?;
+        let mut stmt =
+            conn.prepare_cached("SELECT address, size FROM functions ORDER BY address ASC")?;
         let rows = stmt.query_map([], |row| {
             let start = row.get::<_, i64>(0)? as u64;
             let size = row.get::<_, i64>(1)? as u64;
@@ -3323,7 +3326,11 @@ impl Workspace {
         &self,
         address: u64,
     ) -> Result<Vec<(String, revx_core::PseudocodeUnit)>> {
-        let dir = self.root.join("cache").join("pseudo").join(format!("{address:x}"));
+        let dir = self
+            .root
+            .join("cache")
+            .join("pseudo")
+            .join(format!("{address:x}"));
         if !dir.is_dir() {
             return Ok(Vec::new());
         }
@@ -3402,13 +3409,17 @@ impl Workspace {
             let mut stmt = conn.prepare_cached(
                 "SELECT name, address, size, evidence_ids_json FROM functions ORDER BY address ASC LIMIT ?1 OFFSET ?2",
             )?;
-            let rows = stmt.query_map(params![limit as i64, offset as i64], map_function_hit_row)?;
+            let rows =
+                stmt.query_map(params![limit as i64, offset as i64], map_function_hit_row)?;
             return rows
                 .collect::<std::result::Result<Vec<_>, _>>()
                 .map_err(Into::into);
         }
 
-        let fetch_limit = (limit.saturating_add(offset)).saturating_mul(4).max(limit).min(2_000);
+        let fetch_limit = (limit.saturating_add(offset))
+            .saturating_mul(4)
+            .max(limit)
+            .min(2_000);
         let mut stmt = conn.prepare_cached(
             "SELECT name, address, size, evidence_ids_json FROM functions WHERE name LIKE ?1 ORDER BY address ASC LIMIT ?2",
         )?;
@@ -3437,15 +3448,19 @@ impl Workspace {
     ) -> Result<Vec<StringLiteral>> {
         let conn = self.connection()?;
         if pattern.is_empty() {
-            let mut stmt =
-                conn.prepare_cached("SELECT address, value FROM strings ORDER BY address ASC LIMIT ?1 OFFSET ?2")?;
+            let mut stmt = conn.prepare_cached(
+                "SELECT address, value FROM strings ORDER BY address ASC LIMIT ?1 OFFSET ?2",
+            )?;
             let rows = stmt.query_map(params![limit as i64, offset as i64], map_string_row)?;
             return rows
                 .collect::<std::result::Result<Vec<_>, _>>()
                 .map_err(Into::into);
         }
 
-        let fetch_limit = (limit.saturating_add(offset)).saturating_mul(4).max(limit).min(2_000);
+        let fetch_limit = (limit.saturating_add(offset))
+            .saturating_mul(4)
+            .max(limit)
+            .min(2_000);
         let mut stmt = conn.prepare_cached(
             "SELECT address, value FROM strings WHERE value LIKE ?1 ORDER BY address ASC LIMIT ?2",
         )?;
@@ -3474,9 +3489,7 @@ impl Workspace {
             let rows = stmt.query_map(params![limit, offset], |row| {
                 Ok(revx_core::Import {
                     name: row.get(0)?,
-                    address: row
-                        .get::<_, Option<i64>>(1)?
-                        .map(|value| value as u64),
+                    address: row.get::<_, Option<i64>>(1)?.map(|value| value as u64),
                     library: row.get(2)?,
                 })
             })?;
@@ -3497,9 +3510,7 @@ impl Workspace {
         let rows = stmt.query_map(params![pattern, fetch_limit], |row| {
             Ok(revx_core::Import {
                 name: row.get(0)?,
-                address: row
-                    .get::<_, Option<i64>>(1)?
-                    .map(|value| value as u64),
+                address: row.get::<_, Option<i64>>(1)?.map(|value| value as u64),
                 library: row.get(2)?,
             })
         })?;
@@ -3512,22 +3523,25 @@ impl Workspace {
                 .cmp(&import_hit_rank_score(&q, left))
                 .then_with(|| left.name.cmp(&right.name))
         });
-        Ok(hits.into_iter().skip(offset as usize).take(limit as usize).collect())
+        Ok(hits
+            .into_iter()
+            .skip(offset as usize)
+            .take(limit as usize)
+            .collect())
     }
 
     pub fn lookup_string_at(&self, address: u64) -> Result<Option<StringLiteral>> {
         let conn = self.connection()?;
-        let mut stmt = conn.prepare_cached(
-            "SELECT address, value FROM strings WHERE address = ?1 LIMIT 1",
-        )?;
+        let mut stmt =
+            conn.prepare_cached("SELECT address, value FROM strings WHERE address = ?1 LIMIT 1")?;
         stmt.query_row([address as i64], map_string_row)
             .optional()
             .map_err(Into::into)
     }
 
-        pub fn list_references(&self) -> Result<Vec<Reference>> {
+    pub fn list_references(&self) -> Result<Vec<Reference>> {
         let conn = self.connection()?;
-                let mut stmt = conn.prepare_cached(
+        let mut stmt = conn.prepare_cached(
             "SELECT from_addr, to_addr, kind FROM code_references ORDER BY from_addr ASC, to_addr ASC",
         )?;
         let rows = stmt.query_map([], map_reference_row)?;
@@ -3537,7 +3551,7 @@ impl Workspace {
 
     pub fn find_references(&self, query: &str) -> Result<Vec<Reference>> {
         let conn = self.connection()?;
-                if let Some(function) = self.lookup_function_locator(query)? {
+        if let Some(function) = self.lookup_function_locator(query)? {
             let start = function.address as i64;
             let end = (function.address + function.size) as i64;
             let mut stmt = conn.prepare_cached(
@@ -3783,7 +3797,7 @@ impl Workspace {
 
     pub fn evidence_by_subject(&self, subject: &str) -> Result<Vec<Evidence>> {
         let conn = self.connection()?;
-                let pattern = format!("%{subject}%");
+        let pattern = format!("%{subject}%");
         let mut stmt = conn.prepare(&format!(
             "SELECT id, subject, kind, summary, details_json, provenance_json FROM evidence WHERE {} ORDER BY id LIMIT 1000",
             evidence_search_predicate()
@@ -3798,7 +3812,7 @@ impl Workspace {
             return Ok(Vec::new());
         }
         let conn = self.connection()?;
-                let placeholders = std::iter::repeat_n("?", ids.len())
+        let placeholders = std::iter::repeat_n("?", ids.len())
             .collect::<Vec<_>>()
             .join(", ");
         let sql = format!(
@@ -3816,12 +3830,12 @@ impl Workspace {
 
     pub fn insert_evidence(&self, evidence: Evidence) -> Result<()> {
         let conn = self.connection()?;
-                insert_evidence_record(&conn, evidence)
+        insert_evidence_record(&conn, evidence)
     }
 
     pub fn evidence_count_by_subject(&self, subject: &str) -> Result<usize> {
         let conn = self.connection()?;
-                let pattern = format!("%{subject}%");
+        let pattern = format!("%{subject}%");
         let count = conn.query_row(
             &format!(
                 "SELECT COUNT(*) FROM evidence WHERE {}",
@@ -3839,7 +3853,7 @@ impl Workspace {
         preview_limit: usize,
     ) -> Result<EvidenceIdExport> {
         let conn = self.connection()?;
-                let pattern = format!("%{subject}%");
+        let pattern = format!("%{subject}%");
         let mut stmt = conn.prepare(&format!(
             "SELECT id FROM evidence WHERE {} ORDER BY id LIMIT 1000",
             evidence_search_predicate()
@@ -3854,7 +3868,7 @@ impl Workspace {
         preview_limit: usize,
     ) -> Result<EvidenceExport> {
         let conn = self.connection()?;
-                let pattern = format!("%{subject}%");
+        let pattern = format!("%{subject}%");
         let mut stmt = conn.prepare(&format!(
             "SELECT id, subject, kind, summary, details_json, provenance_json FROM evidence WHERE {} ORDER BY id LIMIT 1000",
             evidence_search_predicate()
@@ -3876,7 +3890,7 @@ impl Workspace {
             });
         }
         let conn = self.connection()?;
-                let placeholders = std::iter::repeat_n("?", ids.len())
+        let placeholders = std::iter::repeat_n("?", ids.len())
             .collect::<Vec<_>>()
             .join(", ");
         let sql = format!(
@@ -3938,7 +3952,7 @@ impl Workspace {
         let seed_objects = self.search_objects(subject, None, limit.min(64))?;
         let seed_traces = self.trace_records_by_subject(subject, limit.min(128))?;
         let conn = self.connection()?;
-        
+
         let mut evidence_queue = seed_evidence
             .into_iter()
             .map(|evidence| (evidence, 0usize))
@@ -4290,7 +4304,7 @@ impl Workspace {
             return Ok(None);
         };
         let conn = self.connection()?;
-                let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare(
             "SELECT evidence_ids_json
              FROM functions
              WHERE binary_id = ?1 AND address = ?2
@@ -4310,7 +4324,7 @@ impl Workspace {
         per_kind_limit: usize,
     ) -> Result<ReportEvidenceMaterial> {
         let conn = self.connection()?;
-                let pattern = format!("%{subject}%");
+        let pattern = format!("%{subject}%");
         let mut stmt = conn.prepare(
             "SELECT id, kind, summary FROM evidence WHERE subject LIKE ?1 OR summary LIKE ?1 ORDER BY id LIMIT 1000",
         )?;
@@ -4364,7 +4378,7 @@ impl Workspace {
         evidence_ids: &[String],
     ) -> Result<Hypothesis> {
         let conn = self.connection()?;
-                let hypothesis = Hypothesis {
+        let hypothesis = Hypothesis {
             id: Uuid::new_v4().to_string(),
             title: title.to_string(),
             notes: notes.to_string(),
@@ -4396,7 +4410,7 @@ impl Workspace {
         evidence_ids: Option<Vec<String>>,
     ) -> Result<Hypothesis> {
         let conn = self.connection()?;
-                let mut hypothesis = self
+        let mut hypothesis = self
             .get_hypothesis(id)?
             .ok_or_else(|| anyhow::anyhow!("hypothesis not found: {id}"))?;
         if let Some(title) = title {
@@ -4428,7 +4442,7 @@ impl Workspace {
 
     pub fn get_hypothesis(&self, id: &str) -> Result<Option<Hypothesis>> {
         let conn = self.connection()?;
-                conn.query_row(
+        conn.query_row(
             "SELECT id, title, notes, evidence_ids_json, updated_at FROM hypotheses WHERE id = ?1 LIMIT 1",
             [id],
             |row| {
@@ -4450,7 +4464,7 @@ impl Workspace {
 
     pub fn query_traces(&self, kind: Option<&str>, limit: usize) -> Result<Vec<TraceEvent>> {
         let conn = self.connection()?;
-                let capped_limit = limit.min(1000);
+        let capped_limit = limit.min(1000);
         let mut stmt = if kind.is_some() {
             conn.prepare(
                 "SELECT ts, process, thread, kind, location, payload_json FROM trace_events WHERE kind = ?1 ORDER BY ts DESC LIMIT ?2",
@@ -4476,7 +4490,7 @@ impl Workspace {
         limit: usize,
     ) -> Result<Vec<TraceEventRecord>> {
         let conn = self.connection()?;
-                let capped_limit = limit.clamp(1, 1000);
+        let capped_limit = limit.clamp(1, 1000);
         let trimmed = subject.trim();
         let location = parse_address(trimmed);
         if let Some(location) = location {
@@ -4544,7 +4558,11 @@ impl Workspace {
         Ok(Some(value))
     }
 
-    pub fn write_cache_json<T: serde::Serialize + ?Sized>(&self, name: &str, value: &T) -> Result<()> {
+    pub fn write_cache_json<T: serde::Serialize + ?Sized>(
+        &self,
+        name: &str,
+        value: &T,
+    ) -> Result<()> {
         let path = self.cache_file_path(name);
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
@@ -4681,7 +4699,7 @@ impl Workspace {
 
     fn collect_referenced_artifacts(&self, catalog: &mut ArtifactCatalog) -> Result<()> {
         let conn = self.connection()?;
-        
+
         {
             let mut stmt = conn.prepare(
                 "SELECT id, path, survey_artifact_hash, survey_artifact_path, survey_artifact_size
@@ -5019,9 +5037,8 @@ impl Workspace {
 
     fn import_name_map(&self) -> Result<std::collections::HashMap<u64, String>> {
         let conn = self.connection()?;
-        let mut stmt = conn.prepare_cached(
-            "SELECT address, name FROM binary_imports WHERE address IS NOT NULL",
-        )?;
+        let mut stmt = conn
+            .prepare_cached("SELECT address, name FROM binary_imports WHERE address IS NOT NULL")?;
         let rows = stmt.query_map([], |row| {
             Ok((row.get::<_, i64>(0)? as u64, row.get::<_, String>(1)?))
         })?;
@@ -5035,8 +5052,9 @@ impl Workspace {
 
     fn list_function_locators(&self) -> Result<Vec<FunctionLocator>> {
         let conn = self.connection()?;
-                let mut stmt = conn
-            .prepare_cached("SELECT binary_id, name, address, size FROM functions ORDER BY address ASC")?;
+        let mut stmt = conn.prepare_cached(
+            "SELECT binary_id, name, address, size FROM functions ORDER BY address ASC",
+        )?;
         let rows = stmt.query_map([], map_function_locator_row)?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(Into::into)
@@ -5044,7 +5062,7 @@ impl Workspace {
 
     fn lookup_function_locator(&self, query: &str) -> Result<Option<FunctionLocator>> {
         let conn = self.connection()?;
-        
+
         if let Some(address) = parse_address(query) {
             let mut stmt = conn.prepare_cached(
                 "SELECT binary_id, name, address, size FROM functions WHERE address = ?1 LIMIT 1",
@@ -5078,7 +5096,7 @@ impl Workspace {
         };
 
         let conn = self.connection()?;
-                let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare(
             "SELECT binary_id, name, address, size
              FROM functions
              WHERE address < ?1 AND (address + size) > ?1
@@ -5148,14 +5166,17 @@ impl Workspace {
                display_name ASC
              LIMIT 1",
         )?;
-        stmt.query_row(params![pattern.as_str(), trimmed, suffix.as_str()], map_object_row)
-            .optional()
-            .map_err(Into::into)
+        stmt.query_row(
+            params![pattern.as_str(), trimmed, suffix.as_str()],
+            map_object_row,
+        )
+        .optional()
+        .map_err(Into::into)
     }
 
     fn object_edges_for(&self, object_id: &str) -> Result<Vec<ObjectEdgeRecord>> {
         let conn = self.connection()?;
-                let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare(
             "SELECT graph_root_id, from_id, to_id, kind_json, metadata_json
              FROM object_edges
              WHERE from_id = ?1 OR to_id = ?1
@@ -5168,7 +5189,7 @@ impl Workspace {
 
     fn object_graph_artifact(&self, object_id: &str) -> Result<Option<ArtifactHandle>> {
         let conn = self.connection()?;
-                conn.query_row(
+        conn.query_row(
             "SELECT graph_artifact_hash, graph_artifact_path, graph_artifact_size
              FROM objects
              WHERE id = ?1
@@ -5212,15 +5233,15 @@ impl Workspace {
             }
         }
 
-        if let Some(path) = object.path.as_deref() {
-            if !path.contains('!') {
-                let bytes =
-                    fs::read(path).with_context(|| format!("failed to read object file {path}"))?;
-                return Ok(MaterializedObjectBytes {
-                    bytes,
-                    source: format!("file:{path}"),
-                });
-            }
+        if let Some(path) = object.path.as_deref()
+            && !path.contains('!')
+        {
+            let bytes =
+                fs::read(path).with_context(|| format!("failed to read object file {path}"))?;
+            return Ok(MaterializedObjectBytes {
+                bytes,
+                source: format!("file:{path}"),
+            });
         }
 
         if let Some(hash) = object.hash_blake3.as_deref() {
@@ -5530,7 +5551,7 @@ impl Workspace {
         query: Option<&str>,
     ) -> Result<Vec<UniversalObject>> {
         let conn = self.connection()?;
-                let trimmed = query.map(str::trim).filter(|value| !value.is_empty());
+        let trimmed = query.map(str::trim).filter(|value| !value.is_empty());
         let mut objects = if let Some(query) = trimmed {
             let pattern = format!("%{query}%");
             let mut stmt = conn.prepare(
@@ -5573,7 +5594,7 @@ impl Workspace {
 
     fn list_call_references(&self, target: Option<&FunctionLocator>) -> Result<Vec<Reference>> {
         let conn = self.connection()?;
-                match target {
+        match target {
             Some(target) => {
                 let start = target.address as i64;
                 let end = (target.address + target.size) as i64;
@@ -5604,7 +5625,7 @@ impl Workspace {
 
     fn hydrate_function(&self, binary_id: &str, address: u64) -> Result<Function> {
         let conn = self.connection()?;
-                let mut stmt = conn.prepare_cached(
+        let mut stmt = conn.prepare_cached(
             "SELECT name, size, function_snapshot_path, pseudocode_artifact_path, stack_summary_json, evidence_ids_json, warnings_json
              FROM functions
              WHERE binary_id = ?1 AND address = ?2
@@ -5672,7 +5693,7 @@ impl Workspace {
 
     fn hydrate_function_overview(&self, binary_id: &str, address: u64) -> Result<FunctionOverview> {
         let conn = self.connection()?;
-                let mut stmt = conn.prepare_cached(
+        let mut stmt = conn.prepare_cached(
             "SELECT name, size, function_snapshot_path, stack_summary_json, evidence_ids_json, warnings_json
              FROM functions
              WHERE binary_id = ?1 AND address = ?2
@@ -5725,7 +5746,7 @@ impl Workspace {
         }
 
         let conn = self.connection()?;
-                let mut stmt =
+        let mut stmt =
             conn.prepare("SELECT name, address, size, evidence_ids_json FROM functions")?;
         let rows = stmt.query_map([], map_function_hit_row)?;
         let mut scored = rows
@@ -5857,7 +5878,7 @@ impl Workspace {
 
     fn log_operation(&self, kind: &str, details: serde_json::Value) -> Result<()> {
         let conn = self.connection()?;
-                conn.execute(
+        conn.execute(
             "INSERT INTO operation_log(ts, kind, details_json) VALUES(?1, ?2, ?3)",
             params![
                 utc_now().to_rfc3339(),
@@ -5910,28 +5931,31 @@ impl AnalysisRunIngestSession {
                     || name.contains("Java_")
                     || name == "main"
                     || self.lean_pseudo_written < 2);
-            if keep_pseudo {
-                if let Some(unit) = pseudocode.as_ref() {
-                    let mut text = unit.text.clone();
-                    if text.len() > 256 {
-                        text.truncate(256);
-                        text.push_str("
-// ...");
-                    }
-                    let slim = revx_core::PseudocodeUnit {
-                        language: unit.language.clone(),
-                        text,
-                        regions: Vec::new(),
-                        region_artifact: None,
-                        evidence_ids: Vec::new(),
-                        semantic_lattice: None,
-                    };
-                    if let Ok(art) = self.workspace.write_json_artifact("application/json", &slim) {
-                        pseudo_hash = Some(art.hash_blake3);
-                        pseudo_path = Some(art.relative_path);
-                        pseudo_size = Some(art.size as i64);
-                        self.lean_pseudo_written += 1;
-                    }
+            if keep_pseudo && let Some(unit) = pseudocode.as_ref() {
+                let mut text = unit.text.clone();
+                if text.len() > 256 {
+                    text.truncate(256);
+                    text.push_str(
+                        "
+// ...",
+                    );
+                }
+                let slim = revx_core::PseudocodeUnit {
+                    language: unit.language.clone(),
+                    text,
+                    regions: Vec::new(),
+                    region_artifact: None,
+                    evidence_ids: Vec::new(),
+                    semantic_lattice: None,
+                };
+                if let Ok(art) = self
+                    .workspace
+                    .write_json_artifact("application/json", &slim)
+                {
+                    pseudo_hash = Some(art.hash_blake3);
+                    pseudo_path = Some(art.relative_path);
+                    pseudo_size = Some(art.size as i64);
+                    self.lean_pseudo_written += 1;
                 }
             }
             let mut stmt = self.conn.prepare_cached(
@@ -5980,13 +6004,11 @@ impl AnalysisRunIngestSession {
             .as_ref()
             .is_some_and(|unit| unit.text.len() > 512 || !unit.regions.is_empty());
         let mut pseudo_artifact = None;
-        if split_pseudo {
-            if let Some(unit) = snapshot.pseudocode.take() {
-                pseudo_artifact = Some(
-                    self.workspace
-                        .write_json_artifact("application/json", &unit)?,
-                );
-            }
+        if split_pseudo && let Some(unit) = snapshot.pseudocode.take() {
+            pseudo_artifact = Some(
+                self.workspace
+                    .write_json_artifact("application/json", &unit)?,
+            );
         }
         if snapshot_insts > 256 || snapshot.blocks.len() > 64 {
             strip_snapshot_instruction_bytes(&mut snapshot);
@@ -6079,10 +6101,7 @@ impl AnalysisRunIngestSession {
                 summary: format!(
                     "Recovered stack summary for {} with calling convention {}",
                     name,
-                    stack
-                        .calling_convention
-                        .as_deref()
-                        .unwrap_or("unknown")
+                    stack.calling_convention.as_deref().unwrap_or("unknown")
                 ),
                 kind: "stack_summary".to_string(),
                 details: serde_json::json!({
@@ -6106,9 +6125,7 @@ impl AnalysisRunIngestSession {
                 subject: self.binary_path_owned.clone(),
                 summary: format!(
                     "Recovered {} arguments and {} locals for {}",
-                    argument_count,
-                    local_count,
-                    name
+                    argument_count, local_count, name
                 ),
                 kind: "variables".to_string(),
                 details: serde_json::json!({
@@ -6132,8 +6149,7 @@ impl AnalysisRunIngestSession {
                 subject: self.binary_path_owned.clone(),
                 summary: format!(
                     "Structured pseudocode for {} contains {} regions",
-                    name,
-                    pseudocode_region_count
+                    name, pseudocode_region_count
                 ),
                 kind: "pseudocode".to_string(),
                 details: serde_json::json!({
@@ -6175,7 +6191,9 @@ impl AnalysisRunIngestSession {
         strings: &[StringLiteral],
     ) -> Result<String> {
         self.flush_pending_evidence()?;
-        if survey.binary.id.as_str() != self.binary_id.as_ref() || survey.binary.path.as_str() != self.binary_path.as_ref() {
+        if survey.binary.id.as_str() != self.binary_id.as_ref()
+            || survey.binary.path.as_str() != self.binary_path.as_ref()
+        {
             anyhow::bail!("analysis finalize received mismatched survey for active ingest session");
         }
         let run_id = self.run_id.clone();
@@ -6199,12 +6217,13 @@ impl AnalysisRunIngestSession {
             let mut type_evidences: Vec<Evidence> = Vec::new();
             let mut type_artifacts: Vec<(String, ArtifactHandle)> = Vec::new();
             for ty in &types {
-                let artifact = self
-                    .workspace
-                    .write_json_artifact("application/json", ty)?;
+                let artifact = self.workspace.write_json_artifact("application/json", ty)?;
                 type_artifacts.push((ty.id.clone(), artifact));
             }
-            let paired: Vec<(&TypeDef, &ArtifactHandle)> = types.iter().zip(type_artifacts.iter().map(|(_, h)| h)).collect();
+            let paired: Vec<(&TypeDef, &ArtifactHandle)> = types
+                .iter()
+                .zip(type_artifacts.iter().map(|(_, h)| h))
+                .collect();
             for chunk in paired.chunks(TYPE_CHUNK_SIZE) {
                 let mut batch_sql = String::with_capacity(200 + chunk.len() * 56);
                 batch_sql.push_str(
@@ -6285,12 +6304,15 @@ impl AnalysisRunIngestSession {
         // Batch insert references using chunked multi-row INSERT.
         // SQLite has a limit of 32766 bound parameters per statement.
         // Each reference row uses 4 params, so we chunk at 8000 rows.
-        let references_for_db: &[Reference] = if self.profile == AnalysisProfile::Fast || revx_core::lean_mode() {
-            let n = references.len().min(if revx_core::lean_mode() { 64 } else { 512 });
-            &references[..n]
-        } else {
-            references.as_slice()
-        };
+        let references_for_db: &[Reference] =
+            if self.profile == AnalysisProfile::Fast || revx_core::lean_mode() {
+                let n = references
+                    .len()
+                    .min(if revx_core::lean_mode() { 64 } else { 512 });
+                &references[..n]
+            } else {
+                references.as_slice()
+            };
         if !references_for_db.is_empty() {
             const REF_CHUNK_SIZE: usize = 10000;
             for chunk in references_for_db.chunks(REF_CHUNK_SIZE) {
@@ -6449,7 +6471,9 @@ impl AnalysisRunIngestSession {
         self.conn.execute_batch("COMMIT")?;
         let _ = restore_after_analysis_ingest_pragmas(&self.conn);
         if revx_core::lean_mode() {
-            let _ = self.conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA shrink_memory;");
+            let _ = self
+                .conn
+                .execute_batch("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA shrink_memory;");
         }
         self.finished = true;
         Ok(run_id)
@@ -6462,9 +6486,7 @@ impl AnalysisRunIngestSession {
         const CHUNK: usize = 8000;
         for chunk in imports.chunks(CHUNK) {
             let mut sql = String::with_capacity(80 + chunk.len() * 28);
-            sql.push_str(
-                "INSERT INTO binary_imports(binary_id, name, address, library) VALUES",
-            );
+            sql.push_str("INSERT INTO binary_imports(binary_id, name, address, library) VALUES");
             let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> =
                 Vec::with_capacity(1 + chunk.len() * 3);
             params_vec.push(Box::new(self.binary_id.as_ref()));
@@ -6666,11 +6688,10 @@ fn persist_binary_imports_on_conn(
     Ok(())
 }
 
-
-fn function_range_for_address<'a>(
-    ranges: &'a [(u64, u64, String)],
+fn function_range_for_address(
+    ranges: &[(u64, u64, String)],
     address: u64,
-) -> Option<&'a (u64, u64, String)> {
+) -> Option<&(u64, u64, String)> {
     let index = ranges.partition_point(|(start, _, _)| *start <= address);
     if index == 0 {
         return None;
@@ -7264,17 +7285,17 @@ fn collect_object_id_hints(value: &serde_json::Value, object_ids: &mut BTreeSet<
         }
         serde_json::Value::Object(map) => {
             for (key, value) in map {
-                if matches!(key.as_str(), "object_id" | "root_id" | "graph_root_id") {
-                    if let Some(object_id) = value.as_str() {
-                        object_ids.insert(object_id.to_string());
-                    }
+                if matches!(key.as_str(), "object_id" | "root_id" | "graph_root_id")
+                    && let Some(object_id) = value.as_str()
+                {
+                    object_ids.insert(object_id.to_string());
                 }
-                if key == "object_ids" {
-                    if let Some(items) = value.as_array() {
-                        for item in items {
-                            if let Some(object_id) = item.as_str() {
-                                object_ids.insert(object_id.to_string());
-                            }
+                if key == "object_ids"
+                    && let Some(items) = value.as_array()
+                {
+                    for item in items {
+                        if let Some(object_id) = item.as_str() {
+                            object_ids.insert(object_id.to_string());
                         }
                     }
                 }
@@ -7477,7 +7498,7 @@ fn init_schema(conn: &Connection) -> Result<()> {
         return Ok(());
     }
     if user_version < 5 {
-    conn.execute_batch(
+        conn.execute_batch(
         r#"
         CREATE TABLE IF NOT EXISTS binaries(
             id TEXT PRIMARY KEY,
@@ -7675,14 +7696,14 @@ fn init_schema(conn: &Connection) -> Result<()> {
         "#,
     )
     .context("failed to initialize schema")?;
-    let _ = conn.execute(
-        "ALTER TABLE functions ADD COLUMN warnings_json TEXT NOT NULL DEFAULT '[]'",
-        [],
-    );
-    let _ = conn.execute(
-        "ALTER TABLE objects ADD COLUMN analyses_json TEXT NOT NULL DEFAULT '[]'",
-        [],
-    );
+        let _ = conn.execute(
+            "ALTER TABLE functions ADD COLUMN warnings_json TEXT NOT NULL DEFAULT '[]'",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE objects ADD COLUMN analyses_json TEXT NOT NULL DEFAULT '[]'",
+            [],
+        );
     }
     conn.execute_batch(
         r#"
@@ -7760,7 +7781,6 @@ fn insert_evidence_record(conn: &Connection, item: Evidence) -> Result<()> {
     Ok(())
 }
 
-
 fn strip_snapshot_instruction_bytes(snapshot: &mut FunctionSnapshotPayload) {
     static EMPTY: std::sync::OnceLock<std::sync::Arc<str>> = std::sync::OnceLock::new();
     let empty = EMPTY.get_or_init(|| std::sync::Arc::<str>::from(""));
@@ -7801,7 +7821,9 @@ fn strip_snapshot_instruction_bytes(snapshot: &mut FunctionSnapshotPayload) {
         }
         kept += block.instructions.len();
     }
-    snapshot.blocks.retain(|block| !block.instructions.is_empty() || block.size > 0);
+    snapshot
+        .blocks
+        .retain(|block| !block.instructions.is_empty() || block.size > 0);
 }
 
 fn insert_evidence_records_batch(conn: &Connection, items: &[Evidence]) -> Result<()> {
@@ -7920,25 +7942,23 @@ fn artifact_hit_matches(
     content_type: Option<&str>,
     role: Option<&str>,
 ) -> bool {
-    if let Some(content_type) = content_type {
-        if !hit
+    if let Some(content_type) = content_type
+        && !hit
             .artifact
             .content_type
             .to_ascii_lowercase()
             .contains(content_type)
-        {
-            return false;
-        }
+    {
+        return false;
     }
 
-    if let Some(role) = role {
-        if !hit
+    if let Some(role) = role
+        && !hit
             .roles
             .iter()
             .any(|item| item.to_ascii_lowercase().contains(role))
-        {
-            return false;
-        }
+    {
+        return false;
     }
 
     query.is_none_or(|query| artifact_hit_search_text(hit).contains(query))
@@ -8181,7 +8201,7 @@ fn signature_content_type(format: &str) -> String {
 }
 
 fn text_preview(bytes: &[u8]) -> Option<String> {
-    if bytes.is_empty() || bytes.iter().any(|byte| *byte == 0) {
+    if bytes.is_empty() || bytes.contains(&0) {
         return None;
     }
     let text = std::str::from_utf8(bytes).ok()?;
@@ -8195,7 +8215,7 @@ fn text_preview(bytes: &[u8]) -> Option<String> {
 }
 
 fn text_preview_for_analysis(bytes: &[u8], max_bytes: usize) -> Option<String> {
-    if bytes.is_empty() || bytes.iter().any(|byte| *byte == 0) {
+    if bytes.is_empty() || bytes.contains(&0) {
         return None;
     }
     let capped = &bytes[..bytes.len().min(max_bytes)];
@@ -8349,7 +8369,6 @@ fn should_run_gguf_model_analyzer(object: &UniversalObject, bytes: &[u8]) -> boo
     object.format.as_deref() == Some("gguf") || is_gguf_like_bytes(bytes)
 }
 
-
 fn should_run_pytorch_model_analyzer(object: &UniversalObject, bytes: &[u8]) -> bool {
     object.format.as_deref() == Some("pytorch")
         || matches!(object.format.as_deref(), Some("pt" | "pth" | "ckpt"))
@@ -8383,8 +8402,10 @@ fn should_run_rar_archive_analyzer(object: &UniversalObject, bytes: &[u8]) -> bo
 }
 
 fn should_run_font_file_analyzer(object: &UniversalObject, bytes: &[u8]) -> bool {
-    matches!(object.format.as_deref(), Some("woff" | "woff2" | "ttf" | "otf"))
-        || bytes.starts_with(b"wOFF")
+    matches!(
+        object.format.as_deref(),
+        Some("woff" | "woff2" | "ttf" | "otf")
+    ) || bytes.starts_with(b"wOFF")
         || bytes.starts_with(b"wOF2")
         || bytes.starts_with(b"OTTO")
         || matches!(
@@ -8427,12 +8448,14 @@ fn should_run_unknown_blob_analyzer(object: &UniversalObject, bytes: &[u8]) -> b
     if bytes.is_empty() {
         return false;
     }
-    matches!(object.format.as_deref(), Some("unknown" | "bin" | "raw" | "data"))
-        || (object.format.is_none()
-            && matches!(
-                object.kind,
-                ObjectKind::File | ObjectKind::Unknown | ObjectKind::MemoryDump
-            ))
+    matches!(
+        object.format.as_deref(),
+        Some("unknown" | "bin" | "raw" | "data")
+    ) || (object.format.is_none()
+        && matches!(
+            object.kind,
+            ObjectKind::File | ObjectKind::Unknown | ObjectKind::MemoryDump
+        ))
 }
 
 fn select_object_analyzers(
@@ -8682,7 +8705,6 @@ fn run_object_analyzer(
     }
 }
 
-
 fn analyze_object_iso_bmff(object: &UniversalObject, bytes: &[u8]) -> ObjectAnalysisSummary {
     if bytes.len() < 12 || &bytes[4..8] != b"ftyp" {
         return ObjectAnalysisSummary {
@@ -8798,7 +8820,11 @@ fn analyze_object_ar_archive(object: &UniversalObject, bytes: &[u8]) -> ObjectAn
         summary: format!(
             "Unix ar archive with {} member(s){}",
             members.len(),
-            if truncated { " (truncated listing)" } else { "" }
+            if truncated {
+                " (truncated listing)"
+            } else {
+                ""
+            }
         ),
         details: serde_json::json!({
             "member_count": members.len(),
@@ -8810,7 +8836,10 @@ fn analyze_object_ar_archive(object: &UniversalObject, bytes: &[u8]) -> ObjectAn
     }
 }
 
-fn analyze_object_seven_zip_archive(object: &UniversalObject, bytes: &[u8]) -> ObjectAnalysisSummary {
+fn analyze_object_seven_zip_archive(
+    object: &UniversalObject,
+    bytes: &[u8],
+) -> ObjectAnalysisSummary {
     if !bytes.starts_with(b"7z\xbc\xaf'\x1c") {
         return ObjectAnalysisSummary {
             analyzer: "seven_zip_archive".to_string(),
@@ -8834,9 +8863,8 @@ fn analyze_object_seven_zip_archive(object: &UniversalObject, bytes: &[u8]) -> O
     }
     let next_header_file_offset =
         next_header_offset.map(|offset| 32usize.saturating_add(offset as usize));
-    let next_header_end = next_header_file_offset.and_then(|offset| {
-        next_header_size.and_then(|size| offset.checked_add(size as usize))
-    });
+    let next_header_end = next_header_file_offset
+        .and_then(|offset| next_header_size.and_then(|size| offset.checked_add(size as usize)));
     let next_header_in_bounds = next_header_end.is_some_and(|end| end <= bytes.len());
     if next_header_file_offset.is_some() && !next_header_in_bounds {
         warnings.push("7z next header extends beyond object bounds".to_string());
@@ -8933,7 +8961,8 @@ fn analyze_object_rar_archive(object: &UniversalObject, bytes: &[u8]) -> ObjectA
                     cursor += consumed;
                     let header_end = cursor.saturating_add(header_size as usize);
                     if header_end > bytes.len() {
-                        warnings.push("RAR5 archive header extends beyond object bounds".to_string());
+                        warnings
+                            .push("RAR5 archive header extends beyond object bounds".to_string());
                     }
                     match read_rar5_vint(bytes, cursor) {
                         Some((header_type, type_consumed)) => {
@@ -8950,21 +8979,19 @@ fn analyze_object_rar_archive(object: &UniversalObject, bytes: &[u8]) -> ObjectA
                                 if flags & 0x0001 != 0 {
                                     volume = true;
                                 }
-                                if flags & 0x0004 != 0 {
-                                    if let Some((extra_size, extra_consumed)) =
+                                if flags & 0x0004 != 0
+                                    && let Some((extra_size, extra_consumed)) =
                                         read_rar5_vint(bytes, cursor)
-                                    {
-                                        cursor = cursor
-                                            .saturating_add(extra_consumed)
-                                            .saturating_add(extra_size as usize);
-                                    }
+                                {
+                                    cursor = cursor
+                                        .saturating_add(extra_consumed)
+                                        .saturating_add(extra_size as usize);
                                 }
-                                if flags & 0x0008 != 0 {
-                                    if let Some((_, data_size_consumed)) =
+                                if flags & 0x0008 != 0
+                                    && let Some((_, data_size_consumed)) =
                                         read_rar5_vint(bytes, cursor)
-                                    {
-                                        cursor = cursor.saturating_add(data_size_consumed);
-                                    }
+                                {
+                                    cursor = cursor.saturating_add(data_size_consumed);
                                 }
                                 if let Some((arch_flags, _)) = read_rar5_vint(bytes, cursor) {
                                     archive_flags = Some(arch_flags as u32);
@@ -9049,7 +9076,6 @@ fn read_rar5_vint(bytes: &[u8], offset: usize) -> Option<(u64, usize)> {
     None
 }
 
-
 fn analyze_object_font_file(object: &UniversalObject, bytes: &[u8]) -> ObjectAnalysisSummary {
     let kind = if bytes.starts_with(b"wOFF") {
         "woff"
@@ -9070,13 +9096,14 @@ fn analyze_object_font_file(object: &UniversalObject, bytes: &[u8]) -> ObjectAna
         "size": bytes.len(),
         "magic": bytes.iter().take(8).map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(""),
     });
-    if matches!(kind, "ttf" | "otf") && bytes.len() >= 12 {
-        if let Some(num_tables) = read_be_u16(bytes, 4) {
-            details["num_tables"] = serde_json::json!(num_tables);
-            let tables = extract_sfnt_table_tags(bytes, num_tables as usize, 32);
-            details["tables"] = serde_json::json!(tables);
-            details["table_count"] = serde_json::json!(tables.len());
-        }
+    if matches!(kind, "ttf" | "otf")
+        && bytes.len() >= 12
+        && let Some(num_tables) = read_be_u16(bytes, 4)
+    {
+        details["num_tables"] = serde_json::json!(num_tables);
+        let tables = extract_sfnt_table_tags(bytes, num_tables as usize, 32);
+        details["tables"] = serde_json::json!(tables);
+        details["table_count"] = serde_json::json!(tables.len());
     }
     if matches!(kind, "woff" | "woff2") && bytes.len() >= 44 {
         details["flavor"] = serde_json::json!(read_be_u32(bytes, 4));
@@ -9121,8 +9148,7 @@ fn analyze_object_tiff_image(object: &UniversalObject, bytes: &[u8]) -> ObjectAn
     } else {
         read_be_u32(bytes, 4)
     };
-    let bigtiff = bytes.get(2..4)
-        == Some(if little { &[0x2b, 0x00] } else { &[0x00, 0x2b] });
+    let bigtiff = bytes.get(2..4) == Some(if little { &[0x2b, 0x00] } else { &[0x00, 0x2b] });
     ObjectAnalysisSummary {
         analyzer: "tiff_image".to_string(),
         status: if magic_ok {
@@ -9243,18 +9269,31 @@ fn analyze_object_disk_image(object: &UniversalObject, bytes: &[u8]) -> ObjectAn
     }
 }
 
-
-
 const MAX_AUTO_DIG_DEPTH: usize = 2;
 
 fn child_seed_analyzers(object: &UniversalObject, bytes: &[u8]) -> &'static [ObjectAnalyzerKind] {
     match object.format.as_deref() {
         Some("pdf") => &[ObjectAnalyzerKind::PdfDocument, ObjectAnalyzerKind::Strings],
-        Some("png") => &[ObjectAnalyzerKind::PngImage, ObjectAnalyzerKind::ByteHistogram],
-        Some("jpeg") => &[ObjectAnalyzerKind::JpegImage, ObjectAnalyzerKind::ByteHistogram],
-        Some("gif") => &[ObjectAnalyzerKind::GifImage, ObjectAnalyzerKind::ByteHistogram],
-        Some("tiff") => &[ObjectAnalyzerKind::TiffImage, ObjectAnalyzerKind::ByteHistogram],
-        Some("bmp" | "dib") => &[ObjectAnalyzerKind::BmpImage, ObjectAnalyzerKind::ByteHistogram],
+        Some("png") => &[
+            ObjectAnalyzerKind::PngImage,
+            ObjectAnalyzerKind::ByteHistogram,
+        ],
+        Some("jpeg") => &[
+            ObjectAnalyzerKind::JpegImage,
+            ObjectAnalyzerKind::ByteHistogram,
+        ],
+        Some("gif") => &[
+            ObjectAnalyzerKind::GifImage,
+            ObjectAnalyzerKind::ByteHistogram,
+        ],
+        Some("tiff") => &[
+            ObjectAnalyzerKind::TiffImage,
+            ObjectAnalyzerKind::ByteHistogram,
+        ],
+        Some("bmp" | "dib") => &[
+            ObjectAnalyzerKind::BmpImage,
+            ObjectAnalyzerKind::ByteHistogram,
+        ],
         Some("zip") => &[ObjectAnalyzerKind::ZipListing, ObjectAnalyzerKind::Strings],
         Some("apk") => &[
             ObjectAnalyzerKind::AndroidPackage,
@@ -9313,28 +9352,46 @@ fn child_seed_analyzers(object: &UniversalObject, bytes: &[u8]) -> &'static [Obj
             ObjectAnalyzerKind::Strings,
             ObjectAnalyzerKind::ByteHistogram,
         ],
-        Some("wasm") => &[ObjectAnalyzerKind::WasmModule, ObjectAnalyzerKind::ByteHistogram],
-        Some("sqlite") => &[ObjectAnalyzerKind::SqliteSchema, ObjectAnalyzerKind::Strings],
-        Some("cab") => &[ObjectAnalyzerKind::CabArchive, ObjectAnalyzerKind::ByteHistogram],
-        Some("ar") => &[ObjectAnalyzerKind::ArArchive, ObjectAnalyzerKind::ByteHistogram],
-        Some("mp4" | "m4a" | "m4v" | "mov" | "heif" | "avif") => {
-            &[ObjectAnalyzerKind::IsoBmff, ObjectAnalyzerKind::ByteHistogram]
-        }
-        Some("flac" | "ogg" | "mp3") => {
-            &[ObjectAnalyzerKind::AudioMedia, ObjectAnalyzerKind::ByteHistogram]
-        }
-        Some("riff" | "wav" | "avi" | "webp") => {
-            &[ObjectAnalyzerKind::RiffContainer, ObjectAnalyzerKind::ByteHistogram]
-        }
-        Some("woff" | "woff2" | "ttf" | "otf") => {
-            &[ObjectAnalyzerKind::FontFile, ObjectAnalyzerKind::ByteHistogram]
-        }
-        Some("qcow2" | "iso" | "dmg" | "vmdk" | "img") => {
-            &[ObjectAnalyzerKind::DiskImage, ObjectAnalyzerKind::ByteHistogram]
-        }
-        Some("pcap" | "pcapng") => {
-            &[ObjectAnalyzerKind::PcapCapture, ObjectAnalyzerKind::ByteHistogram]
-        }
+        Some("wasm") => &[
+            ObjectAnalyzerKind::WasmModule,
+            ObjectAnalyzerKind::ByteHistogram,
+        ],
+        Some("sqlite") => &[
+            ObjectAnalyzerKind::SqliteSchema,
+            ObjectAnalyzerKind::Strings,
+        ],
+        Some("cab") => &[
+            ObjectAnalyzerKind::CabArchive,
+            ObjectAnalyzerKind::ByteHistogram,
+        ],
+        Some("ar") => &[
+            ObjectAnalyzerKind::ArArchive,
+            ObjectAnalyzerKind::ByteHistogram,
+        ],
+        Some("mp4" | "m4a" | "m4v" | "mov" | "heif" | "avif") => &[
+            ObjectAnalyzerKind::IsoBmff,
+            ObjectAnalyzerKind::ByteHistogram,
+        ],
+        Some("flac" | "ogg" | "mp3") => &[
+            ObjectAnalyzerKind::AudioMedia,
+            ObjectAnalyzerKind::ByteHistogram,
+        ],
+        Some("riff" | "wav" | "avi" | "webp") => &[
+            ObjectAnalyzerKind::RiffContainer,
+            ObjectAnalyzerKind::ByteHistogram,
+        ],
+        Some("woff" | "woff2" | "ttf" | "otf") => &[
+            ObjectAnalyzerKind::FontFile,
+            ObjectAnalyzerKind::ByteHistogram,
+        ],
+        Some("qcow2" | "iso" | "dmg" | "vmdk" | "img") => &[
+            ObjectAnalyzerKind::DiskImage,
+            ObjectAnalyzerKind::ByteHistogram,
+        ],
+        Some("pcap" | "pcapng") => &[
+            ObjectAnalyzerKind::PcapCapture,
+            ObjectAnalyzerKind::ByteHistogram,
+        ],
         Some("safetensors") => &[
             ObjectAnalyzerKind::SafeTensorsModel,
             ObjectAnalyzerKind::Strings,
@@ -9350,9 +9407,10 @@ fn child_seed_analyzers(object: &UniversalObject, bytes: &[u8]) -> &'static [Obj
             ObjectAnalyzerKind::Strings,
             ObjectAnalyzerKind::ByteHistogram,
         ],
-        Some("gzip" | "xz" | "zstd" | "bzip2") => {
-            &[ObjectAnalyzerKind::ByteHistogram, ObjectAnalyzerKind::Strings]
-        }
+        Some("gzip" | "xz" | "zstd" | "bzip2") => &[
+            ObjectAnalyzerKind::ByteHistogram,
+            ObjectAnalyzerKind::Strings,
+        ],
         Some("7z") => &[
             ObjectAnalyzerKind::SevenZipArchive,
             ObjectAnalyzerKind::ByteHistogram,
@@ -9367,9 +9425,10 @@ fn child_seed_analyzers(object: &UniversalObject, bytes: &[u8]) -> &'static [Obj
         _ if bytes.starts_with(b"%PDF-") => {
             &[ObjectAnalyzerKind::PdfDocument, ObjectAnalyzerKind::Strings]
         }
-        _ if bytes.starts_with(b"\x89PNG\r\n\x1a\n") => {
-            &[ObjectAnalyzerKind::PngImage, ObjectAnalyzerKind::ByteHistogram]
-        }
+        _ if bytes.starts_with(b"\x89PNG\r\n\x1a\n") => &[
+            ObjectAnalyzerKind::PngImage,
+            ObjectAnalyzerKind::ByteHistogram,
+        ],
         _ if bytes.starts_with(b"dex\n") => {
             &[ObjectAnalyzerKind::DexBytecode, ObjectAnalyzerKind::Strings]
         }
@@ -9413,7 +9472,12 @@ fn derive_object_next_actions(
         .unwrap_or_else(|| object.id.clone());
     let mut seen = BTreeSet::<String>::new();
     let mut push = |action: AgentNextAction| {
-        let key = format!("{}|{}|{}", action.tool, action.query.as_deref().unwrap_or(""), action.reason);
+        let key = format!(
+            "{}|{}|{}",
+            action.tool,
+            action.query.as_deref().unwrap_or(""),
+            action.reason
+        );
         if seen.insert(key) {
             actions.push(action);
         }
@@ -9489,10 +9553,7 @@ fn derive_object_next_actions(
                     .and_then(|value| value.as_array())
                     .cloned()
                     .unwrap_or_default();
-                let has = |name: &str| {
-                    risk.iter()
-                        .any(|item| item.as_str() == Some(name))
-                };
+                let has = |name: &str| risk.iter().any(|item| item.as_str() == Some(name));
                 if has("embedded_manifest_resources_present") || has("manifest_resources_present") {
                     push(agent_next_action(
                         "object_analyze",
@@ -9675,7 +9736,6 @@ fn derive_object_next_actions(
         }
     }
 
-    drop(push);
     if actions.is_empty() {
         actions.push(agent_next_action(
             "evidence_graph",
@@ -9725,8 +9785,8 @@ fn derive_object_agent_brief(
                 risk_findings.push(format!("risk/{}/{}", analysis.analyzer, risk));
             }
         }
-        if analysis.analyzer == "auto_expand" {
-            if let Some(count) = analysis
+        if analysis.analyzer == "auto_expand"
+            && let Some(count) = analysis
                 .details
                 .get("expanded_count")
                 .and_then(|value| value.as_u64())
@@ -9737,26 +9797,24 @@ fn derive_object_agent_brief(
                         .and_then(|value| value.as_array())
                         .map(|items| items.len() as u64)
                 })
-            {
-                if count > 0 {
-                    open_questions.push(format!(
+            && count > 0
+        {
+            open_questions.push(format!(
                         "{count} expanded child object(s) are ready; analyze top child before sibling breadth"
                     ));
-                }
-            }
         }
     }
     let mut key_findings = risk_findings;
     key_findings.extend(base_findings);
     key_findings.truncate(8);
     open_questions.truncate(5);
-    if open_questions.is_empty() {
-        if let Some(top) = next_actions.first().filter(|action| action.priority >= 80) {
-            open_questions.push(format!(
-                "Execute top action `{}` before opening parallel tool calls",
-                top.tool
-            ));
-        }
+    if open_questions.is_empty()
+        && let Some(top) = next_actions.first().filter(|action| action.priority >= 80)
+    {
+        open_questions.push(format!(
+            "Execute top action `{}` before opening parallel tool calls",
+            top.tool
+        ));
     }
     let headline = if let Some(top) = next_actions.first() {
         format!(
@@ -9861,10 +9919,10 @@ fn compressed_format_for_object(
     object: &UniversalObject,
     bytes: &[u8],
 ) -> Option<CompressedFormat> {
-    if let Some(format) = object.format.as_deref() {
-        if let Some(parsed) = compressed_format(format).or_else(|| compressed_tar_format(format)) {
-            return Some(parsed);
-        }
+    if let Some(format) = object.format.as_deref()
+        && let Some(parsed) = compressed_format(format).or_else(|| compressed_tar_format(format))
+    {
+        return Some(parsed);
     }
     if bytes.starts_with(&[0x1f, 0x8b, 0x08]) {
         return Some(CompressedFormat::Gzip);
@@ -9938,7 +9996,9 @@ fn high_value_archive_member_priority(name: &str, parent_format: Option<&str>) -
         return Some(55);
     }
     if matches!(parent_format, Some("apk" | "ipa" | "jar" | "aar" | "zip"))
-        && (lower.starts_with("assets/") || lower.starts_with("res/raw/") || lower.contains("/assets/"))
+        && (lower.starts_with("assets/")
+            || lower.starts_with("res/raw/")
+            || lower.contains("/assets/"))
         && (lower.ends_with(".so")
             || lower.ends_with(".dex")
             || lower.ends_with(".bin")
@@ -10000,7 +10060,10 @@ fn is_tar_bytes(bytes: &[u8]) -> bool {
     declared == sum
 }
 
-fn classify_expanded_bytes(bytes: &[u8], entry_name: &str) -> (ObjectKind, &'static str, &'static str) {
+fn classify_expanded_bytes(
+    bytes: &[u8],
+    entry_name: &str,
+) -> (ObjectKind, &'static str, &'static str) {
     let lower = entry_name.to_ascii_lowercase();
     if bytes.starts_with(b"\x7fELF") {
         return (ObjectKind::Binary, "elf", "application/x-elf");
@@ -10018,16 +10081,14 @@ fn classify_expanded_bytes(bytes: &[u8], entry_name: &str) -> (ObjectKind, &'sta
     ) {
         return (ObjectKind::Binary, "macho", "application/x-mach-binary");
     }
-    if bytes.get(..4) == Some(b"\xca\xfe\xba\xbe") {
-        if bytes.len() >= 8 {
-            let nfat = u32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
-            if (1..=32).contains(&nfat) {
-                return (ObjectKind::Binary, "macho_fat", "application/x-mach-binary");
-            }
-            let major = u16::from_be_bytes([bytes[6], bytes[7]]);
-            if (45..=70).contains(&major) {
-                return (ObjectKind::Binary, "jvm_class", "application/java-vm");
-            }
+    if bytes.get(..4) == Some(b"\xca\xfe\xba\xbe") && bytes.len() >= 8 {
+        let nfat = u32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+        if (1..=32).contains(&nfat) {
+            return (ObjectKind::Binary, "macho_fat", "application/x-mach-binary");
+        }
+        let major = u16::from_be_bytes([bytes[6], bytes[7]]);
+        if (45..=70).contains(&major) {
+            return (ObjectKind::Binary, "jvm_class", "application/java-vm");
         }
     }
     if bytes.starts_with(b"dex\n") {
@@ -10041,7 +10102,11 @@ fn classify_expanded_bytes(bytes: &[u8], entry_name: &str) -> (ObjectKind, &'sta
     }
     if bytes.starts_with(b"PK\x03\x04") {
         if lower.ends_with(".apk") {
-            return (ObjectKind::Package, "apk", "application/vnd.android.package-archive");
+            return (
+                ObjectKind::Package,
+                "apk",
+                "application/vnd.android.package-archive",
+            );
         }
         if lower.ends_with(".jar") {
             return (ObjectKind::Archive, "jar", "application/java-archive");
@@ -10067,8 +10132,10 @@ fn classify_expanded_bytes(bytes: &[u8], entry_name: &str) -> (ObjectKind, &'sta
     if lower.ends_with(".dylib") {
         return (ObjectKind::Binary, "macho", "application/x-mach-binary");
     }
-    if lower.contains("payload/") && lower.contains(".app/") && !lower.contains('.') {
-        if matches!(
+    if lower.contains("payload/")
+        && lower.contains(".app/")
+        && !lower.contains('.')
+        && matches!(
             bytes.get(..4),
             Some(
                 b"\xcf\xfa\xed\xfe"
@@ -10077,15 +10144,11 @@ fn classify_expanded_bytes(bytes: &[u8], entry_name: &str) -> (ObjectKind, &'sta
                     | b"\xfe\xed\xfa\xce"
                     | b"\xca\xfe\xba\xbe"
             )
-        ) {
-            return (ObjectKind::Binary, "macho", "application/x-mach-binary");
-        }
+        )
+    {
+        return (ObjectKind::Binary, "macho", "application/x-mach-binary");
     }
-    (
-        ObjectKind::File,
-        "unknown",
-        "application/octet-stream",
-    )
+    (ObjectKind::File, "unknown", "application/octet-stream")
 }
 
 fn should_auto_dig_object(
@@ -10126,17 +10189,7 @@ fn should_auto_dig_object(
     matches!(
         object.format.as_deref(),
         Some(
-            "unknown"
-                | "bin"
-                | "raw"
-                | "data"
-                | "7z"
-                | "rar"
-                | "pe"
-                | "dll"
-                | "exe"
-                | "sys"
-                | "ar"
+            "unknown" | "bin" | "raw" | "data" | "7z" | "rar" | "pe" | "dll" | "exe" | "sys" | "ar"
         ) | None
     )
 }
@@ -10159,7 +10212,10 @@ fn lightweight_carved_object(
     let mut flags = vec![
         "carved".to_string(),
         "auto_dig".to_string(),
-        format!("from:{parent_format}", parent_format = parent.format.as_deref().unwrap_or("unknown")),
+        format!(
+            "from:{parent_format}",
+            parent_format = parent.format.as_deref().unwrap_or("unknown")
+        ),
     ];
     if matches!(format, "elf" | "pe" | "macho" | "macho_fat") {
         flags.push("native_binary_candidate".to_string());
@@ -10251,11 +10307,7 @@ fn classify_carved_format(format: &str, bytes: &[u8]) -> (ObjectKind, &'static s
         "woff2" => (ObjectKind::File, "woff2", "font/woff2"),
         _ if bytes.starts_with(b"%PDF-") => (ObjectKind::Document, "pdf", "application/pdf"),
         _ if bytes.starts_with(b"\x89PNG\r\n\x1a\n") => (ObjectKind::Image, "png", "image/png"),
-        _ => (
-            ObjectKind::File,
-            "unknown",
-            "application/octet-stream",
-        ),
+        _ => (ObjectKind::File, "unknown", "application/octet-stream"),
     }
 }
 
@@ -10358,7 +10410,9 @@ fn extract_iso_bmff_summary(bytes: &[u8]) -> Result<serde_json::Value> {
             .to_string();
         let (header_size, size) = if size32 == 1 {
             if cursor + 16 > bytes.len() {
-                warnings.push(format!("truncated 64-bit box header for {kind} at {cursor}"));
+                warnings.push(format!(
+                    "truncated 64-bit box header for {kind} at {cursor}"
+                ));
                 break;
             }
             let size64 = read_be_u64(bytes, cursor + 8).context("missing ISO BMFF largesize")?;
@@ -10423,10 +10477,7 @@ fn extract_iso_bmff_summary(bytes: &[u8]) -> Result<serde_json::Value> {
     }))
 }
 
-fn extract_ar_members(
-    bytes: &[u8],
-    limit: usize,
-) -> (Vec<serde_json::Value>, bool, Vec<String>) {
+fn extract_ar_members(bytes: &[u8], limit: usize) -> (Vec<serde_json::Value>, bool, Vec<String>) {
     let mut members = Vec::new();
     let mut warnings = Vec::new();
     let mut cursor = 8usize;
@@ -10499,7 +10550,9 @@ fn analyze_object_byte_histogram(object: &UniversalObject, bytes: &[u8]) -> Obje
         .count();
     let ascii_control_count = bytes
         .iter()
-        .filter(|byte| byte.is_ascii_control() && **byte != b'\t' && **byte != b'\n' && **byte != b'\r')
+        .filter(|byte| {
+            byte.is_ascii_control() && **byte != b'\t' && **byte != b'\n' && **byte != b'\r'
+        })
         .count();
     let high_bit_count = bytes.iter().filter(|byte| **byte >= 0x80).count();
     let unique_bytes = histogram.iter().filter(|count| **count > 0).count();
@@ -11093,7 +11146,7 @@ struct GgufParseState<'a> {
 const GGUF_MAGIC: &[u8; 4] = b"GGUF";
 const GGUF_METADATA_LIMIT: u64 = 2048;
 const GGUF_TENSOR_LIMIT: u64 = 4096;
-const GGUF_STRING_LIMIT: u64 = 1 * 1024 * 1024;
+const GGUF_STRING_LIMIT: u64 = 1024 * 1024;
 const GGUF_ARRAY_ITEM_LIMIT: u64 = 64;
 
 fn extract_gguf_model_summary(object: &UniversalObject, bytes: &[u8]) -> Result<GgufModelSummary> {
@@ -11438,7 +11491,7 @@ impl<'a> GgufParseState<'a> {
             2 | 3 => {
                 self.read_bytes(2, "GGUF metadata scalar")?;
             }
-            4 | 5 | 6 => {
+            4..=6 => {
                 self.read_bytes(4, "GGUF metadata scalar")?;
             }
             8 => {
@@ -11455,7 +11508,7 @@ impl<'a> GgufParseState<'a> {
                     self.skip_metadata_value_of_type(item_type)?;
                 }
             }
-            10 | 11 | 12 => {
+            10..=12 => {
                 self.read_bytes(8, "GGUF metadata scalar")?;
             }
             _ => anyhow::bail!("unknown GGUF metadata value type {value_type}"),
@@ -12663,7 +12716,7 @@ fn android_manifest_summary<R: Read + std::io::Seek>(
         warnings.push("AndroidManifest.xml was truncated during analysis".to_string());
     }
     let bytes = entry.text.as_bytes();
-    if bytes.starts_with(&[0x03, 0x00, 0x08, 0x00]) || bytes.iter().any(|byte| *byte == 0) {
+    if bytes.starts_with(&[0x03, 0x00, 0x08, 0x00]) || bytes.contains(&0) {
         return Ok(serde_json::json!({
             "present": true,
             "encoding": "binary_axml",
@@ -12926,7 +12979,6 @@ fn parse_dex_version(bytes: &[u8]) -> Option<String> {
 fn is_dex_like_bytes(bytes: &[u8]) -> bool {
     parse_dex_version(bytes).is_some()
 }
-
 
 fn is_interesting_dex_string(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
@@ -15176,6 +15228,7 @@ fn jvm_cp_entry_json(
     }
 }
 
+#[allow(clippy::collapsible_match)]
 fn jvm_string_constants(pool: &[Option<JvmConstantPoolEntry>]) -> Vec<serde_json::Value> {
     let mut values = Vec::new();
     for (index, entry) in pool.iter().enumerate().skip(1) {
@@ -16664,10 +16717,10 @@ fn shell_link_info_json(info: &ShellLinkLinkInfo) -> serde_json::Value {
 }
 
 fn shell_link_target_hint(parsed: &ShellLinkParsed) -> String {
-    if let Some(value) = parsed.strings.get("command_line_arguments") {
-        if let Some(relative) = parsed.strings.get("relative_path") {
-            return format!("{relative} {value}");
-        }
+    if let Some(value) = parsed.strings.get("command_line_arguments")
+        && let Some(relative) = parsed.strings.get("relative_path")
+    {
+        return format!("{relative} {value}");
     }
     for value in [
         parsed.strings.get("relative_path").map(String::as_str),
@@ -17397,7 +17450,11 @@ fn extract_dotnet_metadata_summary(
     if !tables.manifest_resources.is_empty() {
         risk_signals.insert("manifest_resources_present".to_string());
     }
-    if tables.manifest_resources.iter().any(|item| item.is_embedded) {
+    if tables
+        .manifest_resources
+        .iter()
+        .any(|item| item.is_embedded)
+    {
         risk_signals.insert("embedded_manifest_resources_present".to_string());
     }
     for resource in &tables.manifest_resources {
@@ -18142,6 +18199,7 @@ fn parse_dotnet_type_defs(
     Ok(records)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn parse_dotnet_method_defs(
     bytes: &[u8],
     table_offsets: &[Option<usize>; 64],
@@ -18188,6 +18246,7 @@ fn parse_dotnet_method_defs(
     Ok(records)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn parse_dotnet_member_refs(
     bytes: &[u8],
     table_offsets: &[Option<usize>; 64],
@@ -18237,6 +18296,7 @@ fn parse_dotnet_member_refs(
     Ok(records)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn parse_dotnet_assemblies(
     bytes: &[u8],
     table_offsets: &[Option<usize>; 64],
@@ -18338,8 +18398,7 @@ fn parse_dotnet_manifest_resources(
         let offset = cursor.read_u32("ManifestResource.Offset")?;
         let flags = cursor.read_u32("ManifestResource.Flags")?;
         let name_index = cursor.read_index(string_index_size, "ManifestResource.Name")?;
-        let implementation_raw =
-            cursor.read_index(impl_size, "ManifestResource.Implementation")?;
+        let implementation_raw = cursor.read_index(impl_size, "ManifestResource.Implementation")?;
         let implementation =
             dotnet_decode_coded_index(implementation_raw, DotnetCodedIndexKind::Implementation);
         let name = dotnet_string_or_placeholder(strings_heap, name_index);
@@ -18361,6 +18420,7 @@ fn parse_dotnet_manifest_resources(
     Ok(records)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn parse_dotnet_module_refs(
     bytes: &[u8],
     table_offsets: &[Option<usize>; 64],
@@ -18392,6 +18452,7 @@ fn parse_dotnet_module_refs(
     Ok(records)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn parse_dotnet_impl_maps(
     bytes: &[u8],
     table_offsets: &[Option<usize>; 64],
@@ -18414,8 +18475,7 @@ fn parse_dotnet_impl_maps(
     for row in 1..=declared_rows.min(DOTNET_IMPL_MAP_LIMIT) {
         let mut cursor = DotnetTableCursor::new(bytes, base_offset + (row - 1) * row_size);
         let mapping_flags = cursor.read_u16("ImplMap.MappingFlags")?;
-        let member_forwarded_raw =
-            cursor.read_index(forwarded_size, "ImplMap.MemberForwarded")?;
+        let member_forwarded_raw = cursor.read_index(forwarded_size, "ImplMap.MemberForwarded")?;
         let import_name_index = cursor.read_index(string_index_size, "ImplMap.ImportName")?;
         let import_scope = cursor.read_index(module_ref_index_size, "ImplMap.ImportScope")?;
         let member_forwarded =
@@ -18792,10 +18852,8 @@ fn dotnet_read_compressed_unsigned(bytes: &[u8], offset: usize) -> Option<(u32, 
         let b1 = *bytes.get(offset + 1)?;
         let b2 = *bytes.get(offset + 2)?;
         let b3 = *bytes.get(offset + 3)?;
-        let value = (((first & 0x1f) as u32) << 24)
-            | ((b1 as u32) << 16)
-            | ((b2 as u32) << 8)
-            | b3 as u32;
+        let value =
+            (((first & 0x1f) as u32) << 24) | ((b1 as u32) << 16) | ((b2 as u32) << 8) | b3 as u32;
         return Some((value, 4));
     }
     None
@@ -19671,7 +19729,7 @@ fn parse_pe_import_thunks(
     } else {
         0x8000_0000u64
     };
-    let ordinal_value_mask = if is_pe64 { 0xffffu64 } else { 0xffffu64 };
+    let ordinal_value_mask = 0xffffu64;
     let mut functions = Vec::new();
     let mut function_count = 0usize;
     loop {
@@ -20004,7 +20062,6 @@ fn pe_certificate_summary(directories: &[PeDataDirectory], bytes: &[u8]) -> serd
     })
 }
 
-
 #[derive(Debug, Clone)]
 struct PeExpandResource {
     name: String,
@@ -20065,8 +20122,14 @@ fn pe_expand_layout(bytes: &[u8]) -> Option<PeExpandLayout> {
         .unwrap_or(false)
     {
         Some((
-            overlay.get("offset").and_then(|value| value.as_u64()).unwrap_or(0) as usize,
-            overlay.get("size").and_then(|value| value.as_u64()).unwrap_or(0) as usize,
+            overlay
+                .get("offset")
+                .and_then(|value| value.as_u64())
+                .unwrap_or(0) as usize,
+            overlay
+                .get("size")
+                .and_then(|value| value.as_u64())
+                .unwrap_or(0) as usize,
         ))
     } else {
         None
@@ -20407,6 +20470,7 @@ fn pe_resource_expand_priority(resource: &PeExpandResource, bytes: &[u8]) -> u8 
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn parse_pe_resource_entries(
     bytes: &[u8],
     directories: &[PeDataDirectory],
@@ -20438,6 +20502,8 @@ fn parse_pe_resource_entries(
     out
 }
 
+#[allow(clippy::only_used_in_recursion)]
+#[allow(clippy::too_many_arguments)]
 fn parse_pe_resource_directory(
     bytes: &[u8],
     sections: &[PeSectionSummary],
@@ -21355,6 +21421,7 @@ fn elf_needed_libraries(
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn parse_elf_symbols(
     bytes: &[u8],
     is_64: bool,
@@ -21435,6 +21502,7 @@ fn parse_elf_symbols(
     symbols
 }
 
+#[allow(clippy::too_many_arguments)]
 fn collect_elf_risk_signals(
     e_type: u16,
     entry: u64,
@@ -21963,10 +22031,10 @@ fn is_macho_fat_bytes(bytes: &[u8]) -> bool {
 }
 
 fn is_macho_thin_bytes(bytes: &[u8]) -> bool {
-    if let Some(magic) = read_le_u32(bytes, 0) {
-        if matches!(magic, 0xfeedface | 0xcefaedfe | 0xfeedfacf | 0xcffaedfe) {
-            return true;
-        }
+    if let Some(magic) = read_le_u32(bytes, 0)
+        && matches!(magic, 0xfeedface | 0xcefaedfe | 0xfeedfacf | 0xcffaedfe)
+    {
+        return true;
     }
     matches!(
         read_be_u32(bytes, 0),
@@ -22119,6 +22187,7 @@ fn extract_macho_fat_summary(
     })
 }
 
+#[allow(clippy::collapsible_match)]
 fn extract_macho_thin_summary(
     object: &UniversalObject,
     bytes: &[u8],
@@ -22971,14 +23040,12 @@ fn extract_ios_package_summary(
         } else if name.ends_with(".plist") {
             plist_entries.push(name.clone());
         }
-        if ios_code_signature_entry(&name) {
-            if code_signatures.len() < IOS_SAMPLE_LIMIT {
-                code_signatures.push(serde_json::json!({
-                    "path": name,
-                    "size": file.size(),
-                    "role": ios_code_signature_role(file.name()),
-                }));
-            }
+        if ios_code_signature_entry(&name) && code_signatures.len() < IOS_SAMPLE_LIMIT {
+            code_signatures.push(serde_json::json!({
+                "path": name,
+                "size": file.size(),
+                "role": ios_code_signature_role(file.name()),
+            }));
         }
         if name.ends_with("embedded.mobileprovision") {
             provisioning_profiles.push(name.clone());
@@ -23834,10 +23901,10 @@ fn detect_open_xml_format(
     content_types: &OpenXmlContentTypes,
     entry_names: &[String],
 ) -> String {
-    if let Some(format) = object.format.as_deref() {
-        if matches!(format, "docx" | "docm" | "xlsx" | "xlsm" | "pptx" | "pptm") {
-            return format.to_string();
-        }
+    if let Some(format) = object.format.as_deref()
+        && matches!(format, "docx" | "docm" | "xlsx" | "xlsm" | "pptx" | "pptm")
+    {
+        return format.to_string();
     }
     for content_type in content_types.overrides.values() {
         let lower = content_type.to_ascii_lowercase();
@@ -24765,17 +24832,17 @@ fn decode_xml_entities(value: &str) -> String {
             "quot" => output.push('"'),
             "apos" => output.push('\''),
             _ if entity.starts_with("#x") => {
-                if let Ok(value) = u32::from_str_radix(&entity[2..], 16) {
-                    if let Some(ch) = char::from_u32(value) {
-                        output.push(ch);
-                    }
+                if let Ok(value) = u32::from_str_radix(&entity[2..], 16)
+                    && let Some(ch) = char::from_u32(value)
+                {
+                    output.push(ch);
                 }
             }
             _ if entity.starts_with('#') => {
-                if let Ok(value) = entity[1..].parse::<u32>() {
-                    if let Some(ch) = char::from_u32(value) {
-                        output.push(ch);
-                    }
+                if let Ok(value) = entity[1..].parse::<u32>()
+                    && let Some(ch) = char::from_u32(value)
+                {
+                    output.push(ch);
                 }
             }
             _ => {
@@ -25376,12 +25443,7 @@ fn extract_wasm_module_summary(bytes: &[u8]) -> Result<WasmModuleSummary> {
         anyhow::bail!("missing wasm magic");
     }
     let version = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
-    let encoding = if version == 1 {
-        "module"
-    } else {
-        "unknown"
-    }
-    .to_string();
+    let encoding = if version == 1 { "module" } else { "unknown" }.to_string();
 
     let mut offset = 8usize;
     let mut sections = Vec::new();
@@ -25415,7 +25477,8 @@ fn extract_wasm_module_summary(bytes: &[u8]) -> Result<WasmModuleSummary> {
             if let Ok(name_len) = read_wasm_leb128(bytes, &mut local) {
                 let name_len = name_len as usize;
                 if local + name_len <= body_end {
-                    let name = String::from_utf8_lossy(&bytes[local..local + name_len]).into_owned();
+                    let name =
+                        String::from_utf8_lossy(&bytes[local..local + name_len]).into_owned();
                     if custom_sections.len() < WASM_SECTION_PREVIEW_LIMIT {
                         custom_sections.push(serde_json::json!({
                             "name": name,
@@ -25545,13 +25608,10 @@ fn count_ascii_token(bytes: &[u8], token: &[u8]) -> usize {
 fn extract_pdf_document_summary(bytes: &[u8]) -> Result<PdfDocumentSummary> {
     let risk_signals = scan_pdf_risk_signals(bytes);
     let header = pdf_header_details(bytes);
-    let version = header["version"]
-        .as_str()
-        .unwrap_or("unknown")
-        .to_string();
+    let version = header["version"].as_str().unwrap_or("unknown").to_string();
 
-    let page_count = count_ascii_token(bytes, b"/Type /Page")
-        + count_ascii_token(bytes, b"/Type/Page");
+    let page_count =
+        count_ascii_token(bytes, b"/Type /Page") + count_ascii_token(bytes, b"/Type/Page");
     let object_count = count_ascii_token(bytes, b" 0 obj")
         + count_ascii_token(bytes, b"\n0 obj")
         + count_ascii_token(bytes, b"\r0 obj");
@@ -25971,20 +26031,12 @@ fn extract_png_image_summary(bytes: &[u8]) -> Result<PngImageSummary> {
 
     let private_chunks = chunks
         .iter()
-        .filter(|chunk| {
-            chunk["kind"]
-                .as_str()
-                .is_some_and(|kind| png_chunk_is_private(kind))
-        })
+        .filter(|chunk| chunk["kind"].as_str().is_some_and(png_chunk_is_private))
         .cloned()
         .collect::<Vec<_>>();
     let ancillary_chunks = chunks
         .iter()
-        .filter(|chunk| {
-            chunk["kind"]
-                .as_str()
-                .is_some_and(|kind| png_chunk_is_ancillary(kind))
-        })
+        .filter(|chunk| chunk["kind"].as_str().is_some_and(png_chunk_is_ancillary))
         .cloned()
         .collect::<Vec<_>>();
 
@@ -27297,14 +27349,15 @@ fn extract_bmp_image_summary(object: &UniversalObject, bytes: &[u8]) -> Result<B
     });
     let declared_image_size = (header.image_size > 0).then_some(header.image_size as u64);
     let available_pixel_bytes = bytes.len().saturating_sub(pixel_offset) as u64;
-    if let Some(expected) = expected_pixel_bytes {
-        if header.compression == 0 && available_pixel_bytes < expected {
-            warnings.push(format!(
-                "BMP/DIB pixel data has {available_pixel_bytes} bytes, expected at least {expected}"
-            ));
-            valid = false;
-            truncated = true;
-        }
+    if let Some(expected) = expected_pixel_bytes
+        && header.compression == 0
+        && available_pixel_bytes < expected
+    {
+        warnings.push(format!(
+            "BMP/DIB pixel data has {available_pixel_bytes} bytes, expected at least {expected}"
+        ));
+        valid = false;
+        truncated = true;
     }
 
     let trailing = if header.has_file_header {
@@ -28175,10 +28228,10 @@ fn extract_vba_project_summary(
     };
     let mut modules = parse_vba_dir_modules(&decompressed_dir);
     if modules.is_empty() {
-        if let Some(err) = dir_decode_error.as_deref() {
-            if dir_text_preview.is_none() {
-                warnings.push(format!("failed to decompress VBA dir stream: {err}"));
-            }
+        if let Some(err) = dir_decode_error.as_deref()
+            && dir_text_preview.is_none()
+        {
+            warnings.push(format!("failed to decompress VBA dir stream: {err}"));
         }
         modules = infer_vba_modules_from_streams(streams);
     }
@@ -28326,7 +28379,7 @@ fn decode_vba_record_string(data: &[u8]) -> Option<String> {
     if data.is_empty() {
         return None;
     }
-    if data.len() % 2 == 0 && data.iter().skip(1).step_by(2).any(|byte| *byte == 0) {
+    if data.len().is_multiple_of(2) && data.iter().skip(1).step_by(2).any(|byte| *byte == 0) {
         let units = data
             .chunks_exact(2)
             .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
@@ -29260,7 +29313,6 @@ fn bmp_uncompressed_row_stride(width: u64, bit_count: u16) -> Option<u64> {
     bits.checked_add(31)?.checked_div(32)?.checked_mul(4)
 }
 
-
 fn shannon_entropy_from_histogram(histogram: &[usize; 256], total: usize) -> f64 {
     if total == 0 {
         return 0.0;
@@ -29369,17 +29421,16 @@ fn extract_utf16_strings(
                 break;
             }
         }
-        if units.len() >= min_length {
-            if let Ok(value) = String::from_utf16(&units) {
-                if value.chars().any(|ch| ch.is_ascii_alphanumeric()) {
-                    results.push(serde_json::json!({
-                        "offset": start,
-                        "length_bytes": units.len() * 2,
-                        "encoding": if little_endian { "utf16le" } else { "utf16be" },
-                        "value": value,
-                    }));
-                }
-            }
+        if units.len() >= min_length
+            && let Ok(value) = String::from_utf16(&units)
+            && value.chars().any(|ch| ch.is_ascii_alphanumeric())
+        {
+            results.push(serde_json::json!({
+                "offset": start,
+                "length_bytes": units.len() * 2,
+                "encoding": if little_endian { "utf16le" } else { "utf16be" },
+                "value": value,
+            }));
         }
         if units.is_empty() {
             index = index.max(start + 2);
@@ -29401,7 +29452,10 @@ fn score_interesting_strings(
             };
             let lower = value.to_ascii_lowercase();
             let mut tags = Vec::new();
-            if lower.starts_with("http://") || lower.starts_with("https://") || lower.starts_with("ftp://") {
+            if lower.starts_with("http://")
+                || lower.starts_with("https://")
+                || lower.starts_with("ftp://")
+            {
                 tags.push("url");
             }
             if lower.contains("://") && lower.contains('.') {
@@ -30047,7 +30101,7 @@ fn parse_address(value: &str) -> Option<u64> {
 
 fn parse_byte_pattern(pattern: &str) -> Result<Vec<u8>> {
     let normalized = pattern.replace(' ', "").replace("0x", "").replace("0X", "");
-    if normalized.len() % 2 != 0 {
+    if !normalized.len().is_multiple_of(2) {
         anyhow::bail!("byte pattern must contain an even number of hex digits");
     }
     hex::decode(normalized).map_err(Into::into)
@@ -30505,7 +30559,12 @@ fn validate_embedded_signature(bytes: &[u8], offset: usize, format: &str) -> boo
         "pe" => validate_pe_signature(bytes, offset),
         "macho" => matches!(
             bytes.get(offset..offset + 4),
-            Some(b"\xcf\xfa\xed\xfe" | b"\xce\xfa\xed\xfe" | b"\xfe\xed\xfa\xcf" | b"\xfe\xed\xfa\xce")
+            Some(
+                b"\xcf\xfa\xed\xfe"
+                    | b"\xce\xfa\xed\xfe"
+                    | b"\xfe\xed\xfa\xcf"
+                    | b"\xfe\xed\xfa\xce"
+            )
         ),
         "macho_fat" => {
             if bytes.get(offset..offset + 4) != Some(b"\xca\xfe\xba\xbe") {
@@ -30555,7 +30614,7 @@ fn validate_pe_signature(bytes: &[u8], offset: usize) -> bool {
         bytes[offset + 0x3e],
         bytes[offset + 0x3f],
     ]) as usize;
-    if e_lfanew < 0x40 || e_lfanew > 0x1000 {
+    if !(0x40..=0x1000).contains(&e_lfanew) {
         return false;
     }
     let pe_off = offset.saturating_add(e_lfanew);
@@ -30819,8 +30878,12 @@ fn estimate_mp4_length(bytes: &[u8], offset: usize) -> Option<u64> {
 }
 
 fn estimate_dex_length(bytes: &[u8], offset: usize) -> Option<u64> {
-    if bytes.get(offset..offset + 4) != Some(b"dex
-") {
+    if bytes.get(offset..offset + 4)
+        != Some(
+            b"dex
+",
+        )
+    {
         return None;
     }
     let file_size = read_le_u32(bytes, offset + 32)? as usize;
@@ -30832,7 +30895,9 @@ fn find_bytes_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() || haystack.len() < needle.len() {
         return None;
     }
-    haystack.windows(needle.len()).position(|window| window == needle)
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
 }
 
 fn estimate_riff_length(bytes: &[u8], offset: usize) -> Option<u64> {
@@ -31198,7 +31263,7 @@ fn map_reference_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Reference> {
     Ok(Reference {
         from: row.get::<_, i64>(0)? as u64,
         to: row.get::<_, i64>(1)? as u64,
-        kind: revx_core::ReferenceKind::from_str(&kind_str),
+        kind: revx_core::ReferenceKind::parse(&kind_str),
     })
 }
 
@@ -31226,15 +31291,6 @@ fn map_function_locator_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Functio
         size: row.get::<_, i64>(3)? as u64,
     })
 }
-
-fn role_name_to_enum(name: &str) -> revx_core::VariableRole {
-    match name {
-        "Argument" => revx_core::VariableRole::Argument,
-        "Local" => revx_core::VariableRole::Local,
-        _ => revx_core::VariableRole::Temporary,
-    }
-}
-
 
 fn rank_function_hits(query: &str, hits: &mut [FunctionSearchHit]) {
     hits.sort_by(|left, right| {

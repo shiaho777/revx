@@ -5,10 +5,11 @@ use bzip2::read::BzDecoder;
 use flate2::read::GzDecoder;
 #[cfg(feature = "debug-info")]
 use gimli::{EndianSlice, RunTimeEndian, SectionId};
+use memmap2::Mmap;
 use object::read::macho::MachHeader;
 use object::{
-    Architecture as ObjArch, Object, ObjectSection, ObjectSegment,
-    ObjectSymbol, ObjectSymbolTable, SegmentFlags, endian::Endianness, macho,
+    Architecture as ObjArch, Object, ObjectSection, ObjectSegment, ObjectSymbol, ObjectSymbolTable,
+    SegmentFlags, endian::Endianness, macho,
 };
 #[cfg(feature = "debug-info")]
 use pdb::{FallibleIterator, PDB};
@@ -27,14 +28,12 @@ use ruzstd::decoding::StreamingDecoder as ZstdDecoder;
 #[cfg(feature = "debug-info")]
 use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
-use memmap2::Mmap;
 use std::fs;
 #[cfg(feature = "containers")]
 use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
 #[cfg(feature = "containers")]
 use xz2::read::XzDecoder;
-
 
 fn advise_mmap_sequential(bytes: &[u8]) {
     if bytes.is_empty() {
@@ -80,8 +79,8 @@ fn advise_mmap_dontneed(bytes: &[u8]) {
 }
 
 pub fn load_binary(path: &Path) -> Result<BinaryImage> {
-    let file_handle = fs::File::open(path)
-        .with_context(|| format!("failed to open {}", path.display()))?;
+    let file_handle =
+        fs::File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
     let bytes = unsafe { Mmap::map(&file_handle) }
         .with_context(|| format!("failed to mmap {}", path.display()))?;
     if let Some(thin) = extract_preferred_macho_thin_slice(&bytes) {
@@ -172,7 +171,11 @@ fn load_binary_from_bytes(path: &Path, bytes: &[u8]) -> Result<BinaryImage> {
         Vec::new()
     } else {
         let mut symbols = Vec::with_capacity(if lean { symbol_cap.min(256) } else { 8192 });
-        let sources: &[&str] = if lean { &["dynamic", "static"] } else { &["static"] };
+        let sources: &[&str] = if lean {
+            &["dynamic", "static"]
+        } else {
+            &["static"]
+        };
         for source in sources {
             if *source == "dynamic" {
                 for sym in file.dynamic_symbols() {
@@ -243,10 +246,10 @@ fn load_binary_from_bytes(path: &Path, bytes: &[u8]) -> Result<BinaryImage> {
     let mut debug_import = if micro || lean {
         DebugImportSummary::default()
     } else {
-        import_debug_info(path, &bytes, &file, format, architecture)
+        import_debug_info(path, bytes, &file, format, architecture)
     };
     if !micro && !lean {
-        enrich_debug_function_hints_from_macho(&bytes, &file, format, &mut debug_import);
+        enrich_debug_function_hints_from_macho(bytes, &file, format, &mut debug_import);
     }
     let debug_artifacts = if micro || lean {
         Vec::new()
@@ -291,7 +294,6 @@ fn load_binary_from_bytes(path: &Path, bytes: &[u8]) -> Result<BinaryImage> {
         strings,
     })
 }
-
 
 fn segment_permissions(segment: &object::Segment<'_, '_>) -> String {
     match segment.flags() {
@@ -452,10 +454,7 @@ fn macho_function_starts(bytes: &[u8], file: &object::File<'_>) -> Option<Vec<u6
     })
 }
 
-fn parse_macho_function_starts<Mach: MachHeader>(
-    bytes: &[u8],
-    text_base: u64,
-) -> Option<Vec<u64>> {
+fn parse_macho_function_starts<Mach: MachHeader>(bytes: &[u8], text_base: u64) -> Option<Vec<u64>> {
     let header = Mach::parse(bytes, 0).ok()?;
     let endian = header.endian().ok()?;
     let mut commands = header.load_commands(endian, bytes, 0).ok()?;
@@ -475,7 +474,6 @@ fn parse_macho_function_starts<Mach: MachHeader>(
     }
     None
 }
-
 
 fn extract_preferred_macho_thin_slice(bytes: &[u8]) -> Option<Vec<u8>> {
     if bytes.len() < 8 {
@@ -601,11 +599,11 @@ fn identify_path(
                 });
                 child_count += 1;
             }
-            if child_count >= max_children {
-                if let Some(object) = objects.iter_mut().find(|object| object.id == id) {
-                    object.flags.push("children_truncated".to_string());
-                    object.metadata["max_children"] = serde_json::json!(max_children);
-                }
+            if child_count >= max_children
+                && let Some(object) = objects.iter_mut().find(|object| object.id == id)
+            {
+                object.flags.push("children_truncated".to_string());
+                object.metadata["max_children"] = serde_json::json!(max_children);
             }
         }
         return Ok(id);
@@ -815,6 +813,7 @@ fn expand_zip_container(
 }
 
 #[cfg(feature = "containers")]
+#[allow(clippy::too_many_arguments)]
 fn analyze_tar_container(
     parent_id: &str,
     container_format: &str,
@@ -861,6 +860,7 @@ enum CompressedFormat {
     Zstd,
 }
 
+#[cfg(feature = "containers")]
 impl CompressedFormat {
     fn format(self) -> &'static str {
         match self {
@@ -891,6 +891,7 @@ impl CompressedFormat {
 }
 
 #[cfg(feature = "containers")]
+#[allow(clippy::too_many_arguments)]
 fn analyze_compressed_container(
     parent_id: &str,
     parent_display_name: &str,
@@ -1063,6 +1064,7 @@ fn expand_ico_container(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn analyze_riff_container(
     parent_id: &str,
     container_format: &str,
@@ -1101,6 +1103,7 @@ fn analyze_riff_container(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn expand_riff_container(
     parent_id: &str,
     container_format: &str,
@@ -1377,6 +1380,7 @@ fn expand_ole_container(
 }
 
 #[cfg(feature = "containers")]
+#[allow(clippy::too_many_arguments)]
 fn expand_compressed_container(
     parent_id: &str,
     parent_display_name: &str,
@@ -1450,6 +1454,7 @@ fn expand_compressed_container(
 }
 
 #[cfg(feature = "containers")]
+#[allow(clippy::too_many_arguments)]
 fn expand_tar_container(
     parent_id: &str,
     container_format: &str,
@@ -1573,6 +1578,7 @@ fn expand_tar_container(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn identify_virtual_file(
     container_id: &str,
     container_format: &str,
@@ -1641,6 +1647,7 @@ fn identify_virtual_file(
     id
 }
 
+#[allow(clippy::too_many_arguments)]
 fn analyze_container_by_format(
     object_id: &str,
     object_display_name: &str,
@@ -1733,6 +1740,7 @@ fn is_container_candidate(kind: ObjectKind, format: &str) -> bool {
         || is_ole_like_format(format)
 }
 
+#[cfg(feature = "containers")]
 fn is_zip_like_format(format: &str) -> bool {
     matches!(
         format,
@@ -1752,6 +1760,7 @@ fn is_ole_like_format(format: &str) -> bool {
     matches!(format, "ole" | "doc" | "xls" | "ppt" | "msi" | "msg")
 }
 
+#[cfg(feature = "containers")]
 fn compressed_format(format: &str) -> Option<CompressedFormat> {
     match format {
         "gzip" => Some(CompressedFormat::Gzip),
@@ -1805,6 +1814,7 @@ fn decompress_by_format(bytes: &[u8], compressed_format: CompressedFormat) -> Re
     Ok(decompressed)
 }
 
+#[cfg(feature = "containers")]
 fn compressed_payload_name(container_name: &str, compressed_format: CompressedFormat) -> String {
     let suffixes = match compressed_format {
         CompressedFormat::Gzip => &[".gz"][..],
@@ -1815,6 +1825,7 @@ fn compressed_payload_name(container_name: &str, compressed_format: CompressedFo
     strip_compression_suffix(container_name, suffixes).unwrap_or_else(|| "payload".to_string())
 }
 
+#[cfg(feature = "containers")]
 fn strip_compression_suffix(container_name: &str, suffixes: &[&str]) -> Option<String> {
     let name = container_name
         .rsplit_once("!/")
@@ -1901,8 +1912,26 @@ fn analyze_object(
     if matches!(
         format,
         Some(
-            "cab" | "flac" | "ogg" | "mp3" | "mp4" | "m4a" | "m4v" | "mov" | "heif" | "avif"
-                | "tiff" | "woff" | "woff2" | "ttf" | "otf" | "ar" | "qcow2" | "iso" | "dmg" | "pem"
+            "cab"
+                | "flac"
+                | "ogg"
+                | "mp3"
+                | "mp4"
+                | "m4a"
+                | "m4v"
+                | "mov"
+                | "heif"
+                | "avif"
+                | "tiff"
+                | "woff"
+                | "woff2"
+                | "ttf"
+                | "otf"
+                | "ar"
+                | "qcow2"
+                | "iso"
+                | "dmg"
+                | "pem"
         )
     ) {
         analyses.push(analyze_generic_format_header(object_id, format, bytes));
@@ -1915,7 +1944,6 @@ fn analyze_object(
     }
     analyses
 }
-
 
 fn analyze_generic_format_header(
     object_id: &str,
@@ -1963,10 +1991,10 @@ fn analyze_generic_format_header(
         "mp4" | "m4a" | "m4v" | "mov" | "heif" | "avif" => {
             details["ftyp"] = serde_json::json!(is_mp4_family_like(bytes));
             details["major_brand"] = serde_json::json!(mp4_major_brand(bytes));
-            if bytes.len() >= 4 {
-                if let Ok(size) = <[u8; 4]>::try_from(&bytes[0..4]) {
-                    details["box_size"] = serde_json::json!(u32::from_be_bytes(size));
-                }
+            if bytes.len() >= 4
+                && let Ok(size) = <[u8; 4]>::try_from(&bytes[0..4])
+            {
+                details["box_size"] = serde_json::json!(u32::from_be_bytes(size));
             }
         }
         "tiff" => {
@@ -2022,7 +2050,8 @@ fn analyze_generic_format_header(
         "html" | "xml" | "json" => {
             let preview = String::from_utf8_lossy(&bytes[..bytes.len().min(240)]).to_string();
             details["preview"] = serde_json::json!(preview);
-            details["line_count"] = serde_json::json!(String::from_utf8_lossy(bytes).lines().count());
+            details["line_count"] =
+                serde_json::json!(String::from_utf8_lossy(bytes).lines().count());
         }
         _ => {}
     }
@@ -3639,7 +3668,11 @@ fn detect_signature(path: &Path, bytes: &[u8]) -> Signature {
         return signature(ObjectKind::Binary, "wasm", "application/wasm");
     }
     if bytes.starts_with(b"MSCF") {
-        return signature(ObjectKind::Archive, "cab", "application/vnd.ms-cab-compressed");
+        return signature(
+            ObjectKind::Archive,
+            "cab",
+            "application/vnd.ms-cab-compressed",
+        );
     }
     if is_tiff_like(bytes) {
         return signature(ObjectKind::Image, "tiff", "image/tiff");
@@ -3681,13 +3714,25 @@ fn detect_signature(path: &Path, bytes: &[u8]) -> Signature {
         return signature(ObjectKind::Archive, "ar", "application/x-archive");
     }
     if is_qcow2_like(bytes) {
-        return signature(ObjectKind::FilesystemImage, "qcow2", "application/x-qemu-disk");
+        return signature(
+            ObjectKind::FilesystemImage,
+            "qcow2",
+            "application/x-qemu-disk",
+        );
     }
     if is_iso9660_like(bytes) {
-        return signature(ObjectKind::FilesystemImage, "iso", "application/x-iso9660-image");
+        return signature(
+            ObjectKind::FilesystemImage,
+            "iso",
+            "application/x-iso9660-image",
+        );
     }
     if is_dmg_like(bytes) {
-        return signature(ObjectKind::FilesystemImage, "dmg", "application/x-apple-diskimage");
+        return signature(
+            ObjectKind::FilesystemImage,
+            "dmg",
+            "application/x-apple-diskimage",
+        );
     }
     if looks_like_pem(bytes) {
         return signature(ObjectKind::Text, "pem", "application/x-pem-file");
@@ -3737,7 +3782,11 @@ fn detect_signature(path: &Path, bytes: &[u8]) -> Signature {
         Some("woff2") => signature(ObjectKind::File, "woff2", "font/woff2"),
         Some("ttf") => signature(ObjectKind::File, "ttf", "font/ttf"),
         Some("otf") => signature(ObjectKind::File, "otf", "font/otf"),
-        Some("cab") => signature(ObjectKind::Archive, "cab", "application/vnd.ms-cab-compressed"),
+        Some("cab") => signature(
+            ObjectKind::Archive,
+            "cab",
+            "application/vnd.ms-cab-compressed",
+        ),
         Some("a" | "ar" | "deb" | "lib") => {
             signature(ObjectKind::Archive, "ar", "application/x-archive")
         }
@@ -3757,7 +3806,10 @@ fn detect_signature(path: &Path, bytes: &[u8]) -> Signature {
             signature(ObjectKind::Text, "pem", "application/x-pem-file")
         }
         Some("html" | "htm") => signature(ObjectKind::Text, "html", "text/html"),
-        Some("json" | "xml" | "txt" | "md" | "csv" | "toml" | "yaml" | "yml" | "ini" | "properties" | "plist") => {
+        Some(
+            "json" | "xml" | "txt" | "md" | "csv" | "toml" | "yaml" | "yml" | "ini" | "properties"
+            | "plist",
+        ) => {
             let format = ext.as_deref().unwrap();
             let media = match format {
                 "json" => "application/json",
@@ -3907,7 +3959,7 @@ fn parse_pytorch_header(bytes: &[u8]) -> Option<(&'static str, usize, bool)> {
     }
     #[cfg(feature = "containers")]
     {
-        return parse_pytorch_zip_header(bytes);
+        parse_pytorch_zip_header(bytes)
     }
     #[cfg(not(feature = "containers"))]
     {
@@ -3980,11 +4032,15 @@ fn has_any_prefix(bytes: &[u8], prefixes: &[&[u8]]) -> bool {
     prefixes.iter().any(|prefix| bytes.starts_with(prefix))
 }
 
-
 fn is_tiff_like(bytes: &[u8]) -> bool {
     matches!(
         bytes.get(0..4),
-        Some([0x49, 0x49, 0x2a, 0x00] | [0x4d, 0x4d, 0x00, 0x2a] | [0x49, 0x49, 0x2b, 0x00] | [0x4d, 0x4d, 0x00, 0x2b])
+        Some(
+            [0x49, 0x49, 0x2a, 0x00]
+                | [0x4d, 0x4d, 0x00, 0x2a]
+                | [0x49, 0x49, 0x2b, 0x00]
+                | [0x4d, 0x4d, 0x00, 0x2b]
+        )
     )
 }
 
@@ -4078,7 +4134,11 @@ fn looks_like_xml(bytes: &[u8]) -> bool {
     trimmed.starts_with("<?xml")
         || (trimmed.starts_with('<')
             && trimmed.contains('>')
-            && !trimmed.as_bytes().iter().take(256).any(|b| b.is_ascii_control() && !matches!(b, b'\n' | b'\r' | b'\t')))
+            && !trimmed
+                .as_bytes()
+                .iter()
+                .take(256)
+                .any(|b| b.is_ascii_control() && !matches!(b, b'\n' | b'\r' | b'\t')))
 }
 
 fn looks_like_json(bytes: &[u8]) -> bool {
@@ -4155,9 +4215,10 @@ fn import_debug_info(
     #[cfg(feature = "debug-info")]
     {
         match (format, architecture) {
-            (BinaryFormat::Elf | BinaryFormat::MachO, Architecture::X86_64 | Architecture::Arm64) => {
-                dwarf_import(path, bytes, file)
-            }
+            (
+                BinaryFormat::Elf | BinaryFormat::MachO,
+                Architecture::X86_64 | Architecture::Arm64,
+            ) => dwarf_import(path, bytes, file),
             (BinaryFormat::Pe, Architecture::X86_64) => pdb_import(path, file),
             _ => DebugImportSummary::default(),
         }
@@ -4511,11 +4572,7 @@ fn file_imports(
     imports
 }
 
-fn assign_macho_stub_addresses(
-    file: &object::File<'_>,
-    bytes: &[u8],
-    imports: &mut [Import],
-) {
+fn assign_macho_stub_addresses(file: &object::File<'_>, bytes: &[u8], imports: &mut [Import]) {
     let stubs = macho_stub_import_addrs(file, bytes);
     if stubs.is_empty() {
         return;
@@ -4529,16 +4586,12 @@ fn assign_macho_stub_addresses(
             continue;
         }
         let bare = import.name.trim_start_matches('_');
-        for name in [
-            import.name.clone(),
-            bare.to_string(),
-            format!("_{bare}"),
-        ] {
-            if let Some(queue) = by_name.get_mut(&name) {
-                if let Some(address) = queue.pop_front() {
-                    import.address = Some(address);
-                    break;
-                }
+        for name in [import.name.clone(), bare.to_string(), format!("_{bare}")] {
+            if let Some(queue) = by_name.get_mut(&name)
+                && let Some(address) = queue.pop_front()
+            {
+                import.address = Some(address);
+                break;
             }
         }
     }
@@ -4728,10 +4781,14 @@ fn macho_symtab_and_indirect(bytes: &[u8]) -> Option<(usize, usize, usize, usize
             break;
         }
         if cmd == 0x2 && cmdsize >= 24 {
-            symoff = Some(u32::from_le_bytes(bytes[cursor + 8..cursor + 12].try_into().ok()?) as usize);
-            nsyms = Some(u32::from_le_bytes(bytes[cursor + 12..cursor + 16].try_into().ok()?) as usize);
-            stroff = Some(u32::from_le_bytes(bytes[cursor + 16..cursor + 20].try_into().ok()?) as usize);
-            strsize = Some(u32::from_le_bytes(bytes[cursor + 20..cursor + 24].try_into().ok()?) as usize);
+            symoff =
+                Some(u32::from_le_bytes(bytes[cursor + 8..cursor + 12].try_into().ok()?) as usize);
+            nsyms =
+                Some(u32::from_le_bytes(bytes[cursor + 12..cursor + 16].try_into().ok()?) as usize);
+            stroff =
+                Some(u32::from_le_bytes(bytes[cursor + 16..cursor + 20].try_into().ok()?) as usize);
+            strsize =
+                Some(u32::from_le_bytes(bytes[cursor + 20..cursor + 24].try_into().ok()?) as usize);
         } else if cmd == 0xb && cmdsize >= 80 {
             indirectoff =
                 Some(u32::from_le_bytes(bytes[cursor + 56..cursor + 60].try_into().ok()?) as usize);
@@ -4982,7 +5039,6 @@ fn file_debug_artifacts(
     artifacts
 }
 
-
 fn hash_bytes_sample(bytes: &[u8]) -> String {
     let mut hasher = blake3::Hasher::new();
     hasher.update(&(bytes.len() as u64).to_le_bytes());
@@ -5176,6 +5232,7 @@ fn extract_strings(file: &object::File<'_>) -> Vec<StringLiteral> {
     dedupe_strings(out)
 }
 
+#[allow(clippy::collapsible_match)]
 fn extract_ascii_strings(base_address: u64, bytes: &[u8]) -> Vec<StringLiteral> {
     let mut out = Vec::new();
     let mut start = None;
@@ -5386,7 +5443,9 @@ mod tests {
 
     #[test]
     fn macho_entry_and_function_starts_from_bin_ls_slice() {
-        let path = Path::new("/tmp/revx-os-re/.revx/artifacts/88f0478b4887f5baaa38d36c766ce1d80aa265c02f82a13ae7c5f4291f0f9bb8");
+        let path = Path::new(
+            "/tmp/revx-os-re/.revx/artifacts/88f0478b4887f5baaa38d36c766ce1d80aa265c02f82a13ae7c5f4291f0f9bb8",
+        );
         if !path.exists() {
             return;
         }

@@ -1,14 +1,14 @@
-use yaxpeax_arm::armv8::a64::{Instruction, Operand, Opcode, SizeCode};
+use yaxpeax_arm::armv8::a64::{Instruction, Opcode, Operand, SizeCode};
 
 const XREGS: [&str; 31] = [
-    "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13",
-    "x14", "x15", "x16", "x17", "x18", "x19", "x20", "x21", "x22", "x23", "x24", "x25", "x26",
-    "x27", "x28", "x29", "x30",
+    "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13", "x14",
+    "x15", "x16", "x17", "x18", "x19", "x20", "x21", "x22", "x23", "x24", "x25", "x26", "x27",
+    "x28", "x29", "x30",
 ];
 const WREGS: [&str; 31] = [
-    "w0", "w1", "w2", "w3", "w4", "w5", "w6", "w7", "w8", "w9", "w10", "w11", "w12", "w13",
-    "w14", "w15", "w16", "w17", "w18", "w19", "w20", "w21", "w22", "w23", "w24", "w25", "w26",
-    "w27", "w28", "w29", "w30",
+    "w0", "w1", "w2", "w3", "w4", "w5", "w6", "w7", "w8", "w9", "w10", "w11", "w12", "w13", "w14",
+    "w15", "w16", "w17", "w18", "w19", "w20", "w21", "w22", "w23", "w24", "w25", "w26", "w27",
+    "w28", "w29", "w30",
 ];
 
 #[inline]
@@ -73,7 +73,6 @@ fn push_uimm_hex(out: &mut String, imm: u64) {
     out.push_str("0x");
     push_hex_digits(out, imm);
 }
-
 
 #[inline]
 fn shift_style_name(style: yaxpeax_arm::armv8::a64::ShiftStyle) -> &'static str {
@@ -162,8 +161,8 @@ fn push_operand(out: &mut String, op: &Operand) -> bool {
             push_reg_sp(out, SizeCode::X, reg);
             out.push_str(", ");
             push_reg(out, index_size, index_reg);
-            let show_shift = amount != 0
-                || !matches!(extend, yaxpeax_arm::armv8::a64::ShiftStyle::LSL);
+            let show_shift =
+                amount != 0 || !matches!(extend, yaxpeax_arm::armv8::a64::ShiftStyle::LSL);
             if show_shift {
                 out.push_str(", ");
                 out.push_str(shift_style_name(extend));
@@ -208,8 +207,8 @@ fn push_operand(out: &mut String, op: &Operand) -> bool {
         }
         Operand::ConditionCode(cond) => {
             const CONDS: [&str; 16] = [
-                "eq", "ne", "hs", "lo", "mi", "pl", "vs", "vc", "hi", "ls", "ge", "lt", "gt",
-                "le", "al", "nv",
+                "eq", "ne", "hs", "lo", "mi", "pl", "vs", "vc", "hi", "ls", "ge", "lt", "gt", "le",
+                "al", "nv",
             ];
             out.push_str(CONDS[(cond as usize) & 15]);
             true
@@ -297,16 +296,17 @@ pub fn format_inst_fast(inst: &Instruction, out: &mut String) -> bool {
                 if let Operand::Immediate(0) = ops[2] {
                     return push_op2(out, "mov", &ops[0], &ops[1]);
                 }
-                if let Operand::RegShift(style, amt, size, r) = ops[2] {
-                    if matches!(style, yaxpeax_arm::armv8::a64::ShiftStyle::LSL) && amt == 0 {
-                        out.push_str("mov ");
-                        if !push_operand(out, &ops[0]) {
-                            return false;
-                        }
-                        out.push_str(", ");
-                        push_reg(out, size, r);
-                        return true;
+                if let Operand::RegShift(style, amt, size, r) = ops[2]
+                    && matches!(style, yaxpeax_arm::armv8::a64::ShiftStyle::LSL)
+                    && amt == 0
+                {
+                    out.push_str("mov ");
+                    if !push_operand(out, &ops[0]) {
+                        return false;
                     }
+                    out.push_str(", ");
+                    push_reg(out, size, r);
+                    return true;
                 }
                 return push_op2(out, "mov", &ops[0], &ops[2]);
             }
@@ -316,23 +316,17 @@ pub fn format_inst_fast(inst: &Instruction, out: &mut String) -> bool {
             push_op3(out, "orr", &ops[0], &ops[1], &ops[2])
         }
         Opcode::ADD => {
-            if let Operand::Immediate(0) = ops[2] {
-                if matches!(ops[0], Operand::RegisterOrSP(_, 31))
-                    || matches!(ops[1], Operand::RegisterOrSP(_, 31))
-                {
-                    return push_op2(out, "mov", &ops[0], &ops[1]);
-                }
+            if let Operand::Immediate(0) = ops[2]
+                && (matches!(ops[0], Operand::RegisterOrSP(_, 31))
+                    || matches!(ops[1], Operand::RegisterOrSP(_, 31)))
+            {
+                return push_op2(out, "mov", &ops[0], &ops[1]);
             }
-            if let Operand::RegShift(style, amt, size, reg) = ops[2] {
-                if matches!(style, yaxpeax_arm::armv8::a64::ShiftStyle::LSL) && amt == 0 {
-                    return push_op3(
-                        out,
-                        "add",
-                        &ops[0],
-                        &ops[1],
-                        &Operand::Register(size, reg),
-                    );
-                }
+            if let Operand::RegShift(style, amt, size, reg) = ops[2]
+                && matches!(style, yaxpeax_arm::armv8::a64::ShiftStyle::LSL)
+                && amt == 0
+            {
+                return push_op3(out, "add", &ops[0], &ops[1], &Operand::Register(size, reg));
             }
             push_op3(out, "add", &ops[0], &ops[1], &ops[2])
         }
@@ -421,8 +415,8 @@ pub fn format_inst_fast(inst: &Instruction, out: &mut String) -> bool {
         }
         Opcode::Bcc(cond) => {
             const CONDS: [&str; 16] = [
-                "eq", "ne", "hs", "lo", "mi", "pl", "vs", "vc", "hi", "ls", "ge", "lt", "gt",
-                "le", "al", "nv",
+                "eq", "ne", "hs", "lo", "mi", "pl", "vs", "vc", "hi", "ls", "ge", "lt", "gt", "le",
+                "al", "nv",
             ];
             out.push('b');
             out.push('.');
@@ -606,19 +600,19 @@ pub fn format_inst_fast(inst: &Instruction, out: &mut String) -> bool {
             push_op3(out, "sbcs", &ops[0], &ops[1], &ops[2])
         }
         Opcode::CSNEG => {
-            if ops[1] == ops[2] {
-                if let Operand::ConditionCode(cond) = ops[3] {
-                    out.push_str("cneg ");
-                    if !push_operand(out, &ops[0]) {
-                        return false;
-                    }
-                    out.push_str(", ");
-                    if !push_operand(out, &ops[1]) {
-                        return false;
-                    }
-                    out.push_str(", ");
-                    return push_operand(out, &Operand::ConditionCode(cond ^ 1));
+            if ops[1] == ops[2]
+                && let Operand::ConditionCode(cond) = ops[3]
+            {
+                out.push_str("cneg ");
+                if !push_operand(out, &ops[0]) {
+                    return false;
                 }
+                out.push_str(", ");
+                if !push_operand(out, &ops[1]) {
+                    return false;
+                }
+                out.push_str(", ");
+                return push_operand(out, &Operand::ConditionCode(cond ^ 1));
             }
             out.push_str("csneg ");
             if !push_operand(out, &ops[0]) {
@@ -636,8 +630,11 @@ pub fn format_inst_fast(inst: &Instruction, out: &mut String) -> bool {
             push_operand(out, &ops[3])
         }
         Opcode::CSINV => {
-            if let (Operand::Register(_, 31), Operand::Register(_, 31), Operand::ConditionCode(cond)) =
-                (ops[1], ops[2], ops[3])
+            if let (
+                Operand::Register(_, 31),
+                Operand::Register(_, 31),
+                Operand::ConditionCode(cond),
+            ) = (ops[1], ops[2], ops[3])
             {
                 out.push_str("csetm ");
                 if !push_operand(out, &ops[0]) {
@@ -646,19 +643,19 @@ pub fn format_inst_fast(inst: &Instruction, out: &mut String) -> bool {
                 out.push_str(", ");
                 return push_operand(out, &Operand::ConditionCode(cond ^ 1));
             }
-            if ops[1] == ops[2] {
-                if let Operand::ConditionCode(cond) = ops[3] {
-                    out.push_str("cinv ");
-                    if !push_operand(out, &ops[0]) {
-                        return false;
-                    }
-                    out.push_str(", ");
-                    if !push_operand(out, &ops[1]) {
-                        return false;
-                    }
-                    out.push_str(", ");
-                    return push_operand(out, &Operand::ConditionCode(cond ^ 1));
+            if ops[1] == ops[2]
+                && let Operand::ConditionCode(cond) = ops[3]
+            {
+                out.push_str("cinv ");
+                if !push_operand(out, &ops[0]) {
+                    return false;
                 }
+                out.push_str(", ");
+                if !push_operand(out, &ops[1]) {
+                    return false;
+                }
+                out.push_str(", ");
+                return push_operand(out, &Operand::ConditionCode(cond ^ 1));
             }
             out.push_str("csinv ");
             if !push_operand(out, &ops[0]) {
@@ -858,10 +855,9 @@ fn format_sbfm(out: &mut String, ops: &[Operand; 4]) -> bool {
         Operand::Immediate(_immr),
         Operand::Immediate(imms),
     ) = (ops[0], ops[1], ops[2], ops[3])
+        && ((imms == 63 && size == SizeCode::X) || (imms == 31 && size == SizeCode::W))
     {
-        if (imms == 63 && size == SizeCode::X) || (imms == 31 && size == SizeCode::W) {
-            return push_op3(out, "asr", &ops[0], &ops[1], &ops[2]);
-        }
+        return push_op3(out, "asr", &ops[0], &ops[1], &ops[2]);
     }
     if let (
         Operand::Register(_, _),

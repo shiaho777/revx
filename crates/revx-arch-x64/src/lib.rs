@@ -194,10 +194,8 @@ fn is_indirect_jmp(inst: &IcedInstruction) -> bool {
 /// Extract RIP-relative memory target address if the instruction uses RIP-relative addressing.
 fn rip_relative_target(inst: &IcedInstruction) -> Option<u64> {
     for op_idx in 0..inst.op_count() {
-        if inst.op_kind(op_idx) == OpKind::Memory {
-            if inst.memory_base() == iced_x86::Register::RIP {
-                return Some(inst.memory_displacement64());
-            }
+        if inst.op_kind(op_idx) == OpKind::Memory && inst.memory_base() == iced_x86::Register::RIP {
+            return Some(inst.memory_displacement64());
         }
     }
     None
@@ -208,9 +206,8 @@ fn dedupe_references(mut references: Vec<Reference>) -> Vec<Reference> {
         return references;
     }
     if references.len() <= 16 {
-        references.sort_unstable_by_key(|reference| {
-            (reference.from, reference.to, reference.kind as u8)
-        });
+        references
+            .sort_unstable_by_key(|reference| (reference.from, reference.to, reference.kind as u8));
         references.dedup_by(|a, b| a.from == b.from && a.to == b.to && a.kind == b.kind);
         return references;
     }

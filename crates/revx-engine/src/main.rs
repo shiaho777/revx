@@ -1,19 +1,21 @@
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use revx_core::{
-    AnalysisProfile, ArtifactListRequest, ArtifactReadRequest, BinarySurveyRequest,
-    CapabilityRequest, DecompileCacheStatusRequest, DecompileFunctionRequest, DecompileStrategy, DisassembleFunctionRequest,
-    EvidenceGraphRequest, EvidencePackRequest, FunctionProfileRequest,
-    FunctionSearchRequest, InvestigationRunRequest, ObjectAnalyzeBinaryRequest,
-    ObjectAnalyzeRequest, ObjectAnalyzerKind, ObjectCarveIdentifyRequest,
-    ObjectCarveSignaturesRequest, ObjectContentSearchMode, ObjectContentSearchRequest,
-    ObjectExtractRangeRequest, ObjectKind, ObjectMaterializeRequest, ObjectPipelineRequest,
-    ObjectPluginListRequest, ObjectPluginRunRequest, ObjectProfileRequest,
+    AnalysisBriefRequest, AnalysisProfile, ArtifactListRequest, ArtifactReadRequest,
+    BinarySurveyRequest, CapabilityRequest, DecompileCacheStatusRequest, DecompileFunctionRequest,
+    DecompileStrategy, DisassembleFunctionRequest, EvidenceGraphRequest, EvidencePackRequest,
+    FunctionProfileRequest, FunctionSearchRequest, InvestigationRunRequest,
+    ObjectAnalyzeBinaryRequest, ObjectAnalyzeRequest, ObjectAnalyzerKind,
+    ObjectCarveIdentifyRequest, ObjectCarveSignaturesRequest, ObjectContentSearchMode,
+    ObjectContentSearchRequest, ObjectExtractRangeRequest, ObjectKind, ObjectMaterializeRequest,
+    ObjectPipelineRequest, ObjectPluginListRequest, ObjectPluginRunRequest, ObjectProfileRequest,
     ObjectRegisterBinaryRequest, ObjectSearchRequest, ObjectSignatureScanRequest,
-    AnalysisBriefRequest, ProjectStatusRequest, ReportGenerateRequest, SearchBytesRequest, StringSearchRequest,
+    ProjectStatusRequest, ReportGenerateRequest, SearchBytesRequest, StringSearchRequest,
     SymbolicSolveRequest, TraceImportRequest, XrefsQueryRequest,
 };
-use revx_daemon::{CapabilityService, send_ipc_request, serve_ipc, serve_mcp_http, serve_mcp_stdio, socket_path};
+use revx_daemon::{
+    CapabilityService, send_ipc_request, serve_ipc, serve_mcp_http, serve_mcp_stdio, socket_path,
+};
 use revx_loader::load_binary;
 use revx_workspace::Workspace;
 use std::fs;
@@ -489,8 +491,16 @@ impl From<SearchModeValue> for ObjectContentSearchMode {
 
 #[derive(Subcommand)]
 enum SearchCommands {
-    Text { pattern: String, #[arg(long, default_value_t = 200)] limit: usize, #[arg(long, default_value_t = 0)] offset: usize },
-    Bytes { pattern: String },
+    Text {
+        pattern: String,
+        #[arg(long, default_value_t = 200)]
+        limit: usize,
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
+    },
+    Bytes {
+        pattern: String,
+    },
     Objects(ObjectContentSearchArgs),
 }
 
@@ -688,7 +698,11 @@ async fn main() -> Result<()> {
         Command::Disasm { query } => cmd_disasm(&query).await,
         Command::Xrefs { target } => cmd_xrefs(&target).await,
         Command::Strings(args) => cmd_strings(&args).await,
-        Command::Search(SearchCommands::Text { pattern, limit, offset }) => cmd_search_text(&pattern, limit, offset).await,
+        Command::Search(SearchCommands::Text {
+            pattern,
+            limit,
+            offset,
+        }) => cmd_search_text(&pattern, limit, offset).await,
         Command::Search(SearchCommands::Bytes { pattern }) => cmd_search_bytes(&pattern).await,
         Command::Search(SearchCommands::Objects(args)) => cmd_search_objects(&args).await,
         Command::Artifact(ArtifactCommands::Read(args)) => cmd_artifact_read(&args).await,
@@ -749,7 +763,6 @@ fn cmd_add(path: &Path) -> Result<()> {
     println!("{}", serde_json::to_string_pretty(&survey)?);
     Ok(())
 }
-
 
 fn cmd_analyze_micro(path: &std::path::Path) -> Result<()> {
     let micro = std::env::current_exe()
@@ -1018,13 +1031,14 @@ async fn cmd_decompile(
     strategy: Option<DecompileStrategy>,
     force_refresh: bool,
 ) -> Result<()> {
-    let response =
-        dispatch_from_cwd(CapabilityRequest::DecompileFunction(DecompileFunctionRequest {
+    let response = dispatch_from_cwd(CapabilityRequest::DecompileFunction(
+        DecompileFunctionRequest {
             query: query.to_string(),
             strategy,
             force_refresh: Some(force_refresh),
-        }))
-        .await?;
+        },
+    ))
+    .await?;
     println!("{}", serde_json::to_string_pretty(&response)?);
     Ok(())
 }
@@ -1041,11 +1055,12 @@ async fn cmd_decompile_cache(query: &str) -> Result<()> {
 }
 
 async fn cmd_disasm(query: &str) -> Result<()> {
-    let response =
-        dispatch_from_cwd(CapabilityRequest::DisassembleFunction(DisassembleFunctionRequest {
+    let response = dispatch_from_cwd(CapabilityRequest::DisassembleFunction(
+        DisassembleFunctionRequest {
             query: query.to_string(),
-        }))
-        .await?;
+        },
+    ))
+    .await?;
     println!("{}", serde_json::to_string_pretty(&response)?);
     Ok(())
 }
@@ -1278,7 +1293,11 @@ async fn cmd_mcp_http(
     let addr: std::net::SocketAddr = bind
         .parse()
         .with_context(|| format!("invalid --bind {bind}"))?;
-    let token = token.or_else(|| std::env::var("REVX_MCP_TOKEN").ok().filter(|s| !s.is_empty()));
+    let token = token.or_else(|| {
+        std::env::var("REVX_MCP_TOKEN")
+            .ok()
+            .filter(|s| !s.is_empty())
+    });
     serve_mcp_http(project, addr, token).await
 }
 
@@ -1321,11 +1340,7 @@ fn cmd_mcp_doctor(workspace: Option<PathBuf>) -> Result<()> {
     Ok(())
 }
 
-fn cmd_mcp_config(
-    host: McpHost,
-    workspace: Option<PathBuf>,
-    bin: Option<PathBuf>,
-) -> Result<()> {
+fn cmd_mcp_config(host: McpHost, workspace: Option<PathBuf>, bin: Option<PathBuf>) -> Result<()> {
     let engine = resolve_engine_bin(bin)?;
     let project = match workspace {
         Some(path) => canonicalize_path(&path)?,
@@ -1376,9 +1391,8 @@ fn cmd_mcp_install(
         fs::set_permissions(&engine_dst, perms)?;
     }
 
-    let project = resolve_mcp_project_root(workspace, init_workspace).unwrap_or_else(|_| {
-        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
-    });
+    let project = resolve_mcp_project_root(workspace, init_workspace)
+        .unwrap_or_else(|_| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
     if init_workspace && !project.join(".revx").exists() {
         let _ = resolve_mcp_project_root(Some(project.clone()), true)?;
     }
@@ -1415,8 +1429,16 @@ fn cmd_mcp_install(
         }
     }
 
-    println!("serve: {} mcp serve --workspace {}", engine_dst.display(), project.display());
-    println!("doctor: {} mcp doctor --workspace {}", engine_dst.display(), project.display());
+    println!(
+        "serve: {} mcp serve --workspace {}",
+        engine_dst.display(),
+        project.display()
+    );
+    println!(
+        "doctor: {} mcp doctor --workspace {}",
+        engine_dst.display(),
+        project.display()
+    );
     Ok(())
 }
 
@@ -1510,7 +1532,8 @@ fn resolve_mcp_project_root(workspace: Option<PathBuf>, init: bool) -> Result<Pa
 }
 
 fn render_mcp_host_config(host: McpHost, engine: &Path, workspace: &Path) -> String {
-    let url = std::env::var("REVX_MCP_URL").unwrap_or_else(|_| "http://127.0.0.1:9310/mcp".to_string());
+    let url =
+        std::env::var("REVX_MCP_URL").unwrap_or_else(|_| "http://127.0.0.1:9310/mcp".to_string());
     let engine_s = engine.display().to_string();
     let workspace_s = workspace.display().to_string();
     match host {

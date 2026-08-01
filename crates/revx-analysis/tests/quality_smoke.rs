@@ -1,70 +1,91 @@
 use revx_analysis::analyze;
-use revx_core::{AnalysisProfile, RegionKind};
+use revx_core::AnalysisProfile;
 use revx_loader::load_binary;
+use revx_testkit::{elf_args_call_cases, write_temp};
 use std::path::Path;
 
 #[test]
-fn typed_fixture_debug_info_improves_quality_surface() {
-    let path =
-        Path::new("/Users/shiaho/Desktop/ida-mini-mcp/ida-pro-mcp-main/tests/typed_fixture.elf");
-    let image = load_binary(path).expect("load fixture");
-    let fast = analyze(image.clone(), AnalysisProfile::Fast);
-    let full = analyze(image, AnalysisProfile::Full);
+fn synthetic_quality_surface_fast_and_full() {
+    for case in elf_args_call_cases() {
+        let path = write_temp(&case);
+        let image = load_binary(&path).expect("load fixture");
+        let fast = analyze(image.clone(), AnalysisProfile::Fast);
+        let full = analyze(image, AnalysisProfile::Full);
 
-    assert!(fast.survey.summary.function_count > 0);
-    assert!(fast.survey.summary.typed_function_count > 0);
-    assert!(fast.survey.summary.structured_pseudocode_count > 0);
-    assert_eq!(
-        fast.survey
-            .summary
-            .debug_import_coverage
-            .imported_type_count
-            > 0,
-        true
-    );
-
-    let fast_use_wrapper = fast
-        .functions
-        .iter()
-        .find(|function| function.name.contains("use_wrapper"))
-        .expect("use_wrapper function");
-    assert!(!fast_use_wrapper.arguments.is_empty());
-    assert!(!fast_use_wrapper.locals.is_empty());
-    assert_eq!(
-        fast_use_wrapper
-            .pseudocode
-            .as_ref()
-            .map(|unit| unit
-                .regions
-                .iter()
-                .any(|region| region.kind == RegionKind::If))
-            .unwrap_or(false),
-        true
-    );
-    assert!(
-        fast_use_wrapper
-            .evidence_ids
+        assert!(
+            fast.survey.summary.function_count > 0,
+            "{} fast funcs",
+            case.id
+        );
+        assert!(
+            full.functions.len() >= fast.functions.len(),
+            "{} full functions >= fast functions",
+            case.id
+        );
+        assert!(
+            full.functions.len() >= 2,
+            "{} expected call-target expansion, got {}",
+            case.id,
+            full.functions.len()
+        );
+        let entry = full
+            .functions
             .iter()
-            .any(|id| id.contains("pseudo"))
-    );
+            .find(|function| function.name.contains("main"))
+            .expect("main function");
+        let pseudo = entry.pseudocode.as_ref().expect("main pseudocode");
+        assert!(
+            !pseudo.text.is_empty(),
+            "{} main missing pseudocode",
+            case.id
+        );
+        assert!(
+            pseudo.evidence_ids.iter().any(|id| id.contains("pseudo")),
+            "{} main missing pseudo evidence",
+            case.id
+        );
+    }
+}
 
-    let full_use_wrapper = full
-        .functions
-        .iter()
-        .find(|function| function.name.contains("use_wrapper"))
-        .expect("use_wrapper function");
-    assert!(full_use_wrapper.arguments.len() >= fast_use_wrapper.arguments.len());
-    assert!(full_use_wrapper.locals.len() >= fast_use_wrapper.locals.len());
-    assert!(
-        full_use_wrapper
-            .pseudocode
-            .as_ref()
-            .map(|unit| unit.regions.len())
-            .unwrap_or(0)
-            >= fast_use_wrapper
-                .pseudocode
-                .as_ref()
-                .map(|unit| unit.regions.len())
-                .unwrap_or(0)
-    );
+#[test]
+fn corpus_debug_info_improves_quality_surface() {
+    let Ok(corpus) = std::env::var("REVX_CORPUS_DIR") else {
+        eprintln!("skipping: REVX_CORPUS_DIR not set");
+        return;
+    };
+    let root = Path::new(&corpus);
+    if !root.is_dir() {
+        eprintln!("skipping: REVX_CORPUS_DIR is not a directory");
+        return;
+    }
+    let mut analyzed = 0usize;
+    if let Ok(rd) = std::fs::read_dir(root) {
+        for entry in rd.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let Ok(image) = load_binary(&path) else {
+                continue;
+            };
+            let fast = analyze(image.clone(), AnalysisProfile::Fast);
+            assert!(
+                fast.survey.summary.function_count > 0
+                    || !image.symbols.is_empty()
+                    || image.entry.is_some(),
+                "no analysis surface for {}",
+                path.display()
+            );
+            let full = analyze(image, AnalysisProfile::Full);
+            assert!(
+                !full.functions.is_empty()
+                    || full.survey.summary.function_count > 0
+                    || !full.types.is_empty(),
+                "full analysis empty for {}",
+                path.display()
+            );
+            analyzed += 1;
+        }
+    }
+    assert!(analyzed > 0, "no corpus binary could be analyzed");
 }

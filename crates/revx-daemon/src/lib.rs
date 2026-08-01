@@ -2,24 +2,25 @@ use anyhow::{Context, Result};
 use revx_analysis::analyze_streaming;
 use revx_core::{
     AgentInteractionBrief, AgentNextAction, AnalysisBriefRequest, AnalysisBriefResponse,
-    AnalysisHotFunction, AnalysisImportHit, AnalysisRunRequest, AnalysisRunResponse, AnalysisStatusRequest,
-    AnalysisStringHit, BinaryListResponse,
+    AnalysisHotFunction, AnalysisImportHit, AnalysisProfile, AnalysisRunRequest,
+    AnalysisRunResponse, AnalysisStatusRequest, AnalysisStringHit, BinaryListResponse,
     BinarySurveyRequest, BinarySurveyResponse, CallgraphSliceRequest, CallgraphSliceResponse,
     CapabilityEnvelope, CapabilityError, CapabilityReply, CapabilityRequest, CapabilityResponse,
-    DecompileCacheEntry, DecompileCacheStatusRequest, DecompileCacheStatusResponse, DecompileFunctionRequest, DecompileFunctionResponse, DecompileStrategy, DisassembleFunctionRequest,
-    DisassembleFunctionResponse, Evidence, EvidenceGraphRequest, EvidencePackRequest,
-    EvidencePackResponse, EvidenceProvenance, FunctionProfileRequest, FunctionProfileResponse,
-    FunctionSearchHit, FunctionSearchRequest, FunctionSearchResponse, HypothesisCreateRequest,
-    HypothesisCreateResponse, HypothesisUpdateRequest, HypothesisUpdateResponse,
-    IbcAdvanceRequest, IbcAdvanceResponse, IbcStatusRequest, IbcStatusResponse,
-    AnalysisProfile, InvestigationRunRequest, InvestigationRunResponse, ObjectAnalysisStatus,
-    ObjectAnalysisSummary, ObjectAnalyzeBinaryRequest, ObjectAnalyzeBinaryResponse, ObjectAnalyzeRequest,
-    ObjectAnalyzeResponse, ObjectCarveIdentifyRequest, ObjectCarveIdentifyResponse,
-    ObjectCarveIdentifyResult, ObjectCarveSignaturesRequest, ObjectCarveSignaturesResponse,
-    ObjectExtractRangeRequest, ObjectExtractRangeResponse, ObjectIdentifyRequest,
-    ObjectIdentifyResponse, ObjectKind, ObjectMaterializeRequest, ObjectMaterializeResponse,
-    ObjectPipelineRequest, ObjectPipelineResponse, ObjectPipelineStage, ObjectPipelineStep,
-    ObjectPluginListRequest, ObjectPluginListResponse, ObjectPluginRunRequest,
+    DecompileCacheEntry, DecompileCacheStatusRequest, DecompileCacheStatusResponse,
+    DecompileFunctionRequest, DecompileFunctionResponse, DecompileStrategy,
+    DisassembleFunctionRequest, DisassembleFunctionResponse, Evidence, EvidenceGraphRequest,
+    EvidencePackRequest, EvidencePackResponse, EvidenceProvenance, FunctionProfileRequest,
+    FunctionProfileResponse, FunctionSearchHit, FunctionSearchRequest, FunctionSearchResponse,
+    HypothesisCreateRequest, HypothesisCreateResponse, HypothesisUpdateRequest,
+    HypothesisUpdateResponse, IbcAdvanceRequest, IbcAdvanceResponse, IbcStatusRequest,
+    IbcStatusResponse, InvestigationRunRequest, InvestigationRunResponse, ObjectAnalysisStatus,
+    ObjectAnalysisSummary, ObjectAnalyzeBinaryRequest, ObjectAnalyzeBinaryResponse,
+    ObjectAnalyzeRequest, ObjectAnalyzeResponse, ObjectCarveIdentifyRequest,
+    ObjectCarveIdentifyResponse, ObjectCarveIdentifyResult, ObjectCarveSignaturesRequest,
+    ObjectCarveSignaturesResponse, ObjectExtractRangeRequest, ObjectExtractRangeResponse,
+    ObjectIdentifyRequest, ObjectIdentifyResponse, ObjectKind, ObjectMaterializeRequest,
+    ObjectMaterializeResponse, ObjectPipelineRequest, ObjectPipelineResponse, ObjectPipelineStage,
+    ObjectPipelineStep, ObjectPluginListRequest, ObjectPluginListResponse, ObjectPluginRunRequest,
     ObjectPluginRunResponse, ObjectProfileRequest, ObjectProfileResponse,
     ObjectRegisterBinaryRequest, ObjectRegisterBinaryResponse, ObjectSearchRequest,
     ObjectSearchResponse, ObjectSignatureScanRequest, ObjectSignatureScanResponse,
@@ -90,12 +91,11 @@ impl CapabilityService {
         {
             return;
         }
-        if let Ok(Some(loaded)) = ws.read_cache_json::<revx_analysis::IbcContinuumLedger>(
-            IBC_CONTINUUM_LEDGER_CACHE,
-        ) {
-            if let Ok(mut guard) = self.ibc_ledger.lock() {
-                *guard = loaded;
-            }
+        if let Ok(Some(loaded)) =
+            ws.read_cache_json::<revx_analysis::IbcContinuumLedger>(IBC_CONTINUUM_LEDGER_CACHE)
+            && let Ok(mut guard) = self.ibc_ledger.lock()
+        {
+            *guard = loaded;
         }
         self.ibc_ledger_loaded
             .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -114,21 +114,21 @@ impl CapabilityService {
                 return t.to_string();
             }
         }
-        if let Ok(Some(id)) = ws.latest_binary_id() {
-            if !id.is_empty() {
-                return id;
-            }
+        if let Ok(Some(id)) = ws.latest_binary_id()
+            && !id.is_empty()
+        {
+            return id;
         }
-        if let Ok(cfg) = ws.project_config() {
-            if let Some(primary) = cfg.primary_binary {
-                if !primary.is_empty() {
-                    return primary;
-                }
-            }
+        if let Ok(cfg) = ws.project_config()
+            && let Some(primary) = cfg.primary_binary
+            && !primary.is_empty()
+        {
+            return primary;
         }
         "default".to_string()
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn sync_ibc_continuum(
         &self,
         ws: &Workspace,
@@ -200,6 +200,8 @@ impl CapabilityService {
         (out_lattice, note, witnesses, namespace)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::unnecessary_sort_by)]
     fn apply_continuum_to_brief(
         &self,
         ws: &Workspace,
@@ -274,7 +276,12 @@ impl CapabilityService {
                 1,
                 format!(
                     "orbit_hypotheses_bound: {}",
-                    hyp_ids.iter().take(6).cloned().collect::<Vec<_>>().join(",")
+                    hyp_ids
+                        .iter()
+                        .take(6)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(",")
                 ),
             );
             agent_brief.next_actions.push(AgentNextAction {
@@ -291,7 +298,12 @@ impl CapabilityService {
                 1,
                 format!(
                     "pcos_sealed_hypotheses: {}",
-                    sealed_ids.iter().take(6).cloned().collect::<Vec<_>>().join(",")
+                    sealed_ids
+                        .iter()
+                        .take(6)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(",")
                 ),
             );
             agent_brief.stop_conditions.insert(
@@ -302,80 +314,80 @@ impl CapabilityService {
                 ),
             );
         }
-        if let Ok(guard) = self.ibc_ledger.lock() {
-            if let Some(state) = guard.sessions.get(&namespace) {
-                for residual in state
-                    .cognitive_field
-                    .residuals
-                    .iter()
-                    .filter(|r| r.polarity != "sealed")
-                    .take(3)
-                {
-                    agent_brief.open_questions.push(residual.question.clone());
-                    agent_brief.next_actions.insert(
-                        0,
-                        AgentNextAction {
-                            tool: residual.probe_tool.clone(),
-                            reason: format!(
-                                "ODC residual [{}] iv={:.2}",
-                                residual.polarity, residual.information_value
-                            ),
-                            priority: 98,
-                            query: residual.probe_query.clone(),
-                            label: Some(format!("odc-{}", residual.id)),
-                            args: residual
-                                .probe_query
-                                .as_ref()
-                                .map(|q| serde_json::json!({ "query": q }))
-                                .unwrap_or_else(|| serde_json::json!({})),
-                        },
-                    );
-                }
-                if let Some(ev) = state.cognitive_field.collapse_events.iter().rev().next() {
-                    agent_brief.key_findings.insert(
-                        1,
-                        format!("odc_collapse: {}", ev.chars().take(140).collect::<String>()),
-                    );
-                }
-                for line in revx_analysis::format_proof_chain_lines(
-                    &state.cognitive_field.proof_chain,
-                )
+        if let Ok(guard) = self.ibc_ledger.lock()
+            && let Some(state) = guard.sessions.get(&namespace)
+        {
+            for residual in state
+                .cognitive_field
+                .residuals
+                .iter()
+                .filter(|r| r.polarity != "sealed")
+                .take(3)
+            {
+                agent_brief.open_questions.push(residual.question.clone());
+                agent_brief.next_actions.insert(
+                    0,
+                    AgentNextAction {
+                        tool: residual.probe_tool.clone(),
+                        reason: format!(
+                            "ODC residual [{}] iv={:.2}",
+                            residual.polarity, residual.information_value
+                        ),
+                        priority: 98,
+                        query: residual.probe_query.clone(),
+                        label: Some(format!("odc-{}", residual.id)),
+                        args: residual
+                            .probe_query
+                            .as_ref()
+                            .map(|q| serde_json::json!({ "query": q }))
+                            .unwrap_or_else(|| serde_json::json!({})),
+                    },
+                );
+            }
+            if let Some(ev) = state.cognitive_field.collapse_events.iter().next_back() {
+                agent_brief.key_findings.insert(
+                    1,
+                    format!("odc_collapse: {}", ev.chars().take(140).collect::<String>()),
+                );
+            }
+            for line in revx_analysis::format_proof_chain_lines(&state.cognitive_field.proof_chain)
                 .into_iter()
                 .take(4)
                 .rev()
-                {
-                    if !agent_brief.key_findings.iter().any(|k| k == &line) {
-                        agent_brief.key_findings.insert(1, line);
-                    }
+            {
+                if !agent_brief.key_findings.iter().any(|k| k == &line) {
+                    agent_brief.key_findings.insert(1, line);
                 }
-                let sealed = state
-                    .cognitive_field
-                    .proof_chain
-                    .iter()
-                    .filter(|l| l.verdict == "true" || l.verdict == "false")
-                    .count();
-                let open = state
-                    .cognitive_field
-                    .residuals
-                    .iter()
-                    .filter(|r| r.polarity != "sealed")
-                    .count();
-                if sealed > 0 && open == 0 {
-                    agent_brief.stop_conditions.insert(
+            }
+            let sealed = state
+                .cognitive_field
+                .proof_chain
+                .iter()
+                .filter(|l| l.verdict == "true" || l.verdict == "false")
+                .count();
+            let open = state
+                .cognitive_field
+                .residuals
+                .iter()
+                .filter(|r| r.polarity != "sealed")
+                .count();
+            if sealed > 0 && open == 0 {
+                agent_brief.stop_conditions.insert(
                         0,
                         format!(
                             "PCOS orbit set fully sealed ({sealed}); agent may conclude this continuum focus"
                         ),
                     );
-                }
-                agent_brief.next_actions.sort_by(|a, b| b.priority.cmp(&a.priority));
-                let mut seen = std::collections::BTreeSet::new();
-                agent_brief.next_actions.retain(|action| {
-                    let key = format!("{}:{}", action.tool, action.args);
-                    seen.insert(key)
-                });
-                agent_brief.next_actions.truncate(8);
             }
+            agent_brief
+                .next_actions
+                .sort_by(|a, b| b.priority.cmp(&a.priority));
+            let mut seen = std::collections::BTreeSet::new();
+            agent_brief.next_actions.retain(|action| {
+                let key = format!("{}:{}", action.tool, action.args);
+                seen.insert(key)
+            });
+            agent_brief.next_actions.truncate(8);
         }
         agent_brief.stop_conditions.insert(
             0,
@@ -386,12 +398,7 @@ impl CapabilityService {
         agent_brief.semantic_lattice = Some(synced);
     }
 
-
-    fn seal_orbit_hypotheses_from_collapses(
-        &self,
-        ws: &Workspace,
-        namespace: &str,
-    ) -> Vec<String> {
+    fn seal_orbit_hypotheses_from_collapses(&self, ws: &Workspace, namespace: &str) -> Vec<String> {
         self.ensure_ibc_ledger_loaded(ws);
         let (plan, epoch, proof_lines) = {
             let mut guard = match self.ibc_ledger.lock() {
@@ -408,7 +415,8 @@ impl CapabilityService {
             );
             let plan = revx_analysis::seal_plan_from_proof_chain(state);
             let epoch = state.epoch;
-            let proof_lines = revx_analysis::format_proof_chain_lines(&state.cognitive_field.proof_chain);
+            let proof_lines =
+                revx_analysis::format_proof_chain_lines(&state.cognitive_field.proof_chain);
             (plan, epoch, proof_lines)
         };
         if plan.is_empty() {
@@ -427,14 +435,15 @@ impl CapabilityService {
                 && existing.notes.contains(&format!("polarity={polarity}"))
             {
                 existing.notes.clone()
+            } else if existing.notes.is_empty() {
+                verdict_block
             } else {
-                if existing.notes.is_empty() {
-                    verdict_block
-                } else {
-                    format!("{}
+                format!(
+                    "{}
 
-{verdict_block}", existing.notes)
-                }
+            {verdict_block}",
+                    existing.notes
+                )
             };
             let mut evidence = existing.evidence_ids.clone();
             let evid = format!("casl:pcos:{namespace}:{orbit_key}:{polarity}:e{epoch}");
@@ -495,10 +504,7 @@ impl CapabilityService {
         bound_ids
     }
 
-    fn run_ibc_status(
-        &self,
-        request: IbcStatusRequest,
-    ) -> Result<IbcStatusResponse> {
+    fn run_ibc_status(&self, request: IbcStatusRequest) -> Result<IbcStatusResponse> {
         let ws = self.workspace()?;
         self.ensure_ibc_ledger_loaded(&ws);
         let namespace = self.continuum_namespace(&ws, request.namespace.as_deref());
@@ -553,28 +559,31 @@ impl CapabilityService {
         if !hyp_ids.is_empty() {
             key_findings.push(format!(
                 "orbit_hypotheses: {}",
-                hyp_ids.iter().take(8).cloned().collect::<Vec<_>>().join(",")
+                hyp_ids
+                    .iter()
+                    .take(8)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(",")
             ));
         }
-        if let Ok(guard) = self.ibc_ledger.lock() {
-            if let Some(state) = guard.sessions.get(&namespace) {
-                for line in revx_analysis::format_proof_chain_lines(
-                    &state.cognitive_field.proof_chain,
-                )
+        if let Ok(guard) = self.ibc_ledger.lock()
+            && let Some(state) = guard.sessions.get(&namespace)
+        {
+            for line in revx_analysis::format_proof_chain_lines(&state.cognitive_field.proof_chain)
                 .into_iter()
                 .take(5)
-                {
-                    key_findings.push(line);
-                }
-                let sealed = state
-                    .cognitive_field
-                    .proof_chain
-                    .iter()
-                    .filter(|l| l.verdict == "true" || l.verdict == "false")
-                    .count();
-                if sealed > 0 {
-                    key_findings.push(format!("pcos_sealed_links: {sealed}"));
-                }
+            {
+                key_findings.push(line);
+            }
+            let sealed = state
+                .cognitive_field
+                .proof_chain
+                .iter()
+                .filter(|l| l.verdict == "true" || l.verdict == "false")
+                .count();
+            if sealed > 0 {
+                key_findings.push(format!("pcos_sealed_links: {sealed}"));
             }
         }
         let mut next = next_actions;
@@ -631,10 +640,7 @@ impl CapabilityService {
         })
     }
 
-    fn run_ibc_advance(
-        &self,
-        request: IbcAdvanceRequest,
-    ) -> Result<IbcAdvanceResponse> {
+    fn run_ibc_advance(&self, request: IbcAdvanceRequest) -> Result<IbcAdvanceResponse> {
         let ws = self.workspace()?;
         self.ensure_ibc_ledger_loaded(&ws);
         let namespace = self.continuum_namespace(&ws, request.namespace.as_deref());
@@ -663,11 +669,7 @@ impl CapabilityService {
                     },
                 );
             }
-            let query_default_focus = guard
-                .sessions
-                .get(&namespace)
-                .map(|s| s.focus)
-                .unwrap_or(0);
+            let query_default_focus = guard.sessions.get(&namespace).map(|s| s.focus).unwrap_or(0);
             let query = request
                 .query
                 .clone()
@@ -680,10 +682,7 @@ impl CapabilityService {
                 } else {
                     revx_analysis::observe_ibc_execution(&mut state.lattice, &tool, &query)
                 };
-                let corpus = revx_analysis::synthesize_observation_corpus(
-                    &state.lattice,
-                    None,
-                );
+                let corpus = revx_analysis::synthesize_observation_corpus(&state.lattice, None);
                 let collapse = revx_analysis::collapse_cognitive_field(
                     &mut state.cognitive_field,
                     &mut state.lattice,
@@ -712,8 +711,7 @@ impl CapabilityService {
                     &field,
                 );
                 state.cognitive_field = field;
-                state.cognitive_field.proof_chain =
-                    revx_analysis::compose_proof_chain(state);
+                state.cognitive_field.proof_chain = revx_analysis::compose_proof_chain(state);
                 revx_analysis::inject_proof_chain_into_lattice(
                     &mut state.lattice,
                     &state.cognitive_field,
@@ -825,7 +823,12 @@ impl CapabilityService {
                 field_lines,
                 format!(
                     "orbit_hypotheses: {}",
-                    hyp_ids.iter().take(8).cloned().collect::<Vec<_>>().join(",")
+                    hyp_ids
+                        .iter()
+                        .take(8)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(",")
                 ),
                 format!("pcos_hypotheses_touched: {}", hyp_ids.len()),
             ],
@@ -1054,7 +1057,9 @@ impl CapabilityService {
                     4,
                 )?;
                 if let Some(followup) = binary_followups {
-                    analyzed.evidence_ids.extend(followup.evidence_ids.iter().cloned());
+                    analyzed
+                        .evidence_ids
+                        .extend(followup.evidence_ids.iter().cloned());
                     analyzed.evidence_ids.sort();
                     analyzed.evidence_ids.dedup();
                     analyzed.analyses.push(followup.analysis);
@@ -1223,7 +1228,11 @@ impl CapabilityService {
                     artifact: Some(survey.artifact),
                 }))
             }
-            CapabilityRequest::FunctionSearch(FunctionSearchRequest { query, limit, offset }) => {
+            CapabilityRequest::FunctionSearch(FunctionSearchRequest {
+                query,
+                limit,
+                offset,
+            }) => {
                 let ws = self.workspace()?;
                 let lim = limit.unwrap_or(200);
                 let off = offset.unwrap_or(0);
@@ -1260,7 +1269,7 @@ impl CapabilityService {
                         && (reference.to < function_start || reference.to >= function_end)
                         && !address_in_any_range(reference.to, &function_ranges);
                     if is_incoming && is_outgoing {
-                        incoming_xrefs.push(reference.clone());
+                        incoming_xrefs.push(reference);
                         outgoing_xrefs.push(reference);
                     } else if is_incoming {
                         incoming_xrefs.push(reference);
@@ -1313,10 +1322,7 @@ impl CapabilityService {
                     &function.name,
                     &mut agent_brief,
                     None,
-                    function
-                        .pseudocode
-                        .as_ref()
-                        .map(|unit| unit.text.as_str()),
+                    function.pseudocode.as_ref().map(|unit| unit.text.as_str()),
                 );
                 Ok(CapabilityResponse::FunctionProfile(
                     FunctionProfileResponse {
@@ -1420,10 +1426,7 @@ impl CapabilityService {
                     &function.name,
                     &mut agent_brief,
                     None,
-                    function
-                        .pseudocode
-                        .as_ref()
-                        .map(|unit| unit.text.as_str()),
+                    function.pseudocode.as_ref().map(|unit| unit.text.as_str()),
                 );
                 Ok(CapabilityResponse::DecompileFunction(
                     DecompileFunctionResponse {
@@ -1510,7 +1513,11 @@ impl CapabilityService {
                     edges: ws.callgraph_slice(&query)?,
                 }))
             }
-            CapabilityRequest::StringSearch(StringSearchRequest { pattern, limit, offset }) => {
+            CapabilityRequest::StringSearch(StringSearchRequest {
+                pattern,
+                limit,
+                offset,
+            }) => {
                 let ws = self.workspace()?;
                 let lim = limit.unwrap_or(200);
                 let off = offset.unwrap_or(0);
@@ -1590,12 +1597,9 @@ impl CapabilityService {
                     &ws, request,
                 )?))
             }
-            CapabilityRequest::AnalysisBrief(request) => {
-                Ok(CapabilityResponse::AnalysisBrief(run_analysis_brief(
-                    &self.workspace()?,
-                    request,
-                )?))
-            }
+            CapabilityRequest::AnalysisBrief(request) => Ok(CapabilityResponse::AnalysisBrief(
+                run_analysis_brief(&self.workspace()?, request)?,
+            )),
             CapabilityRequest::InvestigationRun(request) => {
                 let ws = self.workspace()?;
                 Ok(CapabilityResponse::InvestigationRun(run_investigation(
@@ -1605,9 +1609,9 @@ impl CapabilityService {
             CapabilityRequest::IbcStatus(request) => {
                 Ok(CapabilityResponse::IbcStatus(self.run_ibc_status(request)?))
             }
-            CapabilityRequest::IbcAdvance(request) => {
-                Ok(CapabilityResponse::IbcAdvance(self.run_ibc_advance(request)?))
-            }
+            CapabilityRequest::IbcAdvance(request) => Ok(CapabilityResponse::IbcAdvance(
+                self.run_ibc_advance(request)?,
+            )),
             CapabilityRequest::HypothesisCreate(HypothesisCreateRequest {
                 title,
                 notes,
@@ -1794,8 +1798,11 @@ pub fn windows_pipe_name(workspace_root: &Path) -> String {
         .canonicalize()
         .unwrap_or_else(|_| workspace_root.to_path_buf());
     let digest = blake3::hash(key.to_string_lossy().as_bytes()).to_hex();
-    format!(r"\.\pipe
-evx-{}", &digest[..16])
+    format!(
+        r"\.\pipe
+evx-{}",
+        &digest[..16]
+    )
 }
 
 pub async fn send_ipc_request(
@@ -1845,9 +1852,14 @@ async fn serve_windows_named_pipe(workspace_root: PathBuf, marker: &Path) -> Res
         std::fs::create_dir_all(parent)?;
     }
     let pipe_name = windows_pipe_name(&workspace_root);
-    std::fs::write(marker, format!("{pipe_name}
-"))
-        .with_context(|| format!("failed to write {}", marker.display()))?;
+    std::fs::write(
+        marker,
+        format!(
+            "{pipe_name}
+"
+        ),
+    )
+    .with_context(|| format!("failed to write {}", marker.display()))?;
     let service = CapabilityService::new(workspace_root);
     let mut first = true;
     loop {
@@ -2247,9 +2259,7 @@ fn mcp_response_summary(response: &CapabilityResponse) -> String {
     let body = match response {
         CapabilityResponse::ProjectOpen(payload) => format!(
             "# project_open\nworkspace: {}\nproject: {}\nschema: {}",
-            payload.workspace_root,
-            payload.project.name,
-            payload.project.schema_version
+            payload.workspace_root, payload.project.name, payload.project.schema_version
         ),
         CapabilityResponse::ProjectStatus(payload) => {
             let mut lines = vec![
@@ -2526,7 +2536,10 @@ fn mcp_response_summary(response: &CapabilityResponse) -> String {
                 lines.push(format!(
                     "- {}  {}  timeout_ms={:?}",
                     plugin.id,
-                    plugin.description.as_deref().unwrap_or(plugin.name.as_str()),
+                    plugin
+                        .description
+                        .as_deref()
+                        .unwrap_or(plugin.name.as_str()),
                     plugin.timeout_ms
                 ));
             }
@@ -2778,7 +2791,8 @@ fn mcp_response_summary(response: &CapabilityResponse) -> String {
                     format_id_list(&payload.evidence_ids, 20)
                 ));
             }
-            if !payload.agent_brief.headline.is_empty() || !payload.agent_brief.next_actions.is_empty()
+            if !payload.agent_brief.headline.is_empty()
+                || !payload.agent_brief.next_actions.is_empty()
             {
                 lines.push(format_agent_brief_section(&payload.agent_brief));
             }
@@ -2806,23 +2820,21 @@ fn mcp_response_summary(response: &CapabilityResponse) -> String {
                 for entry in &payload.strategies {
                     lines.push(format!(
                         "- {} regions={} text_len={} lattice={}",
-                        entry.strategy,
-                        entry.region_count,
-                        entry.text_len,
-                        entry.has_lattice
+                        entry.strategy, entry.region_count, entry.text_len, entry.has_lattice
                     ));
                 }
             }
             lines.push(
                 "
-next: decompile_function(query, strategy) | function_profile(query)".to_string(),
+next: decompile_function(query, strategy) | function_profile(query)"
+                    .to_string(),
             );
-            lines.join("
-")
+            lines.join(
+                "
+",
+            )
         }
-        CapabilityResponse::DisassembleFunction(payload) => {
-            render_disassembly(payload)
-        }
+        CapabilityResponse::DisassembleFunction(payload) => render_disassembly(payload),
         CapabilityResponse::XrefsQuery(payload) => {
             let mut lines = vec![
                 "# xrefs_query".to_string(),
@@ -2837,7 +2849,8 @@ next: decompile_function(query, strategy) | function_profile(query)".to_string()
             if payload.references.len() > 80 {
                 lines.push(format!("- ... {} more", payload.references.len() - 80));
             }
-            if !payload.agent_brief.headline.is_empty() || !payload.agent_brief.next_actions.is_empty()
+            if !payload.agent_brief.headline.is_empty()
+                || !payload.agent_brief.next_actions.is_empty()
             {
                 lines.push(format_agent_brief_section(&payload.agent_brief));
             } else if !payload.references.is_empty() {
@@ -2886,7 +2899,8 @@ next: decompile_function(query, strategy) | function_profile(query)".to_string()
             if payload.matches.len() > 60 {
                 lines.push(format!("- ... {} more", payload.matches.len() - 60));
             }
-            if !payload.agent_brief.headline.is_empty() || !payload.agent_brief.next_actions.is_empty()
+            if !payload.agent_brief.headline.is_empty()
+                || !payload.agent_brief.next_actions.is_empty()
             {
                 lines.push(format_agent_brief_section(&payload.agent_brief));
             } else if !payload.matches.is_empty() {
@@ -2934,7 +2948,10 @@ next: decompile_function(query, strategy) | function_profile(query)".to_string()
                     item.offset,
                     item.length,
                     item.object_kind,
-                    truncate_chars(item.preview_text.as_deref().unwrap_or(&item.preview_hex), 160)
+                    truncate_chars(
+                        item.preview_text.as_deref().unwrap_or(&item.preview_hex),
+                        160
+                    )
                 ));
             }
             if payload.matches.len() > 40 {
@@ -3106,7 +3123,7 @@ next: decompile_function(query, strategy) | function_profile(query)".to_string()
             ));
             lines.join("\n")
         }
-                CapabilityResponse::IbcStatus(payload) => {
+        CapabilityResponse::IbcStatus(payload) => {
             let mut lines = vec![
                 "# ibc_status".to_string(),
                 format!("namespace: {}", payload.active_namespace),
@@ -3126,8 +3143,10 @@ hypotheses:
                     format_id_list(&payload.hypothesis_ids, 20)
                 ));
             }
-            lines.join("
-")
+            lines.join(
+                "
+",
+            )
         }
         CapabilityResponse::IbcAdvance(payload) => {
             let mut lines = vec![
@@ -3149,10 +3168,12 @@ hypotheses:
                     format_id_list(&payload.hypothesis_ids, 20)
                 ));
             }
-            lines.join("
-")
+            lines.join(
+                "
+",
+            )
         }
-CapabilityResponse::HypothesisCreate(payload) => format!(
+        CapabilityResponse::HypothesisCreate(payload) => format!(
             "# hypothesis_create\nid: {}\ntitle: {}\nnotes:\n{}\nevidence:\n{}",
             payload.hypothesis.id,
             payload.hypothesis.title,
@@ -3171,7 +3192,10 @@ CapabilityResponse::HypothesisCreate(payload) => format!(
                 "# report_generate".to_string(),
                 format!("id: {}", payload.report.id),
                 format!("topic: {}", payload.report.topic),
-                format!("\n## Body\n{}", truncate_chars(&payload.report.body, 10_000)),
+                format!(
+                    "\n## Body\n{}",
+                    truncate_chars(&payload.report.body, 10_000)
+                ),
             ];
             if !payload.report.evidence_ids.is_empty() {
                 lines.push(format!(
@@ -3269,7 +3293,14 @@ fn format_analysis_summary(summary: &revx_core::AnalysisSummary) -> String {
 fn format_agent_brief_section(brief: &AgentInteractionBrief) -> String {
     let mut lines = vec![
         "\n## Agent Brief".to_string(),
-        format!("headline: {}", if brief.headline.is_empty() { "-" } else { &brief.headline }),
+        format!(
+            "headline: {}",
+            if brief.headline.is_empty() {
+                "-"
+            } else {
+                &brief.headline
+            }
+        ),
     ];
     if let Some(lattice) = &brief.semantic_lattice {
         lines.push(revx_analysis::format_semantic_lattice(lattice));
@@ -3435,7 +3466,11 @@ fn render_function_profile(payload: &FunctionProfileResponse) -> String {
     }
     lines.push(format!(
         "\n## Digest\n{}",
-        function_pseudocode_digest(function.pseudocode.as_ref(), &payload.callees, &payload.callers)
+        function_pseudocode_digest(
+            function.pseudocode.as_ref(),
+            &payload.callees,
+            &payload.callers
+        )
     ));
     if let Some(unit) = &function.pseudocode {
         lines.push("\n## Pseudocode".to_string());
@@ -3514,7 +3549,10 @@ fn render_disassembly(payload: &DisassembleFunctionResponse) -> String {
         }
     }
     if let Some(annotations) = &payload.annotations {
-        lines.push(format!("\nannotations_artifact: {}", annotations.relative_path));
+        lines.push(format!(
+            "\nannotations_artifact: {}",
+            annotations.relative_path
+        ));
     }
     if let Some(artifact) = &payload.artifact {
         lines.push(format!("artifact: {}", artifact.relative_path));
@@ -3525,7 +3563,6 @@ fn render_disassembly(payload: &DisassembleFunctionResponse) -> String {
     ));
     lines.join("\n")
 }
-
 
 fn mcp_tools_manifest() -> Vec<serde_json::Value> {
     vec![
@@ -3803,7 +3840,7 @@ fn mcp_tools_manifest() -> Vec<serde_json::Value> {
                 "required": ["query"]
             }),
         ),
-                tool_manifest(
+        tool_manifest(
             "decompile_cache_status",
             "List function pseudocode artifact and per-strategy cache entries (fast/full/hotblock) for a function query",
             serde_json::json!({
@@ -3812,7 +3849,7 @@ fn mcp_tools_manifest() -> Vec<serde_json::Value> {
                 "required": ["query"]
             }),
         ),
-tool_manifest(
+        tool_manifest(
             "decompile_function",
             "Return deterministic pseudocode text and region outline for a function. strategy: auto|cached|fast|full|hotblock; force_refresh recomputes",
             serde_json::json!({
@@ -4342,7 +4379,6 @@ fn symbolic_case_id(request: &SymbolicSolveRequest) -> Result<String> {
     Ok(blake3::hash(&bytes).to_hex().to_string())
 }
 
-
 fn daemon_agent_next_action(
     tool: &str,
     reason: impl Into<String>,
@@ -4361,6 +4397,8 @@ fn daemon_agent_next_action(
     }
 }
 
+#[allow(clippy::drop_non_drop)]
+#[allow(clippy::unnecessary_sort_by)]
 fn derive_daemon_object_next_actions(
     object: &UniversalObject,
     analyses: &[ObjectAnalysisSummary],
@@ -4543,6 +4581,7 @@ fn derive_daemon_object_agent_brief(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn derive_pipeline_next_actions(
     root_id: &str,
     object_count: usize,
@@ -4618,6 +4657,7 @@ fn derive_pipeline_next_actions(
     actions
 }
 
+#[allow(clippy::too_many_arguments)]
 fn derive_pipeline_agent_brief(
     root_id: &str,
     object_count: usize,
@@ -4736,7 +4776,11 @@ fn derive_investigation_next_actions(
             serde_json::json!({ "path": subject }),
         ));
     }
-    actions.sort_by(|a, b| b.priority.cmp(&a.priority).then_with(|| a.tool.cmp(&b.tool)));
+    actions.sort_by(|a, b| {
+        b.priority
+            .cmp(&a.priority)
+            .then_with(|| a.tool.cmp(&b.tool))
+    });
     let mut dedup = BTreeSet::new();
     actions.retain(|action| {
         dedup.insert(format!(
@@ -4750,6 +4794,7 @@ fn derive_investigation_next_actions(
     actions
 }
 
+#[allow(clippy::too_many_arguments)]
 fn derive_investigation_agent_brief(
     subject: &str,
     summary: &str,
@@ -4800,7 +4845,8 @@ fn derive_investigation_agent_brief(
         next_actions: next_actions.to_vec(),
         stop_conditions: vec![
             "Execute next_actions[0] with its args, then reassess once".to_string(),
-            "Stop when top next_action priority < 60 and no new pipeline children appear".to_string(),
+            "Stop when top next_action priority < 60 and no new pipeline children appear"
+                .to_string(),
             "Prefer one high-priority action over breadth-first tool spam".to_string(),
             "Do not re-run investigation_run unless inputs or child objects changed".to_string(),
             summary.to_string(),
@@ -4809,8 +4855,8 @@ fn derive_investigation_agent_brief(
     }
 }
 
-
-
+#[allow(clippy::redundant_locals)]
+#[allow(clippy::unnecessary_sort_by)]
 fn run_analysis_brief(
     ws: &Workspace,
     request: AnalysisBriefRequest,
@@ -4869,21 +4915,29 @@ fn run_analysis_brief(
     let mut hot_map: BTreeMap<u64, HotFunctionAccum> = BTreeMap::new();
 
     for function in &function_hits {
-        let entry = hot_map.entry(function.address).or_insert_with(|| HotFunctionAccum {
-            name: function.name.clone(),
-            address: function.address,
-            size: function.size,
-            score: 2_000,
-            reasons: vec![format!("function name match: {}", function.name)],
-            string_hits: Vec::new(),
-            evidence_ids: function.evidence_ids.clone(),
-        });
+        let entry = hot_map
+            .entry(function.address)
+            .or_insert_with(|| HotFunctionAccum {
+                name: function.name.clone(),
+                address: function.address,
+                size: function.size,
+                score: 2_000,
+                reasons: vec![format!("function name match: {}", function.name)],
+                string_hits: Vec::new(),
+                evidence_ids: function.evidence_ids.clone(),
+            });
         entry.score = entry.score.saturating_add(1_500);
         if !function.name.to_ascii_lowercase().contains("sub_") {
             entry.score = entry.score.saturating_add(800);
         }
-        if !entry.reasons.iter().any(|item| item.starts_with("function name match")) {
-            entry.reasons.push(format!("function name match: {}", function.name));
+        if !entry
+            .reasons
+            .iter()
+            .any(|item| item.starts_with("function name match"))
+        {
+            entry
+                .reasons
+                .push(format!("function name match: {}", function.name));
         }
     }
 
@@ -4909,15 +4963,17 @@ fn run_analysis_brief(
                         size: owner.size,
                         evidence_ids: owner.evidence_ids.clone(),
                     });
-                    let entry = hot_map.entry(owner.address).or_insert_with(|| HotFunctionAccum {
-                        name: owner.name.clone(),
-                        address: owner.address,
-                        size: owner.size,
-                        score: 0,
-                        reasons: Vec::new(),
-                        string_hits: Vec::new(),
-                        evidence_ids: owner.evidence_ids.clone(),
-                    });
+                    let entry = hot_map
+                        .entry(owner.address)
+                        .or_insert_with(|| HotFunctionAccum {
+                            name: owner.name.clone(),
+                            address: owner.address,
+                            size: owner.size,
+                            score: 0,
+                            reasons: Vec::new(),
+                            string_hits: Vec::new(),
+                            evidence_ids: owner.evidence_ids.clone(),
+                        });
                     entry.score = entry
                         .score
                         .saturating_add(1_200 + xref_count.min(20) as u32 * 20);
@@ -4943,22 +4999,26 @@ fn run_analysis_brief(
     }
 
     if let Ok(Some(direct)) = ws.resolve_function(&query) {
-        let entry = hot_map.entry(direct.address).or_insert_with(|| HotFunctionAccum {
-            name: direct.name.clone(),
-            address: direct.address,
-            size: direct.size,
-            score: 0,
-            reasons: Vec::new(),
-            string_hits: Vec::new(),
-            evidence_ids: direct.evidence_ids.clone(),
-        });
+        let entry = hot_map
+            .entry(direct.address)
+            .or_insert_with(|| HotFunctionAccum {
+                name: direct.name.clone(),
+                address: direct.address,
+                size: direct.size,
+                score: 0,
+                reasons: Vec::new(),
+                string_hits: Vec::new(),
+                evidence_ids: direct.evidence_ids.clone(),
+            });
         entry.score = entry.score.saturating_add(5_000);
         entry.reasons.push("direct function resolve".to_string());
     }
 
     for import in &import_hits {
         if let Some(address) = import.address {
-            let refs = ws.find_references(&format!("0x{address:x}")).unwrap_or_default();
+            let refs = ws
+                .find_references(&format!("0x{address:x}"))
+                .unwrap_or_default();
             for reference in refs.iter().take(8) {
                 let owner_addr = if reference.to == address {
                     reference.from
@@ -4966,15 +5026,17 @@ fn run_analysis_brief(
                     reference.to
                 };
                 if let Ok(Some(owner)) = ws.resolve_function(&format!("0x{owner_addr:x}")) {
-                    let entry = hot_map.entry(owner.address).or_insert_with(|| HotFunctionAccum {
-                        name: owner.name.clone(),
-                        address: owner.address,
-                        size: owner.size,
-                        score: 0,
-                        reasons: Vec::new(),
-                        string_hits: Vec::new(),
-                        evidence_ids: owner.evidence_ids.clone(),
-                    });
+                    let entry = hot_map
+                        .entry(owner.address)
+                        .or_insert_with(|| HotFunctionAccum {
+                            name: owner.name.clone(),
+                            address: owner.address,
+                            size: owner.size,
+                            score: 0,
+                            reasons: Vec::new(),
+                            string_hits: Vec::new(),
+                            evidence_ids: owner.evidence_ids.clone(),
+                        });
                     entry.score = entry.score.saturating_add(900);
                     let reason = format!("calls/imports `{}`", import.name);
                     if !entry.reasons.iter().any(|item| item == &reason) {
@@ -5007,10 +5069,8 @@ fn run_analysis_brief(
             if edge.callee_address == item.address {
                 caller_count += 1;
                 if caller_samples.len() < 6 {
-                    caller_samples.push(format!(
-                        "{}@0x{:x}",
-                        edge.caller_name, edge.caller_address
-                    ));
+                    caller_samples
+                        .push(format!("{}@0x{:x}", edge.caller_name, edge.caller_address));
                 }
             }
             if edge.caller_address == item.address {
@@ -5081,7 +5141,8 @@ fn run_analysis_brief(
             }
         }
 
-        let confidence = hot_function_confidence(item.score, &quality_tags, caller_count, callee_count);
+        let confidence =
+            hot_function_confidence(item.score, &quality_tags, caller_count, callee_count);
         let digest = format!(
             "score={} conf={:.2} callers={} callees={} tags=[{}] strings=[{}]",
             item.score,
@@ -5193,40 +5254,44 @@ fn run_analysis_brief(
             }
         }
         for seed in ["main", "Main", "_main", "start"] {
-            if let Ok(Some(function)) = ws.resolve_function(seed) {
-                if !fallback_addrs.iter().any(|(_, a)| *a == function.address) {
-                    fallback_addrs.push((function.name.clone(), function.address));
-                }
+            if let Ok(Some(function)) = ws.resolve_function(seed)
+                && !fallback_addrs.iter().any(|(_, a)| *a == function.address)
+            {
+                fallback_addrs.push((function.name.clone(), function.address));
             }
         }
         for (name, address) in fallback_addrs.into_iter().take(6) {
             let q = format!("0x{address:x}");
-            if let Ok(Some(function)) = ws.resolve_function(&q) {
-                if let Some(unit) = &function.pseudocode {
-                    let lattice = unit.semantic_lattice.clone().unwrap_or_else(|| {
-                        revx_analysis::build_agent_semantic_lattice(
-                            &function.name,
-                            function.address,
-                            &unit.text,
-                            &unit.regions,
-                        )
-                    });
-                    let related = unit.text.contains(&query)
-                        || query_tokens.iter().any(|token| {
-                            !token.is_empty() && unit.text.to_ascii_lowercase().contains(&token.to_ascii_lowercase())
-                        })
-                        || string_hits.iter().any(|hit| unit.text.contains(&hit.value));
-                    if related || lattice_pieces.is_empty() {
-                        lattice_pieces.push((
-                            if name.is_empty() {
-                                function.name.clone()
-                            } else {
-                                name
-                            },
-                            function.address,
-                            lattice,
-                        ));
-                    }
+            if let Ok(Some(function)) = ws.resolve_function(&q)
+                && let Some(unit) = &function.pseudocode
+            {
+                let lattice = unit.semantic_lattice.clone().unwrap_or_else(|| {
+                    revx_analysis::build_agent_semantic_lattice(
+                        &function.name,
+                        function.address,
+                        &unit.text,
+                        &unit.regions,
+                    )
+                });
+                let related = unit.text.contains(&query)
+                    || query_tokens.iter().any(|token| {
+                        !token.is_empty()
+                            && unit
+                                .text
+                                .to_ascii_lowercase()
+                                .contains(&token.to_ascii_lowercase())
+                    })
+                    || string_hits.iter().any(|hit| unit.text.contains(&hit.value));
+                if related || lattice_pieces.is_empty() {
+                    lattice_pieces.push((
+                        if name.is_empty() {
+                            function.name.clone()
+                        } else {
+                            name
+                        },
+                        function.address,
+                        lattice,
+                    ));
                 }
             }
             if lattice_pieces.len() >= 4 {
@@ -5238,7 +5303,10 @@ fn run_analysis_brief(
     let fused_lattice = if lattice_pieces.is_empty() {
         None
     } else {
-        Some(revx_analysis::fuse_semantic_lattices(&query, &lattice_pieces))
+        Some(revx_analysis::fuse_semantic_lattices(
+            &query,
+            &lattice_pieces,
+        ))
     };
     let mut key_findings = key_findings;
     let mut next_actions = next_actions;
@@ -5302,7 +5370,11 @@ fn run_analysis_brief(
                 .map(|c| c.glyph.as_str())
                 .collect::<Vec<_>>()
                 .join("");
-            let bound_n = lattice.case_lexicon.iter().filter(|c| c.target.is_some()).count();
+            let bound_n = lattice
+                .case_lexicon
+                .iter()
+                .filter(|c| c.target.is_some())
+                .count();
             key_findings.push(format!(
                 "case_lexicon: `{}` n={} bound={}/{}",
                 compact,
@@ -5502,6 +5574,7 @@ fn hot_function_confidence(
     conf.clamp(0.1, 0.99)
 }
 
+#[allow(clippy::unnecessary_sort_by)]
 fn derive_analysis_brief_next_actions(
     query: &str,
     string_hits: &[AnalysisStringHit],
@@ -5544,35 +5617,35 @@ fn derive_analysis_brief_next_actions(
         });
     }
 
-    if let Some(string) = string_hits.first() {
-        if let Some(address) = string.address {
-            let q = format!("0x{address:x}");
-            push(AgentNextAction {
-                tool: "xrefs_query".to_string(),
-                reason: format!(
-                    "expand all xrefs for top string `{}`",
-                    truncate_chars(&string.value, 80)
-                ),
-                priority: 88,
-                query: Some(q.clone()),
-                label: Some("xrefs top string".to_string()),
-                args: serde_json::json!({ "query": q }),
-            });
-        }
+    if let Some(string) = string_hits.first()
+        && let Some(address) = string.address
+    {
+        let q = format!("0x{address:x}");
+        push(AgentNextAction {
+            tool: "xrefs_query".to_string(),
+            reason: format!(
+                "expand all xrefs for top string `{}`",
+                truncate_chars(&string.value, 80)
+            ),
+            priority: 88,
+            query: Some(q.clone()),
+            label: Some("xrefs top string".to_string()),
+            args: serde_json::json!({ "query": q }),
+        });
     }
 
-    if let Some(import) = import_hits.first() {
-        if let Some(address) = import.address {
-            let q = format!("0x{address:x}");
-            push(AgentNextAction {
-                tool: "xrefs_query".to_string(),
-                reason: format!("find callers of import `{}`", import.name),
-                priority: 80,
-                query: Some(q.clone()),
-                label: Some(format!("xrefs {}", import.name)),
-                args: serde_json::json!({ "query": q }),
-            });
-        }
+    if let Some(import) = import_hits.first()
+        && let Some(address) = import.address
+    {
+        let q = format!("0x{address:x}");
+        push(AgentNextAction {
+            tool: "xrefs_query".to_string(),
+            reason: format!("find callers of import `{}`", import.name),
+            priority: 80,
+            query: Some(q.clone()),
+            label: Some(format!("xrefs {}", import.name)),
+            args: serde_json::json!({ "query": q }),
+        });
     }
 
     if hot_functions.len() > 1 {
@@ -5753,7 +5826,11 @@ fn function_pseudocode_digest(
     callers: &[revx_core::CallEdge],
 ) -> String {
     let mut parts = Vec::new();
-    parts.push(format!("callers={} callees={}", callers.len(), callees.len()));
+    parts.push(format!(
+        "callers={} callees={}",
+        callers.len(),
+        callees.len()
+    ));
     if !callees.is_empty() {
         let names = callees
             .iter()
@@ -5868,10 +5945,9 @@ fn extract_call_names_from_pseudocode(text: &str) -> Vec<String> {
         if name
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == ':')
+            && seen.insert(name.to_string())
         {
-            if seen.insert(name.to_string()) {
-                out.push(name.to_string());
-            }
+            out.push(name.to_string());
         }
     }
     out
@@ -5935,7 +6011,7 @@ fn extract_quoted_literals(text: &str) -> Vec<String> {
     out
 }
 
-
+#[allow(clippy::unnecessary_sort_by)]
 fn derive_function_profile_agent_brief(
     function: &revx_core::Function,
     callers: &[revx_core::CallEdge],
@@ -5962,11 +6038,7 @@ fn derive_function_profile_agent_brief(
                 .arguments
                 .iter()
                 .take(6)
-                .map(|arg| format!(
-                    "{}:{}",
-                    arg.name,
-                    arg.type_name.as_deref().unwrap_or("?")
-                ))
+                .map(|arg| format!("{}:{}", arg.name, arg.type_name.as_deref().unwrap_or("?")))
                 .collect::<Vec<_>>()
                 .join(", ")
         ));
@@ -6060,17 +6132,25 @@ fn derive_function_profile_agent_brief(
     }
 }
 
+#[allow(clippy::unnecessary_sort_by)]
 fn derive_decompile_agent_brief(
     name: &str,
     address: u64,
     unit: Option<&revx_core::PseudocodeUnit>,
 ) -> AgentInteractionBrief {
     let q = format!("0x{address:x}");
-    let lattice = unit.and_then(|unit| unit.semantic_lattice.clone()).or_else(|| {
-        unit.map(|unit| {
-            revx_analysis::build_agent_semantic_lattice(name, address, &unit.text, &unit.regions)
-        })
-    });
+    let lattice = unit
+        .and_then(|unit| unit.semantic_lattice.clone())
+        .or_else(|| {
+            unit.map(|unit| {
+                revx_analysis::build_agent_semantic_lattice(
+                    name,
+                    address,
+                    &unit.text,
+                    &unit.regions,
+                )
+            })
+        });
     let digest = function_pseudocode_digest(unit, &[], &[]);
     let mut next_actions = Vec::new();
     if let Some(lattice) = lattice.as_ref() {
@@ -6080,7 +6160,9 @@ fn derive_decompile_agent_brief(
         for claim in lattice.claims.iter().take(4) {
             if let Some(probe) = claim.probes.first() {
                 let mut action = probe.clone();
-                action.priority = action.priority.saturating_sub(claim.id[1..].parse::<u8>().unwrap_or(0));
+                action.priority = action
+                    .priority
+                    .saturating_sub(claim.id[1..].parse::<u8>().unwrap_or(0));
                 action.reason = format!("{} | {}", claim.intent, action.reason);
                 if action.label.is_none() {
                     action.label = Some(format!("casl-{}", claim.id));
@@ -6161,7 +6243,11 @@ fn derive_decompile_agent_brief(
                 })
                 .collect::<Vec<_>>()
                 .join("");
-            let bound_n = lattice.case_lexicon.iter().filter(|c| c.target.is_some()).count();
+            let bound_n = lattice
+                .case_lexicon
+                .iter()
+                .filter(|c| c.target.is_some())
+                .count();
             key_findings.push(format!(
                 "case_lexicon: `{}` (n={}, with_arg={}, bound={})",
                 compact,
@@ -6225,10 +6311,7 @@ fn derive_decompile_agent_brief(
             ));
         }
         for step in lattice.ibc.iter().take(4) {
-            key_findings.push(format!(
-                "ibc[{}] {} {}",
-                step.pc, step.op, step.detail
-            ));
+            key_findings.push(format!("ibc[{}] {} {}", step.pc, step.op, step.detail));
         }
         for anchor in lattice.anchors.iter().take(6) {
             key_findings.push(format!(
@@ -6292,7 +6375,10 @@ fn derive_decompile_agent_brief(
             if lattice.thesis.is_empty() {
                 format!("decompile {name} @ 0x{address:x}")
             } else {
-                format!("CASL {name} @ 0x{address:x}: {}", truncate_chars(&lattice.thesis, 140))
+                format!(
+                    "CASL {name} @ 0x{address:x}: {}",
+                    truncate_chars(&lattice.thesis, 140)
+                )
             }
         })
         .unwrap_or_else(|| format!("decompile {name} @ 0x{address:x}"));
@@ -6305,10 +6391,10 @@ fn derive_decompile_agent_brief(
                 .filter_map(|claim| claim.confutation.clone())
                 .take(3)
                 .collect::<Vec<_>>();
-            if lattice.quality.escalate {
-                if let Some(reason) = &lattice.quality.escalate_reason {
-                    qs.insert(0, reason.clone());
-                }
+            if lattice.quality.escalate
+                && let Some(reason) = &lattice.quality.escalate_reason
+            {
+                qs.insert(0, reason.clone());
             }
             if qs.is_empty() {
                 next_actions
@@ -6340,7 +6426,6 @@ fn derive_decompile_agent_brief(
         semantic_lattice: lattice,
     }
 }
-
 
 fn derive_string_search_agent_brief(
     pattern: &str,
@@ -6381,11 +6466,7 @@ fn derive_string_search_agent_brief(
         });
     }
     AgentInteractionBrief {
-        headline: format!(
-            "string_search `{}`: {} match(es)",
-            pattern,
-            matches.len()
-        ),
+        headline: format!("string_search `{}`: {} match(es)", pattern, matches.len()),
         key_findings: matches
             .iter()
             .take(5)
@@ -6451,7 +6532,8 @@ fn derive_xrefs_agent_brief(
     let kind_counts = {
         let mut map = BTreeMap::new();
         for reference in references {
-            *map.entry(reference.kind.as_str().to_string()).or_insert(0usize) += 1;
+            *map.entry(reference.kind.as_str().to_string())
+                .or_insert(0usize) += 1;
         }
         map
     };
@@ -6471,8 +6553,6 @@ fn derive_xrefs_agent_brief(
         semantic_lattice: None,
     }
 }
-
-
 
 fn run_investigation(
     ws: &Workspace,
@@ -6636,6 +6716,7 @@ fn run_investigation(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn investigation_report_body(
     subject: &str,
     summary: &str,
@@ -6739,12 +6820,9 @@ fn investigation_report_body(
         .unwrap_or_else(|| "- None".to_string());
     format!(
         "# Investigation: {subject}\n\n## Agent Brief\n\n{}\n\n## Top Action\n\n{top_action_line}\n\n## Summary\n\n{summary}\n\n## Coverage\n\n- Evidence count: {evidence_count}\n- Evidence graph nodes: {}\n- Evidence graph edges: {}\n- Trace events considered: {trace_count}\n\n## Key Findings\n\n{finding_lines}\n\n## Next Actions\n\n{action_lines}\n\n## Open Questions\n\n{question_lines}\n\n## Stop Conditions\n\n{stop_lines}\n\n## Evidence Preview\n\n{evidence_lines}\n\n## Pipeline Steps\n\n{pipeline_lines}\n",
-        agent_brief.headline,
-        graph.node_count,
-        graph.edge_count
+        agent_brief.headline, graph.node_count, graph.edge_count
     )
 }
-
 
 fn run_object_plugin(
     ws: &Workspace,
@@ -6995,24 +7073,23 @@ fn promote_dug_native_binaries_tracked(
                 }));
                 continue;
             }
-            if let Some(hash) = object.hash_blake3.as_deref() {
-                if already_analyzed
+            if let Some(hash) = object.hash_blake3.as_deref()
+                && (already_analyzed
                     .as_ref()
                     .is_some_and(|seen| seen.contains(hash))
-                    || ws.binary_analysis_exists(hash).unwrap_or(false)
-                {
-                    skipped_count += 1;
-                    if let Some(seen) = already_analyzed.as_mut() {
-                        seen.insert(hash.to_string());
-                    }
-                    results.push(serde_json::json!({
-                        "object_id": candidate_id,
-                        "status": "skipped",
-                        "reason": "already_analyzed",
-                        "binary_id": hash,
-                    }));
-                    continue;
+                    || ws.binary_analysis_exists(hash).unwrap_or(false))
+            {
+                skipped_count += 1;
+                if let Some(seen) = already_analyzed.as_mut() {
+                    seen.insert(hash.to_string());
                 }
+                results.push(serde_json::json!({
+                    "object_id": candidate_id,
+                    "status": "skipped",
+                    "reason": "already_analyzed",
+                    "binary_id": hash,
+                }));
+                continue;
             }
         }
         match analyze_object_as_binary(ws, candidate_id, profile, source) {
@@ -7063,11 +7140,7 @@ fn promote_dug_native_binaries_tracked(
             "warnings": &warnings,
         }),
     )?;
-    let analysis_id = format!(
-        "analysis:auto_binary:{}:{}",
-        source,
-        artifact.hash_blake3
-    );
+    let analysis_id = format!("analysis:auto_binary:{}:{}", source, artifact.hash_blake3);
     let status = if analyzed_count == 0 && warnings.is_empty() && skipped_count > 0 {
         ObjectAnalysisStatus::Skipped
     } else if analyzed_count == 0 {
@@ -7485,7 +7558,9 @@ fn run_object_pipeline(
                             analyzed_binary_count += followup.analyzed_count;
                             binary_candidate_count += followup.candidate_count;
                             evidence_ids.extend(followup.evidence_ids.iter().cloned());
-                            analysis.evidence_ids.extend(followup.evidence_ids.iter().cloned());
+                            analysis
+                                .evidence_ids
+                                .extend(followup.evidence_ids.iter().cloned());
                             analysis.evidence_ids.sort();
                             analysis.evidence_ids.dedup();
                             analysis.analyses.push(followup.analysis);
@@ -7597,11 +7672,11 @@ fn run_object_pipeline(
                     let mut discovered_edge_count = 0usize;
                     for result in &carved.carves {
                         evidence_ids.extend(result.evidence_ids.iter().cloned());
-                        if let Some(root_id) = &result.root_id {
-                            if counted_graph_roots.insert(root_id.clone()) {
-                                edge_count += result.edge_count;
-                                discovered_edge_count += result.edge_count;
-                            }
+                        if let Some(root_id) = &result.root_id
+                            && counted_graph_roots.insert(root_id.clone())
+                        {
+                            edge_count += result.edge_count;
+                            discovered_edge_count += result.edge_count;
                         }
                         for object_id in &result.object_ids {
                             if known_object_ids.insert(object_id.clone()) {
@@ -7901,14 +7976,14 @@ fn should_pipeline_carve_embedded(object: &UniversalObject) -> bool {
         Some("elf" | "pe" | "macho" | "macho_fat" | "dex" | "wasm") => true,
         Some(
             "pdf" | "png" | "jpeg" | "gif" | "bmp" | "dib" | "tiff" | "ico" | "webp" | "heif"
-                | "heic" | "avif",
+            | "heic" | "avif",
         ) => true,
-        Some(
-            "mp4" | "m4a" | "m4v" | "mov" | "avi" | "wav" | "flac" | "ogg" | "mp3" | "riff",
-        ) => true,
+        Some("mp4" | "m4a" | "m4v" | "mov" | "avi" | "wav" | "flac" | "ogg" | "mp3" | "riff") => {
+            true
+        }
         Some(
             "cab" | "ar" | "7z" | "rar" | "gzip" | "xz" | "zstd" | "bzip2" | "zip" | "tar"
-                | "tar.gz" | "tar.bz2" | "tar.xz" | "tar.zst",
+            | "tar.gz" | "tar.bz2" | "tar.xz" | "tar.zst",
         ) => true,
         Some("qcow2" | "iso" | "dmg" | "vmdk" | "img") => true,
         Some("woff" | "woff2" | "ttf" | "otf") => true,
@@ -7968,7 +8043,7 @@ fn address_in_any_range(address: u64, ranges: &[(u64, u64)]) -> bool {
 
 fn dedupe_references_in_place(refs: &mut Vec<revx_core::Reference>) {
     let mut seen = BTreeSet::new();
-    refs.retain(|reference| seen.insert((reference.from, reference.to, reference.kind.clone())));
+    refs.retain(|reference| seen.insert((reference.from, reference.to, reference.kind)));
 }
 
 fn dedupe_call_edges_in_place(edges: &mut Vec<revx_core::CallEdge>) {
@@ -8027,44 +8102,45 @@ mod tests {
         mcp_tools_manifest, tool_name_to_request,
     };
     use revx_core::{
-        AnalysisBundle, AnalysisProfile, AnalysisSummary, Architecture, BasicBlock, BinaryFormat,
-        CapabilityRequest, CapabilityResponse, DebugCoverageSummary, DebugImportStatus,
-        DebugImportSummary, Function, Instruction, ObjectAnalyzeRequest, PROJECT_SCHEMA_VERSION,
-        AgentInteractionBrief, PseudocodeRegion, PseudocodeUnit, RegionKind, StackSummary, StringLiteral, Survey, TypeDef,
-        TypeSource, Variable, VariableRole, VariableStorage,
+        AgentInteractionBrief, AnalysisBundle, AnalysisProfile, AnalysisSummary, Architecture,
+        BasicBlock, BinaryFormat, CapabilityRequest, CapabilityResponse, DebugCoverageSummary,
+        DebugImportStatus, DebugImportSummary, Function, Instruction, ObjectAnalyzeRequest,
+        PROJECT_SCHEMA_VERSION, PseudocodeRegion, PseudocodeUnit, RegionKind, StackSummary,
+        StringLiteral, Survey, TypeDef, TypeSource, Variable, VariableRole, VariableStorage,
     };
     use revx_workspace::Workspace;
     use tempfile::tempdir;
 
     #[test]
     fn mcp_response_summary_includes_decompile_text() {
-        let response = CapabilityResponse::DecompileFunction(revx_core::DecompileFunctionResponse {
-            function_name: "main".to_string(),
-            address: 0x1000,
-            pseudocode: Some(PseudocodeUnit {
-                language: "c".to_string(),
-                text: "int main() {\n  return 0;\n}".to_string(),
-                regions: vec![PseudocodeRegion {
-                    id: "r0".to_string(),
-                    kind: RegionKind::Block,
-                    start_address: Some(0x1000),
-                    end_address: Some(0x1010),
-                    header: Some("entry".to_string()),
-                    statements: vec!["return 0;".to_string()],
-                    children: Vec::new(),
-                    evidence_ids: Vec::new(),
-                }],
-                region_artifact: None,
+        let response =
+            CapabilityResponse::DecompileFunction(revx_core::DecompileFunctionResponse {
+                function_name: "main".to_string(),
+                address: 0x1000,
+                pseudocode: Some(PseudocodeUnit {
+                    language: "c".to_string(),
+                    text: "int main() {\n  return 0;\n}".to_string(),
+                    regions: vec![PseudocodeRegion {
+                        id: "r0".to_string(),
+                        kind: RegionKind::Block,
+                        start_address: Some(0x1000),
+                        end_address: Some(0x1010),
+                        header: Some("entry".to_string()),
+                        statements: vec!["return 0;".to_string()],
+                        children: Vec::new(),
+                        evidence_ids: Vec::new(),
+                    }],
+                    region_artifact: None,
+                    evidence_ids: vec!["ev1".to_string()],
+                    semantic_lattice: None,
+                }),
                 evidence_ids: vec!["ev1".to_string()],
-                semantic_lattice: None,
-            }),
-            evidence_ids: vec!["ev1".to_string()],
-            artifact: None,
-            strategy_used: Default::default(),
-            cache_hit: false,
-            available_strategies: Vec::new(),
-                        agent_brief: Default::default(),
-        });
+                artifact: None,
+                strategy_used: Default::default(),
+                cache_hit: false,
+                available_strategies: Vec::new(),
+                agent_brief: Default::default(),
+            });
         let text = mcp_response_summary(&response);
         assert!(text.contains("# decompile_function"));
         assert!(text.contains("int main()"));
@@ -8089,31 +8165,33 @@ int main(int argc, char **argv) {
             &[],
         );
         assert!(!lattice.claims.is_empty());
-        let response = CapabilityResponse::DecompileFunction(revx_core::DecompileFunctionResponse {
-            function_name: "main".to_string(),
-            address: 0x1000,
-            pseudocode: Some(PseudocodeUnit {
-                language: "c".to_string(),
-                text: "int main() {\n  _getopt_long(argc, argv, \"abcd\");\n  return 0;\n}".to_string(),
-                regions: Vec::new(),
-                region_artifact: None,
+        let response =
+            CapabilityResponse::DecompileFunction(revx_core::DecompileFunctionResponse {
+                function_name: "main".to_string(),
+                address: 0x1000,
+                pseudocode: Some(PseudocodeUnit {
+                    language: "c".to_string(),
+                    text: "int main() {\n  _getopt_long(argc, argv, \"abcd\");\n  return 0;\n}"
+                        .to_string(),
+                    regions: Vec::new(),
+                    region_artifact: None,
+                    evidence_ids: vec!["ev1".to_string()],
+                    semantic_lattice: Some(lattice.clone()),
+                }),
                 evidence_ids: vec!["ev1".to_string()],
-                semantic_lattice: Some(lattice.clone()),
-            }),
-            evidence_ids: vec!["ev1".to_string()],
-            artifact: None,
-            strategy_used: Default::default(),
-            cache_hit: false,
-            available_strategies: Vec::new(),
-            agent_brief: AgentInteractionBrief {
-                headline: "CASL main".to_string(),
-                key_findings: vec!["casl_thesis: test".to_string()],
-                open_questions: Vec::new(),
-                next_actions: Vec::new(),
-                stop_conditions: Vec::new(),
-                semantic_lattice: Some(lattice),
-            },
-        });
+                artifact: None,
+                strategy_used: Default::default(),
+                cache_hit: false,
+                available_strategies: Vec::new(),
+                agent_brief: AgentInteractionBrief {
+                    headline: "CASL main".to_string(),
+                    key_findings: vec!["casl_thesis: test".to_string()],
+                    open_questions: Vec::new(),
+                    next_actions: Vec::new(),
+                    stop_conditions: Vec::new(),
+                    semantic_lattice: Some(lattice),
+                },
+            });
         let text = mcp_response_summary(&response);
         let lattice_pos = text.find("## Semantic Lattice").expect("casl section");
         let pseudo_pos = text.find("## Pseudocode").expect("pseudocode section");
@@ -8122,7 +8200,6 @@ int main(int argc, char **argv) {
         assert!(text.contains("### Anchors"));
         assert!(text.contains("getopt") || text.contains("CLI") || text.contains("COLUMNS"));
     }
-
 
     #[test]
     fn mcp_response_summary_includes_function_profile_graph() {
@@ -8232,24 +8309,25 @@ int main(int argc, char **argv) {
     #[test]
     fn mcp_response_summary_truncates_very_large_text() {
         let huge = "A".repeat(30_000);
-        let response = CapabilityResponse::DecompileFunction(revx_core::DecompileFunctionResponse {
-            function_name: "big".to_string(),
-            address: 0x1,
-            pseudocode: Some(PseudocodeUnit {
-                language: "c".to_string(),
-                text: huge,
-                regions: Vec::new(),
-                region_artifact: None,
-                evidence_ids: Vec::new(),
+        let response =
+            CapabilityResponse::DecompileFunction(revx_core::DecompileFunctionResponse {
+                function_name: "big".to_string(),
+                address: 0x1,
+                pseudocode: Some(PseudocodeUnit {
+                    language: "c".to_string(),
+                    text: huge,
+                    regions: Vec::new(),
+                    region_artifact: None,
+                    evidence_ids: Vec::new(),
                     semantic_lattice: None,
                 }),
-            evidence_ids: Vec::new(),
-            artifact: None,
-            strategy_used: Default::default(),
-            cache_hit: false,
-            available_strategies: Vec::new(),
-            agent_brief: Default::default(),
-        });
+                evidence_ids: Vec::new(),
+                artifact: None,
+                strategy_used: Default::default(),
+                cache_hit: false,
+                available_strategies: Vec::new(),
+                agent_brief: Default::default(),
+            });
         let text = mcp_response_summary(&response);
         assert!(text.contains("...[truncated]"));
         assert!(text.chars().count() < 30_000);
@@ -8257,7 +8335,6 @@ int main(int argc, char **argv) {
 
     #[test]
     fn address_range_match_is_half_open() {
-
         let ranges = vec![(0x1000, 0x1100), (0x2000, 0x2100)];
         assert!(address_in_any_range(0x1000, &ranges));
         assert!(address_in_any_range(0x10ff, &ranges));
@@ -9021,7 +9098,7 @@ int main(int argc, char **argv) {
         let dir = tempdir().unwrap();
         let _ws = Workspace::init(dir.path(), "test", None).unwrap();
         let sample = dir.path().join("payload.bin");
-        std::fs::write(&sample, &[0x00, 0xaa, 0xbb, 0xcc, 0xdd, 0xff]).unwrap();
+        std::fs::write(&sample, [0x00, 0xaa, 0xbb, 0xcc, 0xdd, 0xff]).unwrap();
 
         let service = CapabilityService::new(dir.path().to_path_buf());
         service
@@ -9882,10 +9959,10 @@ print(json.dumps({
     fn registers_virtual_elf_object_as_binary() {
         let dir = tempdir().unwrap();
         let ws = Workspace::init(dir.path(), "test", None).unwrap();
-        let fixture = std::path::PathBuf::from("/Users/shiaho/Desktop/ida-mini-mcp/libtersafe.so");
-        if !fixture.exists() {
-            return;
-        }
+        let fixture = revx_testkit::all_cases()
+            .into_iter()
+            .find(|case| case.id == "elf_arm64")
+            .expect("elf_arm64 fixture");
 
         let archive = dir.path().join("payload.apk");
         {
@@ -9894,7 +9971,7 @@ print(json.dumps({
             let options = zip::write::SimpleFileOptions::default();
             use std::io::Write;
             zip.start_file("lib/arm64-v8a/libdemo.so", options).unwrap();
-            zip.write_all(&std::fs::read(&fixture).unwrap()).unwrap();
+            zip.write_all(&fixture.bytes).unwrap();
             zip.finish().unwrap();
         }
         let graph = revx_loader::identify_object_graph(&archive, 1, 16).unwrap();
@@ -9927,7 +10004,6 @@ print(json.dumps({
         }));
     }
 
-    
     #[test]
     fn auto_analyzes_native_from_apk_package_expand() {
         let dir = tempdir().unwrap();
@@ -9987,18 +10063,9 @@ print(json.dumps({
             .find(|analysis| analysis.analyzer == "auto_binary");
         if let Some(auto_binary) = auto_binary {
             assert!(
-                auto_binary.details["analyzed_count"]
-                    .as_u64()
-                    .unwrap_or(0)
-                    >= 1
-                    || auto_binary.details["skipped_count"]
-                        .as_u64()
-                        .unwrap_or(0)
-                        >= 1
-                    || auto_binary.details["candidate_count"]
-                        .as_u64()
-                        .unwrap_or(0)
-                        >= 1,
+                auto_binary.details["analyzed_count"].as_u64().unwrap_or(0) >= 1
+                    || auto_binary.details["skipped_count"].as_u64().unwrap_or(0) >= 1
+                    || auto_binary.details["candidate_count"].as_u64().unwrap_or(0) >= 1,
                 "details={}",
                 auto_binary.details
             );
@@ -10009,23 +10076,23 @@ print(json.dumps({
                 .iter()
                 .find(|analysis| analysis.analyzer == "auto_expand")
                 .expect("auto_expand");
-            let expanded = expand.details["expanded"].as_array().cloned().unwrap_or_default();
+            let expanded = expand.details["expanded"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
             assert!(
                 expanded.iter().any(|item| item
                     .get("binary_candidate")
                     .and_then(|value| value.as_bool())
                     .unwrap_or(false)
-                    || item
-                        .get("object_format")
-                        .and_then(|value| value.as_str())
-                        == Some("elf")),
+                    || item.get("object_format").and_then(|value| value.as_str()) == Some("elf")),
                 "details={}",
                 expand.details
             );
         }
     }
 
-#[test]
+    #[test]
     fn auto_analyzes_dug_native_binary_from_unknown_blob() {
         let dir = tempdir().unwrap();
         let ws = Workspace::init(dir.path(), "test", None).unwrap();
@@ -10065,10 +10132,7 @@ print(json.dumps({
             .find(|analysis| analysis.analyzer == "auto_binary")
             .expect("auto_binary analysis");
         assert!(
-            auto_binary.details["analyzed_count"]
-                .as_u64()
-                .unwrap_or(0)
-                >= 1,
+            auto_binary.details["analyzed_count"].as_u64().unwrap_or(0) >= 1,
             "details={}",
             auto_binary.details
         );
@@ -10083,36 +10147,20 @@ print(json.dumps({
     }
 
     fn sample_native_elf_blob() -> Vec<u8> {
-        let candidates = [
-            std::path::PathBuf::from("/Users/shiaho/Desktop/ida-mini-mcp/arm64-v8a/libmain.so"),
-            std::path::PathBuf::from("/Users/shiaho/Desktop/ida-mini-mcp/arm64-v8a/libgetjvm.so"),
-            std::path::PathBuf::from("/Users/shiaho/Desktop/ida-mini-mcp/arm64-v8a/libCrashAdapter.so"),
-            std::path::PathBuf::from("/Users/shiaho/Desktop/ida-mini-mcp/libtersafe.so"),
-        ];
-        for fixture in candidates {
-            if fixture.exists() {
-                return std::fs::read(fixture).unwrap();
-            }
-        }
-        let mut bytes = vec![0u8; 0x200];
-        bytes[0..4].copy_from_slice(b"\x7fELF");
-        bytes[4] = 2;
-        bytes[5] = 1;
-        bytes[6] = 1;
-        bytes[16] = 3;
-        bytes[18] = 0xb7;
-        bytes[19] = 0x00;
-        bytes
+        revx_testkit::all_cases()
+            .into_iter()
+            .find(|case| case.id == "elf_arm64")
+            .expect("elf_arm64 fixture")
+            .bytes
     }
-
     #[test]
     fn analyzes_virtual_elf_object_as_binary() {
         let dir = tempdir().unwrap();
         let ws = Workspace::init(dir.path(), "test", None).unwrap();
-        let fixture = std::path::PathBuf::from("/Users/shiaho/Desktop/ida-mini-mcp/libtersafe.so");
-        if !fixture.exists() {
-            return;
-        }
+        let fixture = revx_testkit::all_cases()
+            .into_iter()
+            .find(|case| case.id == "elf_arm64")
+            .expect("elf_arm64 fixture");
 
         let archive = dir.path().join("payload.apk");
         {
@@ -10121,7 +10169,7 @@ print(json.dumps({
             let options = zip::write::SimpleFileOptions::default();
             use std::io::Write;
             zip.start_file("lib/arm64-v8a/libdemo.so", options).unwrap();
-            zip.write_all(&std::fs::read(&fixture).unwrap()).unwrap();
+            zip.write_all(&fixture.bytes).unwrap();
             zip.finish().unwrap();
         }
         let graph = revx_loader::identify_object_graph(&archive, 1, 16).unwrap();
@@ -10164,7 +10212,6 @@ print(json.dumps({
         }));
     }
 
-
     #[test]
     fn analysis_brief_ranks_string_and_function_hits() {
         let dir = tempdir().unwrap();
@@ -10181,7 +10228,7 @@ print(json.dumps({
             regions: Vec::new(),
             region_artifact: None,
             evidence_ids: Vec::new(),
-                    semantic_lattice: None,
+            semantic_lattice: None,
         });
         bundle.functions.push(Function {
             name: "sub_3000".to_string(),
@@ -10255,7 +10302,10 @@ print(json.dumps({
             payload.hot_functions[0]
                 .quality_tags
                 .iter()
-                .any(|tag| tag == "named" || tag == "string_backed" || tag == "linear_pseudocode" || tag == "structured_pseudocode")
+                .any(|tag| tag == "named"
+                    || tag == "string_backed"
+                    || tag == "linear_pseudocode"
+                    || tag == "structured_pseudocode")
         );
         let text = mcp_response_summary(&CapabilityResponse::AnalysisBrief(payload));
         assert!(text.contains("# analysis_brief"));
@@ -10298,7 +10348,10 @@ print(json.dumps({
         };
         assert!(!profile.agent_brief.headline.is_empty());
         assert!(!profile.agent_brief.next_actions.is_empty());
-        assert_eq!(profile.agent_brief.next_actions[0].tool, "decompile_function");
+        assert_eq!(
+            profile.agent_brief.next_actions[0].tool,
+            "decompile_function"
+        );
         let profile_text = mcp_response_summary(&CapabilityResponse::FunctionProfile(profile));
         assert!(profile_text.contains("## Digest"));
         assert!(profile_text.contains("Agent Brief") || profile_text.contains("EXECUTE NOW"));
@@ -10373,8 +10426,8 @@ print(json.dumps({
                 }],
                 region_artifact: None,
                 evidence_ids: vec!["pseudo:401000".to_string()],
-                        semantic_lattice: None,
-        }),
+                semantic_lattice: None,
+            }),
             evidence_ids: vec![format!("fn:{binary_id}:401000")],
             warnings: Vec::new(),
         };
@@ -10453,5 +10506,3 @@ print(json.dumps({
         }
     }
 }
-
-
