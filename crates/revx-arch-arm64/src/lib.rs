@@ -1,7 +1,5 @@
 mod format_fast;
-use revx_core::{
-    Instruction, Reference, ReferenceKind, arm64_len_marker, intern_str_local, static_str,
-};
+use revx_core::{Instruction, Reference, ReferenceKind, intern_hex, intern_str_local, static_str};
 use std::collections::HashSet;
 use yaxpeax_arch::{Arch, Decoder as YaxDecoder, LengthedInstruction, U8Reader};
 use yaxpeax_arm::armv8::a64::{ARMv8, Opcode, Operand};
@@ -80,10 +78,9 @@ fn decode_inner_with_references(
                         }
                     }
                 };
-                let _ = inst_bytes;
                 instructions.push(Instruction {
                     address,
-                    bytes: arm64_len_marker(),
+                    bytes: intern_hex(inst_bytes),
                     text: text_arc,
                 });
 

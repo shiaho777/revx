@@ -1254,12 +1254,17 @@ async fn cmd_daemon_start() -> Result<()> {
 fn cmd_daemon_status() -> Result<()> {
     let workspace_dir = workspace_parent_from_cwd()?;
     let socket = socket_path(&workspace_dir);
+    let pid_file = revx_daemon::pid_path(&workspace_dir);
+    let pid = std::fs::read_to_string(&pid_file)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u32>().ok());
     println!(
         "{}",
         serde_json::json!({
             "workspace_root": workspace_dir.display().to_string(),
             "ipc_path": socket.display().to_string(),
             "available": socket.exists(),
+            "pid": pid,
         })
     );
     Ok(())
@@ -1268,14 +1273,11 @@ fn cmd_daemon_status() -> Result<()> {
 fn cmd_daemon_stop() -> Result<()> {
     let workspace_dir = workspace_parent_from_cwd()?;
     let socket = socket_path(&workspace_dir);
-    if socket.exists() {
-        fs::remove_file(&socket)
-            .with_context(|| format!("failed to remove {}", socket.display()))?;
-        println!("Removed daemon socket {}", socket.display());
-    } else {
-        println!("No daemon socket present at {}", socket.display());
+    if !socket.exists() && !revx_daemon::pid_path(&workspace_dir).exists() {
+        println!("No daemon present at {}", socket.display());
+        return Ok(());
     }
-    Ok(())
+    revx_daemon::stop_daemon(&workspace_dir)
 }
 
 async fn cmd_mcp_serve(workspace: Option<PathBuf>, init: bool) -> Result<()> {
