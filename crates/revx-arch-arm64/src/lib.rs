@@ -1,8 +1,10 @@
 mod format_fast;
-use revx_core::{Instruction, Reference, ReferenceKind, arm64_len_marker, intern_str_local, static_str};
+use revx_core::{
+    Instruction, Reference, ReferenceKind, arm64_len_marker, intern_str_local, static_str,
+};
 use std::collections::HashSet;
 use yaxpeax_arch::{Arch, Decoder as YaxDecoder, LengthedInstruction, U8Reader};
-use yaxpeax_arm::armv8::a64::{ARMv8, Operand, Opcode};
+use yaxpeax_arm::armv8::a64::{ARMv8, Opcode, Operand};
 
 const DEFAULT_MAX_INSTRUCTIONS_PER_FUNCTION: usize = 2048;
 
@@ -49,7 +51,7 @@ fn decode_inner_with_references(
                 let Ok(inst) = decoder.decode(&mut reader) else {
                     break;
                 };
-                let len: u64 = inst.len().to_const() as u64;
+                let len: u64 = inst.len().to_const();
                 if len == 0 {
                     break;
                 }
@@ -144,38 +146,75 @@ fn extract_references_from_decoded(
     match opcode {
         Opcode::BL => {
             if let Some(target) = pcoffset_target(decoded, pc) {
-                out.push(Reference { from: pc, to: target, kind: ReferenceKind::Call });
+                out.push(Reference {
+                    from: pc,
+                    to: target,
+                    kind: ReferenceKind::Call,
+                });
             }
         }
         Opcode::BLR => {
             if let Some(reg) = first_register(decoded) {
-                out.push(Reference { from: pc, to: reg as u64, kind: ReferenceKind::IndirectCall });
+                out.push(Reference {
+                    from: pc,
+                    to: reg as u64,
+                    kind: ReferenceKind::IndirectCall,
+                });
             }
         }
         Opcode::B => {
             if let Some(target) = pcoffset_target(decoded, pc) {
-                out.push(Reference { from: pc, to: target, kind: ReferenceKind::Jump });
+                out.push(Reference {
+                    from: pc,
+                    to: target,
+                    kind: ReferenceKind::Jump,
+                });
             }
         }
         Opcode::BR => {
             if let Some(reg) = first_register(decoded) {
-                out.push(Reference { from: pc, to: reg as u64, kind: ReferenceKind::IndirectJump });
+                out.push(Reference {
+                    from: pc,
+                    to: reg as u64,
+                    kind: ReferenceKind::IndirectJump,
+                });
             }
         }
         Opcode::Bcc(_) | Opcode::CBZ | Opcode::CBNZ | Opcode::TBZ | Opcode::TBNZ => {
             if let Some(target) = pcoffset_target(decoded, pc) {
-                out.push(Reference { from: pc, to: target, kind: ReferenceKind::BranchTrue });
-                out.push(Reference { from: pc, to: next, kind: ReferenceKind::BranchFalse });
+                out.push(Reference {
+                    from: pc,
+                    to: target,
+                    kind: ReferenceKind::BranchTrue,
+                });
+                out.push(Reference {
+                    from: pc,
+                    to: next,
+                    kind: ReferenceKind::BranchFalse,
+                });
             }
         }
         Opcode::ADR | Opcode::ADRP => {
             if let Some(target) = pcoffset_target(decoded, pc) {
-                out.push(Reference { from: pc, to: target, kind: ReferenceKind::Data });
+                out.push(Reference {
+                    from: pc,
+                    to: target,
+                    kind: ReferenceKind::Data,
+                });
             }
         }
-        Opcode::LDR | Opcode::LDRB | Opcode::LDRH | Opcode::LDRSB | Opcode::LDRSH | Opcode::LDRSW => {
+        Opcode::LDR
+        | Opcode::LDRB
+        | Opcode::LDRH
+        | Opcode::LDRSB
+        | Opcode::LDRSH
+        | Opcode::LDRSW => {
             if let Some(target) = pcoffset_target(decoded, pc) {
-                out.push(Reference { from: pc, to: target, kind: ReferenceKind::Data });
+                out.push(Reference {
+                    from: pc,
+                    to: target,
+                    kind: ReferenceKind::Data,
+                });
             }
         }
         _ => {}
@@ -209,8 +248,14 @@ fn first_register(decoded: &yaxpeax_arm::armv8::a64::Instruction) -> Option<u16>
 fn is_block_terminal(opcode: &Opcode) -> bool {
     matches!(
         opcode,
-        Opcode::RET | Opcode::B | Opcode::BR | Opcode::Bcc(_)
-        | Opcode::CBZ | Opcode::CBNZ | Opcode::TBZ | Opcode::TBNZ
+        Opcode::RET
+            | Opcode::B
+            | Opcode::BR
+            | Opcode::Bcc(_)
+            | Opcode::CBZ
+            | Opcode::CBNZ
+            | Opcode::TBZ
+            | Opcode::TBNZ
     )
 }
 
@@ -268,8 +313,10 @@ mod tests {
             text: std::sync::Arc::from("bl $+0x20"),
         }]);
         assert!(
-            refs.iter().any(|r| r.from == 0x1000 && r.to == 0x1020 && r.kind == "call"),
-            "expected BL call reference, got: {:?}", refs
+            refs.iter()
+                .any(|r| r.from == 0x1000 && r.to == 0x1020 && r.kind == "call"),
+            "expected BL call reference, got: {:?}",
+            refs
         );
     }
 
@@ -283,8 +330,10 @@ mod tests {
             text: std::sync::Arc::from("b $-0x8"),
         }]);
         assert!(
-            refs.iter().any(|r| r.from == 0x1008 && r.to == 0x1000 && r.kind == "jump"),
-            "expected B jump reference, got: {:?}", refs
+            refs.iter()
+                .any(|r| r.from == 0x1008 && r.to == 0x1000 && r.kind == "jump"),
+            "expected B jump reference, got: {:?}",
+            refs
         );
     }
 
@@ -297,12 +346,16 @@ mod tests {
             text: std::sync::Arc::from("b.eq $+0x10"),
         }]);
         assert!(
-            refs.iter().any(|r| r.from == 0x1000 && r.to == 0x1010 && r.kind == "branch_true"),
-            "expected branch_true, got: {:?}", refs
+            refs.iter()
+                .any(|r| r.from == 0x1000 && r.to == 0x1010 && r.kind == "branch_true"),
+            "expected branch_true, got: {:?}",
+            refs
         );
         assert!(
-            refs.iter().any(|r| r.from == 0x1000 && r.to == 0x1004 && r.kind == "branch_false"),
-            "expected branch_false (fallthrough), got: {:?}", refs
+            refs.iter()
+                .any(|r| r.from == 0x1000 && r.to == 0x1004 && r.kind == "branch_false"),
+            "expected branch_false (fallthrough), got: {:?}",
+            refs
         );
     }
 
@@ -344,7 +397,8 @@ mod tests {
         }]);
         assert!(
             refs.iter().any(|r| r.from == 0x1000 && r.kind == "data"),
-            "expected ADRP data reference, got: {:?}", refs
+            "expected ADRP data reference, got: {:?}",
+            refs
         );
     }
 }

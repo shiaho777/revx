@@ -30,6 +30,8 @@ xz2 = { workspace = true, optional = true }
 zip = { workspace = true, optional = true }
 
 [dev-dependencies]
+revx-testkit = { path = "../revx-testkit" }
+tar.workspace = true
 tempfile.workspace = true
 bzip2.workspace = true
 crc32fast.workspace = true

@@ -7,7 +7,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
-use crate::{handle_mcp_jsonrpc, CapabilityService};
+use crate::{CapabilityService, handle_mcp_jsonrpc};
 
 #[derive(Clone)]
 struct HttpState {
@@ -112,16 +112,28 @@ async fn handle_connection(mut stream: TcpStream, state: HttpState) -> Result<()
     }
 
     if !authorized(&state, &headers) {
-        write_response(&mut stream, 401, "application/json", br#"{"error":"unauthorized"}"#, None)
-            .await?;
+        write_response(
+            &mut stream,
+            401,
+            "application/json",
+            br#"{"error":"unauthorized"}"#,
+            None,
+        )
+        .await?;
         return Ok(());
     }
 
     let path_norm = normalize_mcp_path(path);
     match (method.as_str(), path_norm.as_str()) {
         ("GET", "/health") | ("GET", "/mcp/health") => {
-            write_response(&mut stream, 200, "application/json", br#"{"ok":true,"server":"revx"}"#, None)
-                .await?;
+            write_response(
+                &mut stream,
+                200,
+                "application/json",
+                br#"{"ok":true,"server":"revx"}"#,
+                None,
+            )
+            .await?;
         }
         ("GET", "/sse") | ("GET", "/mcp/sse") => {
             handle_sse_open(&mut stream, &state).await?;
@@ -169,8 +181,14 @@ async fn handle_connection(mut stream: TcpStream, state: HttpState) -> Result<()
             }
         }
         _ => {
-            write_response(&mut stream, 404, "application/json", br#"{"error":"not found"}"#, None)
-                .await?;
+            write_response(
+                &mut stream,
+                404,
+                "application/json",
+                br#"{"error":"not found"}"#,
+                None,
+            )
+            .await?;
         }
     }
     Ok(())
@@ -312,11 +330,7 @@ fn normalize_mcp_path(path: &str) -> String {
     } else {
         p.to_string()
     };
-    if p.is_empty() {
-        "/".to_string()
-    } else {
-        p
-    }
+    if p.is_empty() { "/".to_string() } else { p }
 }
 
 fn split_path_query(path_q: &str) -> (&str, &str) {

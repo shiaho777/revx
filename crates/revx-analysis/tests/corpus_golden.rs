@@ -8,21 +8,15 @@ fn sample_paths() -> Vec<PathBuf> {
     let mut out = Vec::new();
     if let Ok(dir) = std::env::var("REVX_CORPUS_DIR") {
         let root = PathBuf::from(dir);
-        if root.is_dir() {
-            if let Ok(rd) = std::fs::read_dir(root) {
-                for e in rd.flatten() {
-                    if e.path().is_file() {
-                        out.push(e.path());
-                    }
+        if root.is_dir()
+            && let Ok(rd) = std::fs::read_dir(root)
+        {
+            for e in rd.flatten() {
+                if e.path().is_file() {
+                    out.push(e.path());
                 }
             }
         }
-    }
-    let local = PathBuf::from(
-        "/Users/shiaho/Downloads/AndMX/app/build/intermediates/cxx/Debug/5e11264s/obj/arm64-v8a/libandmxpty.so",
-    );
-    if local.exists() {
-        out.push(local);
     }
     out.sort();
     out.dedup();
@@ -39,6 +33,7 @@ fn fingerprint_function(name: &str, address: u64, text: &str, region_count: usiz
 fn golden_strategy_fingerprints_are_stable() {
     let paths = sample_paths();
     if paths.is_empty() {
+        eprintln!("skipping: REVX_CORPUS_DIR not set or no binaries available");
         return;
     }
     let mut snapshots: BTreeMap<String, String> = BTreeMap::new();
@@ -65,7 +60,8 @@ fn golden_strategy_fingerprints_are_stable() {
             DecompileStrategy::Hotblock,
         ] {
             let used = resolve_decompile_strategy(strategy, true, false, insts);
-            let unit = recompose_function_pseudocode(function, bundle.survey.summary.architecture, used);
+            let unit =
+                recompose_function_pseudocode(function, bundle.survey.summary.architecture, used);
             let key = format!(
                 "{}:{}:{:?}",
                 path.file_name().and_then(|s| s.to_str()).unwrap_or("bin"),
@@ -89,7 +85,8 @@ fn golden_strategy_fingerprints_are_stable() {
             DecompileStrategy::Hotblock,
         ] {
             let used = resolve_decompile_strategy(strategy, true, false, insts);
-            let unit = recompose_function_pseudocode(function, bundle.survey.summary.architecture, used);
+            let unit =
+                recompose_function_pseudocode(function, bundle.survey.summary.architecture, used);
             let key = format!(
                 "{}:{}:{:?}",
                 path.file_name().and_then(|s| s.to_str()).unwrap_or("bin"),
@@ -121,7 +118,6 @@ fn strategy_auto_prefers_cache_when_present() {
     let used = resolve_decompile_strategy(DecompileStrategy::Auto, true, false, 10_000);
     assert_eq!(used, DecompileStrategy::Hotblock);
 }
-
 
 #[test]
 fn fast_path_emits_block_addresses() {

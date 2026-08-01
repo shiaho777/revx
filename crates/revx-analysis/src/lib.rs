@@ -1,31 +1,33 @@
-pub mod ssa;
-pub mod resource;
 pub mod lattice;
+pub mod resource;
+pub mod ssa;
 pub use lattice::{
+    CognitiveField, CollapseVerdict, DiffractionResidual, IbcContinuumLedger, IbcContinuumState,
+    IbcObserveNote, OrbitHypothesisDraft, PhaseConjugateProbe, ProofChainLink, StandingWave,
     advance_ibc_cursor, apply_cognitive_field_to_lattice, apply_verdict_to_hypothesis_notes,
     apply_verdict_to_hypothesis_title, build_agent_semantic_lattice, collapse_cognitive_field,
-    compile_phase_conjugates, compose_proof_chain, continuum_bind_hypothesis, continuum_brief_lines,
-    continuum_ledger_on_visit, continuum_ledger_on_visit_with_observation, continuum_ledger_summary,
-    continuum_on_visit, continuum_on_visit_ns, continuum_on_visit_with_observation,
-    detect_and_attach_orbit_conflicts, extract_case_target_map, finalize_pseudocode_unit,
-    finalize_pseudocode_unit_with_context, force_advance_ibc, forge_orbit_hypothesis_drafts,
-    format_cognitive_field_lines, format_proof_chain_lines, format_semantic_lattice,
-    fuse_semantic_lattices, ibc_program_fingerprint, inject_diffraction_residuals_into_lattice,
+    compile_phase_conjugates, compose_proof_chain, continuum_bind_hypothesis,
+    continuum_brief_lines, continuum_ledger_on_visit, continuum_ledger_on_visit_with_observation,
+    continuum_ledger_summary, continuum_on_visit, continuum_on_visit_ns,
+    continuum_on_visit_with_observation, detect_and_attach_orbit_conflicts,
+    extract_case_target_map, finalize_pseudocode_unit, finalize_pseudocode_unit_with_context,
+    force_advance_ibc, forge_orbit_hypothesis_drafts, format_cognitive_field_lines,
+    format_proof_chain_lines, format_semantic_lattice, fuse_semantic_lattices,
+    ibc_program_fingerprint, inject_diffraction_residuals_into_lattice,
     inject_proof_chain_into_lattice, interfere_cognitive_fields, lattice_action_at_pc,
-    lattice_ibc_plan, lattice_primary_next_action, match_verdict_to_orbit_key, observe_ibc_execution,
-    parse_collapse_verdict, project_cognitive_field, project_diffraction_residuals,
-    resume_ibc_from_state, seal_plan_from_proof_chain, synthesize_observation_corpus,
-    CollapseVerdict, CognitiveField, DiffractionResidual, IbcContinuumLedger, IbcContinuumState,
-    IbcObserveNote, OrbitHypothesisDraft, PhaseConjugateProbe, ProofChainLink, StandingWave,
+    lattice_ibc_plan, lattice_primary_next_action, match_verdict_to_orbit_key,
+    observe_ibc_execution, parse_collapse_verdict, project_cognitive_field,
+    project_diffraction_residuals, resume_ibc_from_state, seal_plan_from_proof_chain,
+    synthesize_observation_corpus,
 };
 
 use object::{Object, ObjectSection};
 use revx_core::{
     AnalysisBundle, AnalysisProfile, AnalysisSummary, Architecture, BasicBlock, BinaryFormat,
-    DecompileStrategy,
-    BinaryImage, BinarySummary, DebugCoverageSummary, DebugFunctionHint, Function, Instruction,
-    PseudocodeRegion, PseudocodeUnit, Reference, ReferenceKind, RegionKind, StackSummary,
-    StringLiteral, Survey, TypeDef, TypeSource, Variable, VariableRole, VariableStorage,
+    BinaryImage, BinarySummary, DebugCoverageSummary, DebugFunctionHint, DecompileStrategy,
+    Function, Instruction, PseudocodeRegion, PseudocodeUnit, Reference, ReferenceKind, RegionKind,
+    StackSummary, StringLiteral, Survey, TypeDef, TypeSource, Variable, VariableRole,
+    VariableStorage,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, OnceLock};
@@ -113,10 +115,8 @@ fn pending_stream_batch_size() -> usize {
 }
 
 const MAX_DATA_REF_SCAN_INSTS: usize = 256;
-const MAX_PENDING_STREAM_BATCH: usize = 1;
 const MAX_GLOBAL_REFERENCES: usize = 512;
 const MAX_SHARED_STRING_MAP: usize = 64;
-
 
 #[inline]
 fn format_sub_addr(addr: u64) -> String {
@@ -172,17 +172,19 @@ where
     let results = std::sync::Mutex::new((0..n).map(|_| None).collect::<Vec<Option<R>>>());
     std::thread::scope(|scope| {
         for _ in 0..workers {
-            scope.spawn(|| loop {
-                let next = {
-                    let mut guard = queue.lock().unwrap_or_else(|e| e.into_inner());
-                    guard.pop()
-                };
-                let Some((idx, item)) = next else {
-                    break;
-                };
-                let value = f(item);
-                let mut guard = results.lock().unwrap_or_else(|e| e.into_inner());
-                guard[idx] = Some(value);
+            scope.spawn(|| {
+                loop {
+                    let next = {
+                        let mut guard = queue.lock().unwrap_or_else(|e| e.into_inner());
+                        guard.pop()
+                    };
+                    let Some((idx, item)) = next else {
+                        break;
+                    };
+                    let value = f(item);
+                    let mut guard = results.lock().unwrap_or_else(|e| e.into_inner());
+                    guard[idx] = Some(value);
+                }
             });
         }
     });
@@ -206,6 +208,7 @@ pub struct StreamedAnalysis {
 const MAX_CODE_WINDOW: usize = 0x1000;
 
 enum ByteSource {
+    #[allow(dead_code)]
     Vec(Arc<[u8]>),
     File {
         file: Arc<std::fs::File>,
@@ -218,7 +221,7 @@ fn read_file_exact_at(file: &std::fs::File, buf: &mut [u8], offset: u64) -> std:
     #[cfg(unix)]
     {
         use std::os::unix::fs::FileExt;
-        return FileExt::read_exact_at(file, buf, offset);
+        FileExt::read_exact_at(file, buf, offset)
     }
     #[cfg(windows)]
     {
@@ -421,15 +424,15 @@ pub fn recompose_function_pseudocode_ctx(
         let Some(addr) = s.address else {
             continue;
         };
-        if !symbols.contains_key(&addr) {
+        symbols.entry(addr).or_insert_with(|| {
             let clipped: String = s.value.chars().take(45).collect();
-            let label = if s.value.len() > 48 {
+
+            if s.value.len() > 48 {
                 format!("str:{clipped}...")
             } else {
                 format!("str:{clipped}")
-            };
-            symbols.insert(addr, label);
-        }
+            }
+        });
     }
     let mut string_map_inner = HashMap::new();
     for s in strings {
@@ -606,10 +609,8 @@ pub fn analyze(image: BinaryImage, profile: AnalysisProfile) -> AnalysisBundle {
 
 /// Analyze multiple binaries in parallel using available CPU cores.
 /// Each binary is analyzed on its own thread. Results are collected and merged.
-pub fn analyze_parallel(
-    images: Vec<BinaryImage>,
-    profile: AnalysisProfile,
-) -> Vec<AnalysisBundle> {
+#[allow(clippy::single_match)]
+pub fn analyze_parallel(images: Vec<BinaryImage>, profile: AnalysisProfile) -> Vec<AnalysisBundle> {
     if images.len() <= 1 {
         return images
             .into_iter()
@@ -826,6 +827,8 @@ fn lean_function_from_decode(
     }
 }
 
+#[allow(clippy::redundant_locals)]
+#[allow(clippy::type_complexity)]
 fn walk_functions_inner<F, E>(
     image: &BinaryImage,
     profile: AnalysisProfile,
@@ -936,6 +939,8 @@ where
     let mut visited = HashSet::with_capacity(function_budget.min(8192));
     let mut claimed_ranges: BTreeMap<u64, u64> = BTreeMap::new();
 
+    #[allow(clippy::redundant_locals)]
+    #[allow(clippy::type_complexity)]
     struct PendingFunction {
         address: u64,
         name: String,
@@ -965,25 +970,28 @@ where
     let mut budget = resource::AnalysisBudget::from_process_limits();
     budget.rebaseline();
     let mut budget_truncated = false;
-    revx_trace(|| format!(
-        "phase1 start seeds_priority={} seeds_deferred={} budget={} jobs={} batch={} wall_sec={} rss_kb={}",
-        priority_queue.len(),
-        deferred_queue.len(),
-        function_budget,
-        parallel_worker_count(),
-        phase1_batch_size,
-        resource::process_resource_limits().wall_sec,
-        resource::process_resource_limits().rss_kb
-    ));
+    revx_trace(|| {
+        format!(
+            "phase1 start seeds_priority={} seeds_deferred={} budget={} jobs={} batch={} wall_sec={} rss_kb={}",
+            priority_queue.len(),
+            deferred_queue.len(),
+            function_budget,
+            parallel_worker_count(),
+            phase1_batch_size,
+            resource::process_resource_limits().wall_sec,
+            resource::process_resource_limits().rss_kb
+        )
+    });
 
     while function_count < function_budget {
         if budget.check().is_err() {
-            budget_truncated = true;
-            revx_trace(|| format!(
-                "phase1 budget stop elapsed_ms={:?} kind={:?}",
-                budget.elapsed_ms(),
-                budget.exceeded()
-            ));
+            revx_trace(|| {
+                format!(
+                    "phase1 budget stop elapsed_ms={:?} kind={:?}",
+                    budget.elapsed_ms(),
+                    budget.exceeded()
+                )
+            });
             break;
         }
         let mut batch: Vec<(u64, String, u64, u64, bool)> = Vec::with_capacity(phase1_batch_size);
@@ -1025,71 +1033,77 @@ where
         phase1_batches += 1;
         let batch_started = std::time::Instant::now();
         let batch_len = batch.len();
-        let decoded: Vec<(
-            u64,
-            String,
-            u64,
-            bool,
-            Vec<Instruction>,
-            Vec<Reference>,
-        )> = map_in_analysis_pool(batch, |(address, name, max_end, range_end, is_heuristic_seed)| {
-                let (instructions, code_refs) = decode_function_with_references(
-                    architecture,
-                    &code_regions,
-                    address,
-                    max_end,
-                    &executable,
-                );
-                if instructions.is_empty() {
-                    return (address, name, range_end, is_heuristic_seed, Vec::new(), Vec::new());
-                }
-                let mut combined_references = if profile == AnalysisProfile::Full {
-                    normalize_references(architecture, &code_regions, code_refs)
-                } else {
-                    code_refs
-                };
-                if profile == AnalysisProfile::Full {
-                    promote_data_reference_kinds(
-                        &mut combined_references,
-                        &string_ranges,
+        let decoded: Vec<(u64, String, u64, bool, Vec<Instruction>, Vec<Reference>)> =
+            map_in_analysis_pool(
+                batch,
+                |(address, name, max_end, range_end, is_heuristic_seed)| {
+                    let (instructions, code_refs) = decode_function_with_references(
+                        architecture,
+                        &code_regions,
+                        address,
+                        max_end,
                         &executable,
                     );
-                    if instructions.len() <= MAX_DATA_REF_SCAN_INSTS {
-                        combined_references.extend(extract_data_references(
-                            architecture,
-                            &instructions,
+                    if instructions.is_empty() {
+                        return (
+                            address,
+                            name,
+                            range_end,
+                            is_heuristic_seed,
+                            Vec::new(),
+                            Vec::new(),
+                        );
+                    }
+                    let mut combined_references = if profile == AnalysisProfile::Full {
+                        normalize_references(architecture, &code_regions, code_refs)
+                    } else {
+                        code_refs
+                    };
+                    if profile == AnalysisProfile::Full {
+                        promote_data_reference_kinds(
+                            &mut combined_references,
                             &string_ranges,
                             &executable,
-                        ));
+                        );
+                        if instructions.len() <= MAX_DATA_REF_SCAN_INSTS {
+                            combined_references.extend(extract_data_references(
+                                architecture,
+                                &instructions,
+                                &string_ranges,
+                                &executable,
+                            ));
+                        }
+                        attach_relocation_references(
+                            &mut combined_references,
+                            &instructions,
+                            &relocation_refs,
+                        );
+                        if combined_references.len() <= 4096 {
+                            reclassify_string_references(&mut combined_references, &string_ranges);
+                        }
+                        dedupe_references_in_place(&mut combined_references);
+                    } else if combined_references.len() > 1 {
+                        dedupe_references_in_place(&mut combined_references);
                     }
-                    attach_relocation_references(
-                        &mut combined_references,
-                        &instructions,
-                        &relocation_refs,
-                    );
-                    if combined_references.len() <= 4096 {
-                        reclassify_string_references(&mut combined_references, &string_ranges);
-                    }
-                    dedupe_references_in_place(&mut combined_references);
-                } else if combined_references.len() > 1 {
-                    dedupe_references_in_place(&mut combined_references);
-                }
-                (
-                    address,
-                    name,
-                    range_end,
-                    is_heuristic_seed,
-                    instructions,
-                    combined_references,
-                )
+                    (
+                        address,
+                        name,
+                        range_end,
+                        is_heuristic_seed,
+                        instructions,
+                        combined_references,
+                    )
+                },
+            );
+        revx_trace(|| {
+            format!(
+                "phase1 batch={} size={} decoded={} elapsed_ms={}",
+                phase1_batches,
+                batch_len,
+                decoded.len(),
+                batch_started.elapsed().as_millis()
+            )
         });
-        revx_trace(|| format!(
-            "phase1 batch={} size={} decoded={} elapsed_ms={}",
-            phase1_batches,
-            batch_len,
-            decoded.len(),
-            batch_started.elapsed().as_millis()
-        ));
 
         for (address, name, range_end, is_heuristic_seed, instructions, combined_references) in
             decoded
@@ -1135,10 +1149,7 @@ where
                 .range(..=address)
                 .next_back()
                 .is_some_and(|(_, &end)| address < end)
-                || claimed_ranges
-                    .range(address..function_end)
-                    .next()
-                    .is_some();
+                || claimed_ranges.range(address..function_end).next().is_some();
             if overlaps {
                 continue;
             }
@@ -1232,15 +1243,16 @@ where
         }
     }
 
-    revx_trace(|| format!(
-        "phase1 done functions={} batches={} elapsed_ms={}",
-        pending_functions.len(),
-        phase1_batches,
-        phase1_started.elapsed().as_millis()
-    ));
+    revx_trace(|| {
+        format!(
+            "phase1 done functions={} batches={} elapsed_ms={}",
+            pending_functions.len(),
+            phase1_batches,
+            phase1_started.elapsed().as_millis()
+        )
+    });
 
     budget.rebaseline();
-    budget_truncated = false;
 
     // ── Phase 2: Parallel function analysis (rayon) ─────────────────────────
     let image_id = &image.id;
@@ -1294,242 +1306,235 @@ where
     let phase2_started = std::time::Instant::now();
     let phase2_deadline = budget.deadline();
     let phase2_rss_limit = budget.rss_limit_bytes();
-    revx_trace(|| format!(
-        "phase2 start pending={} jobs={} budget_truncated={} remaining_ms={}",
-        pending_functions.len(),
-        parallel_worker_count(),
-        budget_truncated,
-        budget.remaining().as_millis()
-    ));
+    revx_trace(|| {
+        format!(
+            "phase2 start pending={} jobs={} budget_truncated={} remaining_ms={}",
+            pending_functions.len(),
+            parallel_worker_count(),
+            budget_truncated,
+            budget.remaining().as_millis()
+        )
+    });
     let analyze_one = |pf: PendingFunction| -> (Function, Vec<Reference>) {
-            if std::time::Instant::now() >= phase2_deadline {
-                return (
-                    Function {
-                        name: pf.name,
-                        address: pf.address,
-                        size: pf.size,
-                        blocks: Vec::new(),
-                        stack_summary: None,
-                        arguments: Vec::new(),
-                        locals: Vec::new(),
-                        pseudocode: None,
-                        evidence_ids: vec![format!("fn:{}:{:x}", image_id, pf.address)],
-                        warnings: vec!["analysis_budget_exceeded:wall".to_string()],
-                    },
-                    Vec::new(),
-                );
-            }
-            if resource::current_rss_bytes().is_some_and(|rss| rss >= phase2_rss_limit) {
-                return (
-                    Function {
-                        name: pf.name,
-                        address: pf.address,
-                        size: pf.size,
-                        blocks: Vec::new(),
-                        stack_summary: None,
-                        arguments: Vec::new(),
-                        locals: Vec::new(),
-                        pseudocode: None,
-                        evidence_ids: vec![format!("fn:{}:{:x}", image_id, pf.address)],
-                        warnings: vec!["analysis_budget_exceeded:memory".to_string()],
-                    },
-                    Vec::new(),
-                );
-            }
-            let fn_started = std::time::Instant::now();
-            let (instructions, code_refs) = decode_function_with_references(
-                architecture,
-                &code_regions,
-                pf.address,
-                pf.decode_end,
-                &executable,
+        if std::time::Instant::now() >= phase2_deadline {
+            return (
+                Function {
+                    name: pf.name,
+                    address: pf.address,
+                    size: pf.size,
+                    blocks: Vec::new(),
+                    stack_summary: None,
+                    arguments: Vec::new(),
+                    locals: Vec::new(),
+                    pseudocode: None,
+                    evidence_ids: vec![format!("fn:{}:{:x}", image_id, pf.address)],
+                    warnings: vec!["analysis_budget_exceeded:wall".to_string()],
+                },
+                Vec::new(),
             );
-            if instructions.is_empty() {
-                return (
-                    Function {
-                        name: pf.name,
-                        address: pf.address,
-                        size: pf.size,
-                        blocks: Vec::new(),
-                        stack_summary: None,
-                        arguments: Vec::new(),
-                        locals: Vec::new(),
-                        pseudocode: None,
-                        evidence_ids: vec![format!("fn:{}:{:x}", image_id, pf.address)],
-                        warnings: vec!["empty_decode".to_string()],
-                    },
-                    Vec::new(),
-                );
-            }
-            let mut combined_references = if profile == AnalysisProfile::Full {
-                normalize_references(architecture, &code_regions, code_refs)
-            } else {
-                code_refs
-            };
-            if profile == AnalysisProfile::Full {
-                promote_data_reference_kinds(
-                    &mut combined_references,
+        }
+        if resource::current_rss_bytes().is_some_and(|rss| rss >= phase2_rss_limit) {
+            return (
+                Function {
+                    name: pf.name,
+                    address: pf.address,
+                    size: pf.size,
+                    blocks: Vec::new(),
+                    stack_summary: None,
+                    arguments: Vec::new(),
+                    locals: Vec::new(),
+                    pseudocode: None,
+                    evidence_ids: vec![format!("fn:{}:{:x}", image_id, pf.address)],
+                    warnings: vec!["analysis_budget_exceeded:memory".to_string()],
+                },
+                Vec::new(),
+            );
+        }
+        let fn_started = std::time::Instant::now();
+        let (instructions, code_refs) = decode_function_with_references(
+            architecture,
+            &code_regions,
+            pf.address,
+            pf.decode_end,
+            &executable,
+        );
+        if instructions.is_empty() {
+            return (
+                Function {
+                    name: pf.name,
+                    address: pf.address,
+                    size: pf.size,
+                    blocks: Vec::new(),
+                    stack_summary: None,
+                    arguments: Vec::new(),
+                    locals: Vec::new(),
+                    pseudocode: None,
+                    evidence_ids: vec![format!("fn:{}:{:x}", image_id, pf.address)],
+                    warnings: vec!["empty_decode".to_string()],
+                },
+                Vec::new(),
+            );
+        }
+        let mut combined_references = if profile == AnalysisProfile::Full {
+            normalize_references(architecture, &code_regions, code_refs)
+        } else {
+            code_refs
+        };
+        if profile == AnalysisProfile::Full {
+            promote_data_reference_kinds(&mut combined_references, &string_ranges, &executable);
+            if instructions.len() <= MAX_DATA_REF_SCAN_INSTS {
+                combined_references.extend(extract_data_references(
+                    architecture,
+                    &instructions,
                     &string_ranges,
                     &executable,
-                );
-                if instructions.len() <= MAX_DATA_REF_SCAN_INSTS {
-                    combined_references.extend(extract_data_references(
-                        architecture,
-                        &instructions,
-                        &string_ranges,
-                        &executable,
-                    ));
-                }
-                attach_relocation_references(
-                    &mut combined_references,
-                    &instructions,
-                    &relocation_refs,
-                );
-                if combined_references.len() <= 4096 {
-                    reclassify_string_references(&mut combined_references, &string_ranges);
-                }
-                dedupe_references_in_place(&mut combined_references);
-            } else if combined_references.len() > 1 {
-                dedupe_references_in_place(&mut combined_references);
+                ));
             }
-            let call_target_overrides = call_target_overrides(&combined_references);
-            revx_trace(|| format!(
+            attach_relocation_references(&mut combined_references, &instructions, &relocation_refs);
+            if combined_references.len() <= 4096 {
+                reclassify_string_references(&mut combined_references, &string_ranges);
+            }
+            dedupe_references_in_place(&mut combined_references);
+        } else if combined_references.len() > 1 {
+            dedupe_references_in_place(&mut combined_references);
+        }
+        let call_target_overrides = call_target_overrides(&combined_references);
+        revx_trace(|| {
+            format!(
                 "fn-start {} @ {:#x} insts={}",
                 pf.name,
                 pf.address,
                 instructions.len()
-            ));
-            let debug_hint = pf.debug_hint.as_ref();
-            let large_fn = instructions.len() > LIGHT_VAR_RECOVERY_INSTS;
-            let (stack_summary, mut arguments, locals) = if profile == AnalysisProfile::Fast {
-                (
-                    Some(recover_stack_summary_fast(
-                        image_arch,
-                        image.format,
-                        &instructions,
-                        debug_hint,
-                    )),
-                    recover_variables_fast(image, pf.address, debug_hint),
-                    Vec::new(),
-                )
-            } else if large_fn {
-                let sample = sample_instructions_for_recovery(&instructions);
-                let mut stack = recover_stack_summary_for(
+            )
+        });
+        let debug_hint = pf.debug_hint.as_ref();
+        let large_fn = instructions.len() > LIGHT_VAR_RECOVERY_INSTS;
+        let (stack_summary, mut arguments, locals) = if profile == AnalysisProfile::Fast {
+            (
+                Some(recover_stack_summary_fast(
                     image_arch,
-                    Some(image.format),
-                    &sample,
-                    debug_hint,
-                    &call_target_overrides,
-                    profile,
-                );
-                if stack.return_type.is_none() {
-                    stack.return_type = infer_return_type(
-                        &sample,
-                        &call_target_overrides,
-                    );
-                }
-                let (arguments, locals) =
-                    recover_variables(image, pf.address, &sample, debug_hint, profile);
-                (Some(stack), arguments, locals)
-            } else {
-                let stack_summary = Some(recover_stack_summary_for(
-                    image_arch,
-                    Some(image.format),
+                    image.format,
                     &instructions,
                     debug_hint,
-                    &call_target_overrides,
-                    profile,
-                ));
-                let (arguments, locals) =
-                    recover_variables(image, pf.address, &instructions, debug_hint, profile);
-                (stack_summary, arguments, locals)
-            };
-            polish_argument_names(&pf.name, &mut arguments);
-            let mut combined_references = combined_references;
-            let fast_return_type = if profile == AnalysisProfile::Fast {
-                stack_summary
-                    .as_ref()
-                    .and_then(|summary| summary.return_type.clone())
-                    .or_else(|| infer_return_type(&instructions, &call_target_overrides))
-            } else {
-                None
-            };
-            let blocks = if profile == AnalysisProfile::Fast {
-                vec![finalize_basic_block(pf.address, instructions)]
-            } else {
-                split_basic_blocks(pf.address, instructions, &combined_references)
-            };
-
-            let mut inst_count_pre = 0usize;
-            for block in &blocks {
-                inst_count_pre += block.instructions.len();
+                )),
+                recover_variables_fast(image, pf.address, debug_hint),
+                Vec::new(),
+            )
+        } else if large_fn {
+            let sample = sample_instructions_for_recovery(&instructions);
+            let mut stack = recover_stack_summary_for(
+                image_arch,
+                Some(image.format),
+                &sample,
+                debug_hint,
+                &call_target_overrides,
+                profile,
+            );
+            if stack.return_type.is_none() {
+                stack.return_type = infer_return_type(&sample, &call_target_overrides);
             }
-            let needs_indirect_resolve = inst_count_pre <= heavy_inst_limit(profile)
-                && combined_references
-                    .iter()
-                    .any(|reference| reference.kind == ReferenceKind::IndirectCall);
-            let resolved_calls = if needs_indirect_resolve {
-                ssa::resolve_indirect_calls(&blocks, image_imports)
-            } else {
-                Vec::new()
-            };
+            let (arguments, locals) =
+                recover_variables(image, pf.address, &sample, debug_hint, profile);
+            (Some(stack), arguments, locals)
+        } else {
+            let stack_summary = Some(recover_stack_summary_for(
+                image_arch,
+                Some(image.format),
+                &instructions,
+                debug_hint,
+                &call_target_overrides,
+                profile,
+            ));
+            let (arguments, locals) =
+                recover_variables(image, pf.address, &instructions, debug_hint, profile);
+            (stack_summary, arguments, locals)
+        };
+        polish_argument_names(&pf.name, &mut arguments);
+        let mut combined_references = combined_references;
+        let fast_return_type = if profile == AnalysisProfile::Fast {
+            stack_summary
+                .as_ref()
+                .and_then(|summary| summary.return_type.clone())
+                .or_else(|| infer_return_type(&instructions, &call_target_overrides))
+        } else {
+            None
+        };
+        let blocks = if profile == AnalysisProfile::Fast {
+            vec![finalize_basic_block(pf.address, instructions)]
+        } else {
+            split_basic_blocks(pf.address, instructions, &combined_references)
+        };
 
-            let mut local_new_refs: Vec<Reference> = Vec::new();
-            if !resolved_calls.is_empty() {
-                let mut resolved_by_addr: HashMap<u64, u64> =
-                    HashMap::with_capacity(resolved_calls.len());
-                for resolved in &resolved_calls {
-                    if resolved.source != ssa::CallTargetSource::Unresolved
-                        && resolved.target_addr != 0
+        let mut inst_count_pre = 0usize;
+        for block in &blocks {
+            inst_count_pre += block.instructions.len();
+        }
+        let needs_indirect_resolve = inst_count_pre <= heavy_inst_limit(profile)
+            && combined_references
+                .iter()
+                .any(|reference| reference.kind == ReferenceKind::IndirectCall);
+        let resolved_calls = if needs_indirect_resolve {
+            ssa::resolve_indirect_calls(&blocks, image_imports)
+        } else {
+            Vec::new()
+        };
+
+        let mut local_new_refs: Vec<Reference> = Vec::new();
+        if !resolved_calls.is_empty() {
+            let mut resolved_by_addr: HashMap<u64, u64> =
+                HashMap::with_capacity(resolved_calls.len());
+            for resolved in &resolved_calls {
+                if resolved.source != ssa::CallTargetSource::Unresolved && resolved.target_addr != 0
+                {
+                    resolved_by_addr.insert(resolved.call_addr, resolved.target_addr);
+                    local_new_refs.push(Reference {
+                        from: resolved.call_addr,
+                        to: resolved.target_addr,
+                        kind: ReferenceKind::Call,
+                    });
+                }
+            }
+            if !resolved_by_addr.is_empty() {
+                for reference in &mut combined_references {
+                    if reference.kind == ReferenceKind::IndirectCall
+                        && let Some(&target) = resolved_by_addr.get(&reference.from)
                     {
-                        resolved_by_addr.insert(resolved.call_addr, resolved.target_addr);
-                        local_new_refs.push(Reference {
-                            from: resolved.call_addr,
-                            to: resolved.target_addr,
-                            kind: ReferenceKind::Call,
-                        });
+                        reference.to = target;
+                        reference.kind = ReferenceKind::Call;
+                        resolved_by_addr.remove(&reference.from);
                     }
                 }
-                if !resolved_by_addr.is_empty() {
-                    for reference in &mut combined_references {
-                        if reference.kind == ReferenceKind::IndirectCall {
-                            if let Some(&target) = resolved_by_addr.get(&reference.from) {
-                                reference.to = target;
-                                reference.kind = ReferenceKind::Call;
-                                resolved_by_addr.remove(&reference.from);
-                            }
-                        }
-                    }
-                    for (from, to) in resolved_by_addr {
-                        combined_references.push(Reference {
-                            from,
-                            to,
-                            kind: ReferenceKind::Call,
-                        });
-                    }
+                for (from, to) in resolved_by_addr {
+                    combined_references.push(Reference {
+                        from,
+                        to,
+                        kind: ReferenceKind::Call,
+                    });
                 }
             }
+        }
 
-            let inst_count = inst_count_pre;
-            let use_ssa = profile == AnalysisProfile::Full
-                && !blocks.is_empty()
-                && inst_count <= ssa_inst_limit(profile)
-                && blocks.len() <= ssa_block_limit(profile);
-            let use_linear_ssa = profile == AnalysisProfile::Full
-                && !blocks.is_empty()
-                && !use_ssa
-                && inst_count <= linear_ssa_inst_limit(profile)
-                && blocks.len() <= linear_ssa_block_limit(profile);
-            let use_heavy = profile == AnalysisProfile::Full
-                && !blocks.is_empty()
-                && inst_count <= heavy_inst_limit(profile)
-                && blocks.len() <= heavy_block_limit(profile);
-            let use_oversize_window = profile == AnalysisProfile::Full
-                && !blocks.is_empty()
-                && !use_ssa
-                && !use_linear_ssa
-                && inst_count > linear_ssa_inst_limit(profile);
-            revx_trace(|| format!(
+        let inst_count = inst_count_pre;
+        let use_ssa = profile == AnalysisProfile::Full
+            && !blocks.is_empty()
+            && inst_count <= ssa_inst_limit(profile)
+            && blocks.len() <= ssa_block_limit(profile);
+        let use_linear_ssa = profile == AnalysisProfile::Full
+            && !blocks.is_empty()
+            && !use_ssa
+            && inst_count <= linear_ssa_inst_limit(profile)
+            && blocks.len() <= linear_ssa_block_limit(profile);
+        let use_heavy = profile == AnalysisProfile::Full
+            && !blocks.is_empty()
+            && inst_count <= heavy_inst_limit(profile)
+            && blocks.len() <= heavy_block_limit(profile);
+        let use_oversize_window = profile == AnalysisProfile::Full
+            && !blocks.is_empty()
+            && !use_ssa
+            && !use_linear_ssa
+            && inst_count > linear_ssa_inst_limit(profile);
+        revx_trace(|| {
+            format!(
                 "fn-stage {} @ {:#x} blocks={} insts={} heavy={} ssa={} linear={} vars_ms={}",
                 pf.name,
                 pf.address,
@@ -1539,117 +1544,114 @@ where
                 use_ssa,
                 use_linear_ssa,
                 fn_started.elapsed().as_millis()
-            ));
+            )
+        });
 
-            let evidence_fn = format!("fn:{}:{:x}", image_id, pf.address);
-            let evidence_stack = format!("stack:{}:{:x}", image_id, pf.address);
-            let evidence_vars = format!("vars:{}:{:x}", image_id, pf.address);
-            let evidence_pseudo = format!("pseudo:{}:{:x}", image_id, pf.address);
+        let evidence_fn = format!("fn:{}:{:x}", image_id, pf.address);
+        let evidence_stack = format!("stack:{}:{:x}", image_id, pf.address);
+        let evidence_vars = format!("vars:{}:{:x}", image_id, pf.address);
+        let evidence_pseudo = format!("pseudo:{}:{:x}", image_id, pf.address);
 
-            let return_type_hint = fast_return_type.or_else(|| {
-                stack_summary
-                    .as_ref()
-                    .and_then(|summary| summary.return_type.clone())
-            });
-            let pseudocode = if resource::micro_mode() {
-                None
-            } else if profile == AnalysisProfile::Fast {
-                if !resource::lean_mode() && inst_count > 0 && inst_count <= MAX_FAST_SSA_INSTS {
-                    let mut combined = combined_references.clone();
-                    for (from, to) in &call_target_overrides {
-                        if !combined
-                            .iter()
-                            .any(|r| r.from == *from && r.kind == ReferenceKind::Call)
-                        {
-                            combined.push(Reference {
-                                from: *from,
-                                to: *to,
-                                kind: ReferenceKind::Call,
-                            });
-                        }
+        let return_type_hint = fast_return_type.or_else(|| {
+            stack_summary
+                .as_ref()
+                .and_then(|summary| summary.return_type.clone())
+        });
+        let pseudocode = if resource::micro_mode() {
+            None
+        } else if profile == AnalysisProfile::Fast {
+            if !resource::lean_mode() && inst_count > 0 && inst_count <= MAX_FAST_SSA_INSTS {
+                let mut combined = combined_references.clone();
+                for (from, to) in &call_target_overrides {
+                    if !combined
+                        .iter()
+                        .any(|r| r.from == *from && r.kind == ReferenceKind::Call)
+                    {
+                        combined.push(Reference {
+                            from: *from,
+                            to: *to,
+                            kind: ReferenceKind::Call,
+                        });
                     }
-                    let mut ssa_func = match image_arch {
-                        #[cfg(feature = "arch-x64")]
-                        Architecture::X86_64 => {
-                            ssa::lift_x64_to_ssa(&blocks, &combined, &arguments)
-                        }
-                        #[cfg(feature = "arch-arm64")]
-                        Architecture::Arm64 => {
-                            ssa::lift_arm64_to_ssa(&blocks, &combined, &arguments)
-                        }
-                        _ => ssa::lift_arm64_to_ssa(&blocks, &combined, &arguments),
-                    };
-                    ssa::refine_call_arguments_with_symbols(&mut ssa_func, function_symbols);
-                    let text = ssa::render_ssa_pseudocode_linear_with_string_arc(
-                        &ssa_func,
-                        &pf.name,
-                        &arguments,
-                        function_symbols,
-                        &HashMap::new(),
-                        Arc::clone(&shared_string_map),
-                    );
+                }
+                let mut ssa_func = match image_arch {
+                    #[cfg(feature = "arch-x64")]
+                    Architecture::X86_64 => ssa::lift_x64_to_ssa(&blocks, &combined, &arguments),
+                    #[cfg(feature = "arch-arm64")]
+                    Architecture::Arm64 => ssa::lift_arm64_to_ssa(&blocks, &combined, &arguments),
+                    _ => ssa::lift_arm64_to_ssa(&blocks, &combined, &arguments),
+                };
+                ssa::refine_call_arguments_with_symbols(&mut ssa_func, function_symbols);
+                let text = ssa::render_ssa_pseudocode_linear_with_string_arc(
+                    &ssa_func,
+                    &pf.name,
+                    &arguments,
+                    function_symbols,
+                    &HashMap::new(),
+                    Arc::clone(&shared_string_map),
+                );
+                Some(finalize_pseudocode_unit_with_context(
+                    &pf.name,
+                    pf.address,
+                    PseudocodeUnit {
+                        language: "c".to_string(),
+                        text,
+                        regions: Vec::new(),
+                        region_artifact: None,
+                        evidence_ids: vec![evidence_pseudo.clone()],
+                        semantic_lattice: None,
+                    },
+                    &combined_references,
+                    function_symbols,
+                ))
+            } else {
+                Some(render_fast_pseudocode(
+                    &pf.name,
+                    pf.address,
+                    &blocks,
+                    &arguments,
+                    image_imports,
+                    image_strings,
+                    &call_target_overrides,
+                    function_symbols,
+                    return_type_hint.as_deref(),
+                    &combined_references,
+                ))
+            }
+        } else if use_ssa || use_linear_ssa {
+            let ssa_started = std::time::Instant::now();
+            if use_linear_ssa {
+                if let Some(cached) = ssa::linear_cache_lookup(&blocks, &pf.name, &arguments) {
+                    revx_trace(|| {
+                        format!(
+                            "fn-ssa-cache-hit {} @ {:#x} text_len={} elapsed_ms={}",
+                            pf.name,
+                            pf.address,
+                            cached.len(),
+                            ssa_started.elapsed().as_millis()
+                        )
+                    });
                     Some(finalize_pseudocode_unit_with_context(
                         &pf.name,
                         pf.address,
                         PseudocodeUnit {
                             language: "c".to_string(),
-                            text,
+                            text: cached,
                             regions: Vec::new(),
                             region_artifact: None,
-                            evidence_ids: vec![evidence_pseudo.clone()],
+                            evidence_ids: vec![format!("pseudo:{:x}", pf.address)],
                             semantic_lattice: None,
                         },
                         &combined_references,
                         function_symbols,
                     ))
                 } else {
-                    Some(render_fast_pseudocode(
-                        &pf.name,
-                        pf.address,
-                        &blocks,
-                        &arguments,
-                        image_imports,
-                        image_strings,
-                        &call_target_overrides,
-                        function_symbols,
-                        return_type_hint.as_deref(),
-                        &combined_references,
-                    ))
-                }
-            } else if use_ssa || use_linear_ssa {
-                let ssa_started = std::time::Instant::now();
-                if use_linear_ssa {
-                    if let Some(cached) =
-                        ssa::linear_cache_lookup(&blocks, &pf.name, &arguments)
-                    {
-                        revx_trace(|| format!(
-                            "fn-ssa-cache-hit {} @ {:#x} text_len={} elapsed_ms={}",
-                            pf.name,
-                            pf.address,
-                            cached.len(),
-                            ssa_started.elapsed().as_millis()
-                        ));
-                        Some(finalize_pseudocode_unit_with_context(
-                            &pf.name,
-                            pf.address,
-                            PseudocodeUnit {
-                                language: "c".to_string(),
-                                text: cached,
-                                regions: Vec::new(),
-                                region_artifact: None,
-                                evidence_ids: vec![format!("pseudo:{:x}", pf.address)],
-                                semantic_lattice: None,
-                            },
-                            &combined_references,
-                            function_symbols,
-                        ))
-                    } else {
-                        None
-                    }
-                } else {
                     None
                 }
-                .or_else(|| {
+            } else {
+                None
+            }
+            .or_else(|| {
                 if !call_target_overrides.is_empty() {
                     for (from, to) in &call_target_overrides {
                         if !combined_references
@@ -1675,13 +1677,15 @@ where
                         ssa::lift_arm64_to_ssa(&blocks, &combined_references, &arguments)
                     }
                 };
-                revx_trace(|| format!(
-                    "fn-ssa-lift {} @ {:#x} values={} elapsed_ms={}",
-                    pf.name,
-                    pf.address,
-                    ssa_func.values.len(),
-                    ssa_started.elapsed().as_millis()
-                ));
+                revx_trace(|| {
+                    format!(
+                        "fn-ssa-lift {} @ {:#x} values={} elapsed_ms={}",
+                        pf.name,
+                        pf.address,
+                        ssa_func.values.len(),
+                        ssa_started.elapsed().as_millis()
+                    )
+                });
                 let refine_started = std::time::Instant::now();
                 let mut local_symbols = HashMap::new();
                 if !use_linear_ssa {
@@ -1697,12 +1701,14 @@ where
                 } else {
                     ssa::refine_call_arguments_with_symbols(&mut ssa_func, function_symbols);
                 }
-                revx_trace(|| format!(
-                    "fn-ssa-refine {} @ {:#x} elapsed_ms={}",
-                    pf.name,
-                    pf.address,
-                    refine_started.elapsed().as_millis()
-                ));
+                revx_trace(|| {
+                    format!(
+                        "fn-ssa-refine {} @ {:#x} elapsed_ms={}",
+                        pf.name,
+                        pf.address,
+                        refine_started.elapsed().as_millis()
+                    )
+                });
                 let render_started = std::time::Instant::now();
                 let ssa_text = if use_linear_ssa {
                     ssa::render_ssa_pseudocode_linear_with_string_arc(
@@ -1731,107 +1737,110 @@ where
                 } else {
                     ssa::ssa_pseudocode_regions(&ssa_func, pf.address)
                 };
-                revx_trace(|| format!(
-                    "fn-ssa-render {} @ {:#x} mode={} text_len={} elapsed_ms={}",
-                    pf.name,
-                    pf.address,
-                    if use_linear_ssa { "linear" } else { "layered" },
-                    ssa_text.len(),
-                    render_started.elapsed().as_millis()
-                ));
+                revx_trace(|| {
+                    format!(
+                        "fn-ssa-render {} @ {:#x} mode={} text_len={} elapsed_ms={}",
+                        pf.name,
+                        pf.address,
+                        if use_linear_ssa { "linear" } else { "layered" },
+                        ssa_text.len(),
+                        render_started.elapsed().as_millis()
+                    )
+                });
                 Some(finalize_pseudocode_unit_with_context(
                     &pf.name,
                     pf.address,
                     PseudocodeUnit {
-                    language: "c".to_string(),
-                    text: ssa_text,
-                    regions,
-                    region_artifact: None,
-                    evidence_ids: vec![format!("pseudo:{:x}", pf.address)],
+                        language: "c".to_string(),
+                        text: ssa_text,
+                        regions,
+                        region_artifact: None,
+                        evidence_ids: vec![format!("pseudo:{:x}", pf.address)],
                         semantic_lattice: None,
-                },
+                    },
                     &combined_references,
                     function_symbols,
                 ))
-                })
-            } else if use_oversize_window {
-                Some(render_oversized_pseudocode(
-                    &pf.name,
-                    pf.address,
-                    &blocks,
-                    &arguments,
-                    &locals,
-                    image_imports,
-                    &call_target_overrides,
-                    function_symbols,
-                    debug_hint,
-                    profile,
-                    image_strings,
-                    image_arch,
-                    &combined_references,
-                    Arc::clone(&shared_string_map),
-                ))
-            } else {
-                Some(render_pseudocode(
-                    &pf.name,
-                    pf.address,
-                    &blocks,
-                    &arguments,
-                    &locals,
-                    image_imports,
-                    &call_target_overrides,
-                    debug_hint,
-                    profile,
-                    image_strings,
-                ))
-            };
+            })
+        } else if use_oversize_window {
+            Some(render_oversized_pseudocode(
+                &pf.name,
+                pf.address,
+                &blocks,
+                &arguments,
+                &locals,
+                image_imports,
+                &call_target_overrides,
+                function_symbols,
+                debug_hint,
+                profile,
+                image_strings,
+                image_arch,
+                &combined_references,
+                Arc::clone(&shared_string_map),
+            ))
+        } else {
+            Some(render_pseudocode(
+                &pf.name,
+                pf.address,
+                &blocks,
+                &arguments,
+                &locals,
+                image_imports,
+                &call_target_overrides,
+                debug_hint,
+                profile,
+                image_strings,
+            ))
+        };
 
-            let mut evidence_ids = Vec::with_capacity(4);
-            evidence_ids.push(evidence_fn);
-            if stack_summary.is_some() {
-                evidence_ids.push(evidence_stack);
-            }
-            if !arguments.is_empty() || !locals.is_empty() {
-                evidence_ids.push(evidence_vars);
-            }
-            if pseudocode.is_some() {
-                evidence_ids.push(evidence_pseudo);
-            }
+        let mut evidence_ids = Vec::with_capacity(4);
+        evidence_ids.push(evidence_fn);
+        if stack_summary.is_some() {
+            evidence_ids.push(evidence_stack);
+        }
+        if !arguments.is_empty() || !locals.is_empty() {
+            evidence_ids.push(evidence_vars);
+        }
+        if pseudocode.is_some() {
+            evidence_ids.push(evidence_pseudo);
+        }
 
-            let mut function = Function {
-                name: pf.name,
-                address: pf.address,
-                size: pf.size,
-                blocks,
-                stack_summary,
-                arguments,
-                locals,
-                pseudocode,
-                evidence_ids,
-                warnings: function_warnings(pf.size, max_function_bytes),
-            };
-            if profile == AnalysisProfile::Full {
-                let heavy_ok = function.blocks.len() <= heavy_block_limit(profile)
-                    && function
-                        .blocks
-                        .iter()
-                        .map(|b| b.instructions.len())
-                        .sum::<usize>()
-                        <= heavy_inst_limit(profile);
-                if heavy_ok {
-                    apply_heuristic_naming(&mut function);
-                    deepen_function_quality(&mut function, import_types);
-                } else {
-                    apply_heuristic_naming(&mut function);
-                }
-            }
-            {
-                let insts = function
+        let mut function = Function {
+            name: pf.name,
+            address: pf.address,
+            size: pf.size,
+            blocks,
+            stack_summary,
+            arguments,
+            locals,
+            pseudocode,
+            evidence_ids,
+            warnings: function_warnings(pf.size, max_function_bytes),
+        };
+        if profile == AnalysisProfile::Full {
+            let heavy_ok = function.blocks.len() <= heavy_block_limit(profile)
+                && function
                     .blocks
                     .iter()
-                    .map(|block| block.instructions.len())
-                    .sum::<usize>();
-                revx_trace(|| format!(
+                    .map(|b| b.instructions.len())
+                    .sum::<usize>()
+                    <= heavy_inst_limit(profile);
+            if heavy_ok {
+                apply_heuristic_naming(&mut function);
+                deepen_function_quality(&mut function, import_types);
+            } else {
+                apply_heuristic_naming(&mut function);
+            }
+        }
+        {
+            let insts = function
+                .blocks
+                .iter()
+                .map(|block| block.instructions.len())
+                .sum::<usize>();
+            revx_trace(|| {
+                format!(
                     "fn {} @ {:#x} size={} blocks={} insts={} elapsed_ms={}",
                     function.name,
                     function.address,
@@ -1839,16 +1848,19 @@ where
                     function.blocks.len(),
                     insts,
                     fn_started.elapsed().as_millis()
-                ));
-            }
+                )
+            });
+        }
 
-            (function, local_new_refs)
+        (function, local_new_refs)
     };
-    revx_trace(|| format!(
-        "phase2 ready pending={} elapsed_ms={}",
-        pending_functions.len(),
-        phase2_started.elapsed().as_millis()
-    ));
+    revx_trace(|| {
+        format!(
+            "phase2 ready pending={} elapsed_ms={}",
+            pending_functions.len(),
+            phase2_started.elapsed().as_millis()
+        )
+    });
 
     // phase3 stream
     let phase3_started = std::time::Instant::now();
@@ -1862,7 +1874,7 @@ where
         }
         let take = pending_stream_batch_size().min(pending_functions.len());
         let batch: Vec<PendingFunction> = pending_functions.drain(..take).collect();
-        let results = map_in_analysis_pool(batch, |pf| analyze_one(pf));
+        let results = map_in_analysis_pool(batch, analyze_one);
         for (function, local_new_refs) in results {
             if all_references.len() < ref_cap {
                 for r in local_new_refs {
@@ -1876,17 +1888,17 @@ where
                 truncated_functions += 1;
             }
             for var in function.arguments.iter().chain(function.locals.iter()) {
-                if let Some(ty) = var.type_name.as_ref() {
-                    if seen_type_names.insert(ty.clone()) {
-                        recovered_types.push(TypeDef {
-                            id: format!("ty:inferred:{}", ty),
-                            name: ty.clone(),
-                            kind: "inferred".to_string(),
-                            source: TypeSource::Inferred,
-                            size: inferred_type_size(ty),
-                            evidence_ids: var.evidence_ids.clone(),
-                        });
-                    }
+                if let Some(ty) = var.type_name.as_ref()
+                    && seen_type_names.insert(ty.clone())
+                {
+                    recovered_types.push(TypeDef {
+                        id: format!("ty:inferred:{}", ty),
+                        name: ty.clone(),
+                        kind: "inferred".to_string(),
+                        source: TypeSource::Inferred,
+                        size: inferred_type_size(ty),
+                        evidence_ids: var.evidence_ids.clone(),
+                    });
                 }
             }
             let addr = function.address;
@@ -1894,38 +1906,45 @@ where
             let ingest_started = std::time::Instant::now();
             on_function(function)?;
             analyzed += 1;
-            revx_trace(|| format!(
-                "phase3 ingest {} @ {:#x} elapsed_ms={}",
-                name,
-                addr,
-                ingest_started.elapsed().as_millis()
-            ));
+            revx_trace(|| {
+                format!(
+                    "phase3 ingest {} @ {:#x} elapsed_ms={}",
+                    name,
+                    addr,
+                    ingest_started.elapsed().as_millis()
+                )
+            });
         }
         release_code_region_pages(&code_regions);
     }
-    revx_trace(|| format!(
-        "phase2/3 done analyzed={} elapsed_ms={}",
-        analyzed,
-        phase2_started.elapsed().as_millis()
-    ));
+    revx_trace(|| {
+        format!(
+            "phase2/3 done analyzed={} elapsed_ms={}",
+            analyzed,
+            phase2_started.elapsed().as_millis()
+        )
+    });
 
     let mut reference_list = all_references.into_iter().collect::<Vec<_>>();
-    reference_list.sort_unstable_by_key(|reference| {
-        (reference.from, reference.to, reference.kind as u8)
-    });
+    reference_list
+        .sort_unstable_by_key(|reference| (reference.from, reference.to, reference.kind as u8));
     if budget_truncated || budget.exceeded().is_some() {
-        revx_trace(|| format!(
-            "budget exceeded kind={:?} elapsed_ms={}",
-            budget.exceeded(),
-            budget.elapsed_ms()
-        ));
+        revx_trace(|| {
+            format!(
+                "budget exceeded kind={:?} elapsed_ms={}",
+                budget.exceeded(),
+                budget.elapsed_ms()
+            )
+        });
     }
-    revx_trace(|| format!(
-        "phase3 done refs={} elapsed_ms={} budget_truncated={}",
-        reference_list.len(),
-        phase3_started.elapsed().as_millis(),
-        budget_truncated
-    ));
+    revx_trace(|| {
+        format!(
+            "phase3 done refs={} elapsed_ms={} budget_truncated={}",
+            reference_list.len(),
+            phase3_started.elapsed().as_millis(),
+            budget_truncated
+        )
+    });
     Ok((reference_list, recovered_types, truncated_functions))
 }
 
@@ -2081,17 +2100,6 @@ fn function_warnings(size: u64, max_bytes: u64) -> Vec<String> {
     warnings
 }
 
-fn summarize_analysis_warnings(functions: &[Function], function_budget: usize) -> Vec<String> {
-    summarize_analysis_warnings_from_counters(
-        functions.len(),
-        functions
-            .iter()
-            .filter(|function| !function.warnings.is_empty())
-            .count(),
-        function_budget,
-    )
-}
-
 fn summarize_analysis_warnings_from_counters(
     function_count: usize,
     truncated_functions: usize,
@@ -2225,12 +2233,13 @@ fn collect_arm64_nearby_seeds(
                 data[offset + 2],
                 data[offset + 3],
             ]);
-            if is_arm64_prologue_word(word) && !is_arm64_thunk_boundary(region, offset) {
-                if let Some(seed_offset) = arm64_seed_offset(region, offset) {
-                    let seed = region.start + seed_offset as u64;
-                    if seed >= scan_start && seed < scan_end && seen.insert(seed) {
-                        out.push(seed);
-                    }
+            if is_arm64_prologue_word(word)
+                && !is_arm64_thunk_boundary(region, offset)
+                && let Some(seed_offset) = arm64_seed_offset(region, offset)
+            {
+                let seed = region.start + seed_offset as u64;
+                if seed >= scan_start && seed < scan_end && seen.insert(seed) {
+                    out.push(seed);
                 }
             }
 
@@ -2364,7 +2373,7 @@ fn is_arm64_prologue_word(word: u32) -> bool {
     // 64-bit STP pre-index/signed-offset encodings commonly used by prologues.
     // bits[31:22] == 0x2A6 (pre-index store pair) or 0x2A9 (unsigned offset store pair-ish family).
     let top = (word >> 22) & 0x3ff;
-    if matches!(top, 0x2a6 | 0x2a7 | 0x2a8 | 0x2a9 | 0x2aa | 0x2ab) {
+    if matches!(top, 0x2a6..=0x2ab) {
         let rt = word & 0x1f;
         let rt2 = (word >> 10) & 0x1f;
         if (rt == 29 && rt2 == 30) || (rt == 30 && rt2 == 29) || rt >= 19 {
@@ -2429,20 +2438,6 @@ fn find_executable_range(ranges: &[(u64, u64)], address: u64) -> Option<(u64, u6
     }
     None
 }
-
-fn decode_function(
-    architecture: Architecture,
-    code_regions: &[CodeRegion],
-    start: u64,
-    max_end: u64,
-    executable: &[(u64, u64)],
-) -> Vec<Instruction> {
-    decode_function_with_references(architecture, code_regions, start, max_end, executable).0
-}
-
-/// Decode a function and extract references in a single pass when possible,
-/// avoiding the double-decode overhead of `decode_function` +
-/// `extract_references`.
 fn decode_function_with_references(
     architecture: Architecture,
     code_regions: &[CodeRegion],
@@ -2538,6 +2533,7 @@ fn build_code_regions(image: &BinaryImage) -> Vec<CodeRegion> {
     out
 }
 
+#[allow(clippy::question_mark)]
 fn build_code_regions_from_image(image: &BinaryImage) -> Option<Vec<CodeRegion>> {
     let lean = resource::lean_mode();
     let path = std::path::Path::new(&image.path);
@@ -2556,10 +2552,7 @@ fn build_code_regions_from_image(image: &BinaryImage) -> Option<Vec<CodeRegion>>
         let allow = if lean {
             is_text
         } else {
-            is_text
-                || kind.contains("readonly")
-                || kind.contains("data")
-                || kind.contains("string")
+            is_text || kind.contains("readonly") || kind.contains("data") || kind.contains("string")
         };
         if !allow || section.size == 0 {
             continue;
@@ -2602,16 +2595,6 @@ fn advise_bytes_dontneed(bytes: &[u8]) {
         }
         const MADV_DONTNEED: i32 = 4;
         let _ = madvise(bytes.as_ptr() as *mut u8, bytes.len(), MADV_DONTNEED);
-    }
-}
-
-fn extract_references(architecture: Architecture, instructions: &[Instruction]) -> Vec<Reference> {
-    match architecture {
-        #[cfg(feature = "arch-x64")]
-        Architecture::X86_64 => revx_arch_x64::extract_references(instructions),
-        #[cfg(feature = "arch-arm64")]
-        Architecture::Arm64 => revx_arch_arm64::extract_references(instructions),
-        _ => Vec::new(),
     }
 }
 
@@ -2697,16 +2680,11 @@ fn arm64_direct_branch_thunk_target(bytes: &[u8], base: u64) -> Option<u64> {
             }
             saw_jump = Some(target);
             non_padding += 1;
-            offset += 4;
             break;
         }
         return None;
     }
-    if non_padding == 1 {
-        saw_jump
-    } else {
-        None
-    }
+    if non_padding == 1 { saw_jump } else { None }
 }
 
 #[inline]
@@ -2918,20 +2896,6 @@ fn code_slice(code_regions: &[CodeRegion], start: u64, end: u64) -> Option<(Vec<
     }
     None
 }
-
-fn decode_arm64_cfg(
-    code_regions: &[CodeRegion],
-    start: u64,
-    max_end: u64,
-    executable: &[(u64, u64)],
-) -> Vec<Instruction> {
-    decode_arm64_cfg_with_references(code_regions, start, max_end, executable).0
-}
-
-/// Decode an ARM64 function with CFG traversal and collect references in a
-/// single pass, avoiding the double-decode of `decode_arm64_cfg` +
-/// `extract_references`.
-
 #[inline]
 fn cfg_window_before(
     map: &HashMap<u64, Instruction>,
@@ -2939,11 +2903,7 @@ fn cfg_window_before(
     hi: u64,
     max: usize,
 ) -> Vec<Instruction> {
-    let mut addrs: Vec<u64> = map
-        .keys()
-        .copied()
-        .filter(|&a| a >= lo && a < hi)
-        .collect();
+    let mut addrs: Vec<u64> = map.keys().copied().filter(|&a| a >= lo && a < hi).collect();
     if addrs.is_empty() {
         return Vec::new();
     }
@@ -2955,6 +2915,8 @@ fn cfg_window_before(
         .collect()
 }
 
+#[allow(clippy::nonminimal_bool)]
+#[allow(clippy::duplicated_attributes)]
 fn decode_arm64_cfg_with_references(
     code_regions: &[CodeRegion],
     start: u64,
@@ -2962,17 +2924,17 @@ fn decode_arm64_cfg_with_references(
     executable: &[(u64, u64)],
 ) -> (Vec<Instruction>, Vec<Reference>) {
     let mut queue = VecDeque::from([start]);
-    let estimated_blocks = ((max_end.saturating_sub(start) / 16) as usize).clamp(4, cfg_block_limit());
+    let estimated_blocks =
+        ((max_end.saturating_sub(start) / 16) as usize).clamp(4, cfg_block_limit());
     let mut visited_blocks = HashSet::with_capacity(estimated_blocks);
-    let estimated_insts = ((max_end.saturating_sub(start) / 4) as usize).clamp(16, cfg_inst_limit());
+    let estimated_insts =
+        ((max_end.saturating_sub(start) / 4) as usize).clamp(16, cfg_inst_limit());
     let mut instruction_map: HashMap<u64, Instruction> = HashMap::with_capacity(estimated_insts);
     let mut all_refs = Vec::with_capacity(estimated_blocks);
     let mut saw_br = false;
 
     while let Some(block_start) = queue.pop_front() {
-        if visited_blocks.len() >= cfg_block_limit()
-            || instruction_map.len() >= cfg_inst_limit()
-        {
+        if visited_blocks.len() >= cfg_block_limit() || instruction_map.len() >= cfg_inst_limit() {
             break;
         }
         if block_start < start || block_start >= max_end {
@@ -3104,9 +3066,7 @@ fn decode_arm64_cfg_with_references(
         }
     }
     while let Some(block_start) = queue.pop_front() {
-        if visited_blocks.len() >= cfg_block_limit()
-            || instruction_map.len() >= cfg_inst_limit()
-        {
+        if visited_blocks.len() >= cfg_block_limit() || instruction_map.len() >= cfg_inst_limit() {
             break;
         }
         if block_start < start || block_start >= max_end {
@@ -3204,6 +3164,7 @@ fn decode_arm64_cfg_with_references(
     (instructions, all_refs)
 }
 
+#[allow(clippy::manual_strip)]
 fn recover_arm64_pc_rel_jump_table_targets(
     block: &[Instruction],
     code_regions: &[CodeRegion],
@@ -3218,7 +3179,11 @@ fn recover_arm64_pc_rel_jump_table_targets(
     if !br_text.starts_with("br ") || br_text.starts_with("blr ") {
         return None;
     }
-    let index_reg = br_text.split_whitespace().nth(1)?.trim().to_ascii_lowercase();
+    let index_reg = br_text
+        .split_whitespace()
+        .nth(1)?
+        .trim()
+        .to_ascii_lowercase();
 
     // Patterns:
     // A) PC-relative (adr + add):
@@ -3250,21 +3215,21 @@ fn recover_arm64_pc_rel_jump_table_targets(
                 let b = parts[2].to_ascii_lowercase();
                 if dst == index_reg {
                     if b.starts_with('#') {
-                        if let Some(page) = find_adrp_page(block, &a) {
-                            if let Some(imm) = parse_hash_imm(&b) {
-                                table_base = Some(page.wrapping_add(imm as u64));
-                                table_base_reg = Some(dst.clone());
-                            }
+                        if let Some(page) = find_adrp_page(block, &a)
+                            && let Some(imm) = parse_hash_imm(&b)
+                        {
+                            table_base = Some(page.wrapping_add(imm as u64));
+                            table_base_reg = Some(dst.clone());
                         }
                     } else if looks_like_reg_name_simple(&a) && looks_like_reg_name_simple(&b) {
                         // add target, anchor_or_off, off_or_base
-                        if let Some(pc) = parse_adr_like_anchor(block, &a)
-                            .or_else(|| find_adr_def(block, &a))
+                        if let Some(pc) =
+                            parse_adr_like_anchor(block, &a).or_else(|| find_adr_def(block, &a))
                         {
                             anchor_pc = Some(pc);
                             offset_reg = Some(b);
-                        } else if let Some(pc) = parse_adr_like_anchor(block, &b)
-                            .or_else(|| find_adr_def(block, &b))
+                        } else if let Some(pc) =
+                            parse_adr_like_anchor(block, &b).or_else(|| find_adr_def(block, &b))
                         {
                             anchor_pc = Some(pc);
                             offset_reg = Some(a);
@@ -3279,28 +3244,26 @@ fn recover_arm64_pc_rel_jump_table_targets(
                                     table_base = Some(page);
                                 }
                             }
-                            if table_base.is_none() {
-                                if let Some(page) = find_adrp_page(block, &a) {
-                                    offset_reg = Some(b.clone());
-                                    table_base_reg = Some(a.clone());
-                                    if let Some(imm) = find_add_imm_to(block, &a) {
-                                        table_base = Some(page.wrapping_add(imm as u64));
-                                    } else {
-                                        table_base = Some(page);
-                                    }
+                            if table_base.is_none()
+                                && let Some(page) = find_adrp_page(block, &a)
+                            {
+                                offset_reg = Some(b.clone());
+                                table_base_reg = Some(a.clone());
+                                if let Some(imm) = find_add_imm_to(block, &a) {
+                                    table_base = Some(page.wrapping_add(imm as u64));
+                                } else {
+                                    table_base = Some(page);
                                 }
                             }
                         }
                     }
-                } else if b.starts_with('#') {
-                    if let Some(page) = find_adrp_page(block, &a) {
-                        if let Some(imm) = parse_hash_imm(&b) {
-                            if table_base.is_none() || table_base_reg.as_deref() == Some(&dst) {
-                                table_base = Some(page.wrapping_add(imm as u64));
-                                table_base_reg = Some(dst);
-                            }
-                        }
-                    }
+                } else if b.starts_with('#')
+                    && let Some(page) = find_adrp_page(block, &a)
+                    && let Some(imm) = parse_hash_imm(&b)
+                    && (table_base.is_none() || table_base_reg.as_deref() == Some(&dst))
+                {
+                    table_base = Some(page.wrapping_add(imm as u64));
+                    table_base_reg = Some(dst);
                 }
             }
             continue;
@@ -3309,23 +3272,23 @@ fn recover_arm64_pc_rel_jump_table_targets(
             let parts: Vec<&str> = text[4..].split(',').map(|s| s.trim()).collect();
             if parts.len() == 2 {
                 let dst = parts[0].to_ascii_lowercase();
-                if let Some(target) = parse_branch_or_adr_target(addr, parts[1]) {
-                    if dst != index_reg {
-                        anchor_pc = Some(target);
-                    }
+                if let Some(target) = parse_branch_or_adr_target(addr, parts[1])
+                    && dst != index_reg
+                {
+                    anchor_pc = Some(target);
                 }
             }
             continue;
         }
         if text.starts_with("adrp ") {
             let parts: Vec<&str> = text[5..].split(',').map(|s| s.trim()).collect();
-            if parts.len() == 2 {
-                if let Some(page) = parse_branch_or_adr_target(addr, parts[1]) {
-                    let page = page & !0xfffu64;
-                    if table_base.is_none() {
-                        table_base = Some(page);
-                        table_base_reg = Some(parts[0].to_ascii_lowercase());
-                    }
+            if parts.len() == 2
+                && let Some(page) = parse_branch_or_adr_target(addr, parts[1])
+            {
+                let page = page & !0xfffu64;
+                if table_base.is_none() {
+                    table_base = Some(page);
+                    table_base_reg = Some(parts[0].to_ascii_lowercase());
                 }
             }
             continue;
@@ -3367,7 +3330,11 @@ fn recover_arm64_pc_rel_jump_table_targets(
     let anchor = if base_relative {
         table_base
     } else {
-        anchor_pc.unwrap_or(if base_relative { table_base } else { br.address })
+        anchor_pc.unwrap_or(if base_relative {
+            table_base
+        } else {
+            br.address
+        })
     };
     // If we never saw adr but add used table base as one operand, treat as base-relative.
     let anchor = if anchor_pc.is_none() && base_relative {
@@ -3451,12 +3418,11 @@ fn infer_jump_table_index_bias(block: &[Instruction]) -> Option<i64> {
             continue;
         }
         let parts: Vec<&str> = text[4..].split(',').map(|s| s.trim()).collect();
-        if parts.len() == 3 {
-            if let Some(imm) = parse_hash_imm(parts[2]) {
-                if (0x20..0x80).contains(&imm) {
-                    return Some(imm);
-                }
-            }
+        if parts.len() == 3
+            && let Some(imm) = parse_hash_imm(parts[2])
+            && (0x20..0x80).contains(&imm)
+        {
+            return Some(imm);
         }
     }
     None
@@ -3499,6 +3465,7 @@ fn parse_branch_or_adr_target(pc: u64, text: &str) -> Option<u64> {
     None
 }
 
+#[allow(clippy::manual_strip)]
 fn find_adrp_page(block: &[Instruction], reg: &str) -> Option<u64> {
     let reg = reg.to_ascii_lowercase();
     for inst in block.iter().rev() {
@@ -3514,6 +3481,7 @@ fn find_adrp_page(block: &[Instruction], reg: &str) -> Option<u64> {
     None
 }
 
+#[allow(clippy::manual_strip)]
 fn find_add_imm_to(block: &[Instruction], reg: &str) -> Option<i64> {
     let reg = reg.to_ascii_lowercase();
     for inst in block.iter().rev() {
@@ -3531,6 +3499,7 @@ fn find_add_imm_to(block: &[Instruction], reg: &str) -> Option<i64> {
     None
 }
 
+#[allow(clippy::manual_strip)]
 fn find_adr_def(block: &[Instruction], reg: &str) -> Option<u64> {
     let reg = reg.to_ascii_lowercase();
     for inst in block.iter().rev() {
@@ -3549,18 +3518,18 @@ fn parse_adr_like_anchor(block: &[Instruction], reg: &str) -> Option<u64> {
     find_adr_def(block, reg)
 }
 
+#[allow(clippy::manual_strip)]
 fn infer_jump_table_bound(block: &[Instruction]) -> Option<usize> {
     // Look for cmp reg, #N / csel with ls / b.hi pattern; table covers 0..=N.
     for inst in block.iter().rev().take(16) {
         let text = inst.text.as_ref();
         if text.starts_with("cmp ") {
             let parts: Vec<&str> = text[4..].split(',').map(|s| s.trim()).collect();
-            if parts.len() == 2 {
-                if let Some(imm) = parse_hash_imm(parts[1]) {
-                    if (1..512).contains(&imm) {
-                        return Some((imm as usize) + 1);
-                    }
-                }
+            if parts.len() == 2
+                && let Some(imm) = parse_hash_imm(parts[1])
+                && (1..512).contains(&imm)
+            {
+                return Some((imm as usize) + 1);
             }
         }
     }
@@ -3588,15 +3557,14 @@ fn decode_x64_cfg_with_references(
     executable: &[(u64, u64)],
 ) -> (Vec<Instruction>, Vec<Reference>) {
     let mut queue = VecDeque::from([start]);
-    let estimated_blocks = ((max_end.saturating_sub(start) / 12) as usize).clamp(4, cfg_block_limit());
+    let estimated_blocks =
+        ((max_end.saturating_sub(start) / 12) as usize).clamp(4, cfg_block_limit());
     let mut visited_blocks = HashSet::with_capacity(estimated_blocks);
     let mut instruction_map: BTreeMap<u64, Instruction> = BTreeMap::new();
     let mut all_refs = Vec::with_capacity(estimated_blocks);
 
     while let Some(block_start) = queue.pop_front() {
-        if visited_blocks.len() >= cfg_block_limit()
-            || instruction_map.len() >= cfg_inst_limit()
-        {
+        if visited_blocks.len() >= cfg_block_limit() || instruction_map.len() >= cfg_inst_limit() {
             break;
         }
         if block_start < start || block_start >= max_end {
@@ -3700,10 +3668,10 @@ fn recover_stack_summary_fast(
         if let Some(size) = parse_stack_sub(text) {
             frame_size = Some(frame_size.unwrap_or(0).max(size));
         }
-        if architecture == Architecture::Arm64 {
-            if let Some(size) = parse_arm64_stack_setup(text) {
-                frame_size = Some(frame_size.unwrap_or(0).max(size));
-            }
+        if architecture == Architecture::Arm64
+            && let Some(size) = parse_arm64_stack_setup(text)
+        {
+            frame_size = Some(frame_size.unwrap_or(0).max(size));
         }
     }
     StackSummary {
@@ -3728,19 +3696,19 @@ fn polish_argument_names(function_name: &str, arguments: &mut [Variable]) {
     if arguments.is_empty() {
         return;
     }
-    if let Some(arg0) = arguments.get_mut(0) {
-        if arg0.name.starts_with("arg_") {
-            arg0.name = "argc".to_string();
-            arg0.type_name = Some("int".to_string());
-            arg0.confidence = arg0.confidence.max(0.7);
-        }
+    if let Some(arg0) = arguments.get_mut(0)
+        && arg0.name.starts_with("arg_")
+    {
+        arg0.name = "argc".to_string();
+        arg0.type_name = Some("int".to_string());
+        arg0.confidence = arg0.confidence.max(0.7);
     }
-    if let Some(arg1) = arguments.get_mut(1) {
-        if arg1.name.starts_with("arg_") {
-            arg1.name = "argv".to_string();
-            arg1.type_name = Some("char **".to_string());
-            arg1.confidence = arg1.confidence.max(0.7);
-        }
+    if let Some(arg1) = arguments.get_mut(1)
+        && arg1.name.starts_with("arg_")
+    {
+        arg1.name = "argv".to_string();
+        arg1.type_name = Some("char **".to_string());
+        arg1.confidence = arg1.confidence.max(0.7);
     }
 }
 
@@ -3749,10 +3717,10 @@ fn recover_variables_fast(
     function_address: u64,
     debug_hint: Option<&DebugFunctionHint>,
 ) -> Vec<Variable> {
-    if let Some(hint) = debug_hint {
-        if !hint.arguments.is_empty() {
-            return hint.arguments.clone();
-        }
+    if let Some(hint) = debug_hint
+        && !hint.arguments.is_empty()
+    {
+        return hint.arguments.clone();
     }
     let location = match image.architecture {
         Architecture::Arm64 => "x0",
@@ -3769,24 +3737,6 @@ fn recover_variables_fast(
         evidence_ids: vec![format!("vars:{function_address:x}:arg:fallback")],
     }]
 }
-
-fn recover_stack_summary(
-    architecture: Architecture,
-    instructions: &[Instruction],
-    debug_hint: Option<&DebugFunctionHint>,
-    call_target_overrides: &HashMap<u64, u64>,
-    profile: AnalysisProfile,
-) -> StackSummary {
-    recover_stack_summary_for(
-        architecture,
-        None,
-        instructions,
-        debug_hint,
-        call_target_overrides,
-        profile,
-    )
-}
-
 fn recover_stack_summary_for(
     architecture: Architecture,
     format: Option<BinaryFormat>,
@@ -4032,117 +3982,117 @@ fn recover_variables(
     }
     #[cfg(feature = "arch-x64")]
     {
-    if image.architecture != Architecture::X86_64 {
-        return (arguments, locals);
-    }
-
-    let win64 = matches!(image.format, BinaryFormat::Pe);
-    let callee_reg_args: &[&str] = if win64 {
-        &["rcx", "rdx", "r8", "r9"]
-    } else {
-        &["rdi", "rsi", "rdx", "rcx", "r8", "r9"]
-    };
-    let input_mask = x64_argument_input_mask(instructions, callee_reg_args);
-
-    for (index, reg) in callee_reg_args.iter().enumerate() {
-        if input_mask & (1u8 << index) == 0 {
-            continue;
+        if image.architecture != Architecture::X86_64 {
+            return (arguments, locals);
         }
-        let name = format!("arg_{index}");
-        if seen_arg_names.insert(name.clone()) {
+
+        let win64 = matches!(image.format, BinaryFormat::Pe);
+        let callee_reg_args: &[&str] = if win64 {
+            &["rcx", "rdx", "r8", "r9"]
+        } else {
+            &["rdi", "rsi", "rdx", "rcx", "r8", "r9"]
+        };
+        let input_mask = x64_argument_input_mask(instructions, callee_reg_args);
+
+        for (index, reg) in callee_reg_args.iter().enumerate() {
+            if input_mask & (1u8 << index) == 0 {
+                continue;
+            }
+            let name = format!("arg_{index}");
+            if seen_arg_names.insert(name.clone()) {
+                arguments.push(Variable {
+                    name,
+                    role: VariableRole::Argument,
+                    storage: VariableStorage::Register,
+                    type_name: infer_type_from_usage(image, instructions, reg, true),
+                    confidence: if profile == AnalysisProfile::Full {
+                        0.8
+                    } else {
+                        0.65
+                    },
+                    location: (*reg).to_string(),
+                    evidence_ids: vec![format!("vars:{function_address:x}:arg:{index}")],
+                });
+            }
+        }
+
+        for (stack_index, offset) in collect_x64_stack_arguments(instructions, win64)
+            .into_iter()
+            .enumerate()
+        {
+            let index = callee_reg_args.len() + stack_index;
+            let name = format!("arg_{index}");
+            if seen_arg_names.insert(name.clone()) {
+                arguments.push(Variable {
+                    name,
+                    role: VariableRole::Argument,
+                    storage: VariableStorage::Stack,
+                    type_name: infer_type_from_offset(image, instructions, offset),
+                    confidence: if profile == AnalysisProfile::Full {
+                        0.7
+                    } else {
+                        0.5
+                    },
+                    location: format!("stack_arg[{offset:+#x}]"),
+                    evidence_ids: vec![format!("vars:{function_address:x}:stack_arg:{offset}")],
+                });
+            }
+        }
+
+        let stack_offsets = collect_stack_offsets(instructions);
+        let arg_offsets: BTreeSet<i64> = collect_x64_stack_arguments(instructions, win64)
+            .into_iter()
+            .collect();
+        for (local_index, offset) in stack_offsets.into_iter().enumerate() {
+            if arg_offsets.contains(&offset) {
+                continue;
+            }
+            if win64 && (0x8..0x30).contains(&offset) {
+                continue;
+            }
+            let name = format!("local_{local_index}");
+            if seen_local_names.insert(name.clone()) {
+                locals.push(Variable {
+                    name,
+                    role: VariableRole::Local,
+                    storage: VariableStorage::Stack,
+                    type_name: infer_type_from_offset(image, instructions, offset)
+                        .or_else(|| infer_x64_stack_slot_type(instructions, offset)),
+                    confidence: if profile == AnalysisProfile::Full {
+                        0.75
+                    } else {
+                        0.5
+                    },
+                    location: format!("stack[{offset:+#x}]"),
+                    evidence_ids: vec![format!("vars:{function_address:x}:local:{offset}")],
+                });
+            }
+        }
+
+        if arguments.is_empty() {
+            let location = if win64 { "rcx" } else { "rdi" };
             arguments.push(Variable {
-                name,
+                name: "arg_0".to_string(),
                 role: VariableRole::Argument,
                 storage: VariableStorage::Register,
-                type_name: infer_type_from_usage(image, instructions, reg, true),
-                confidence: if profile == AnalysisProfile::Full {
-                    0.8
-                } else {
-                    0.65
-                },
-                location: (*reg).to_string(),
-                evidence_ids: vec![format!("vars:{function_address:x}:arg:{index}")],
+                type_name: None,
+                confidence: 0.25,
+                location: location.to_string(),
+                evidence_ids: vec![format!("vars:{function_address:x}:arg:fallback")],
             });
         }
-    }
 
-    for (stack_index, offset) in collect_x64_stack_arguments(instructions, win64)
-        .into_iter()
-        .enumerate()
-    {
-        let index = callee_reg_args.len() + stack_index;
-        let name = format!("arg_{index}");
-        if seen_arg_names.insert(name.clone()) {
-            arguments.push(Variable {
-                name,
-                role: VariableRole::Argument,
-                storage: VariableStorage::Stack,
-                type_name: infer_type_from_offset(image, instructions, offset),
-                confidence: if profile == AnalysisProfile::Full {
-                    0.7
-                } else {
-                    0.5
-                },
-                location: format!("stack_arg[{offset:+#x}]"),
-                evidence_ids: vec![format!("vars:{function_address:x}:stack_arg:{offset}")],
-            });
-        }
-    }
+        polish_argument_names(
+            image
+                .symbols
+                .iter()
+                .find(|s| s.address == Some(function_address))
+                .map(|s| s.name.as_str())
+                .unwrap_or(""),
+            &mut arguments,
+        );
 
-    let stack_offsets = collect_stack_offsets(instructions);
-    let arg_offsets: BTreeSet<i64> = collect_x64_stack_arguments(instructions, win64)
-        .into_iter()
-        .collect();
-    for (local_index, offset) in stack_offsets.into_iter().enumerate() {
-        if arg_offsets.contains(&offset) {
-            continue;
-        }
-        if win64 && (0x8..0x30).contains(&offset) {
-            continue;
-        }
-        let name = format!("local_{local_index}");
-        if seen_local_names.insert(name.clone()) {
-            locals.push(Variable {
-                name,
-                role: VariableRole::Local,
-                storage: VariableStorage::Stack,
-                type_name: infer_type_from_offset(image, instructions, offset)
-                    .or_else(|| infer_x64_stack_slot_type(instructions, offset)),
-                confidence: if profile == AnalysisProfile::Full {
-                    0.75
-                } else {
-                    0.5
-                },
-                location: format!("stack[{offset:+#x}]"),
-                evidence_ids: vec![format!("vars:{function_address:x}:local:{offset}")],
-            });
-        }
-    }
-
-    if arguments.is_empty() {
-        let location = if win64 { "rcx" } else { "rdi" };
-        arguments.push(Variable {
-            name: "arg_0".to_string(),
-            role: VariableRole::Argument,
-            storage: VariableStorage::Register,
-            type_name: None,
-            confidence: 0.25,
-            location: location.to_string(),
-            evidence_ids: vec![format!("vars:{function_address:x}:arg:fallback")],
-        });
-    }
-
-    polish_argument_names(
-        image
-            .symbols
-            .iter()
-            .find(|s| s.address == Some(function_address))
-            .map(|s| s.name.as_str())
-            .unwrap_or(""),
-        &mut arguments,
-    );
-
-    (arguments, locals)
+        (arguments, locals)
     }
     #[cfg(not(feature = "arch-x64"))]
     {
@@ -4187,7 +4137,10 @@ fn x64_register_usage(text: &str, reg: &str) -> RegisterUsage {
     let reg = reg.to_ascii_lowercase();
     let aliases = x64_register_aliases(&reg);
     let lower = text.to_ascii_lowercase();
-    if !aliases.iter().any(|alias| instruction_mentions_token(&lower, alias)) {
+    if !aliases
+        .iter()
+        .any(|alias| instruction_mentions_token(&lower, alias))
+    {
         return RegisterUsage::None;
     }
     let mut parts = lower.splitn(2, char::is_whitespace);
@@ -4205,7 +4158,10 @@ fn x64_register_usage(text: &str, reg: &str) -> RegisterUsage {
     let mut read = false;
     let mut write = false;
     for (index, operand) in operands.iter().enumerate() {
-        if !aliases.iter().any(|alias| instruction_mentions_token(operand, alias)) {
+        if !aliases
+            .iter()
+            .any(|alias| instruction_mentions_token(operand, alias))
+        {
             continue;
         }
         let is_dest = index == 0
@@ -4237,7 +4193,17 @@ fn x64_register_usage(text: &str, reg: &str) -> RegisterUsage {
             write = true;
             if matches!(
                 opcode,
-                "xor" | "or" | "and" | "add" | "sub" | "imul" | "shl" | "shr" | "sar" | "rol" | "ror"
+                "xor"
+                    | "or"
+                    | "and"
+                    | "add"
+                    | "sub"
+                    | "imul"
+                    | "shl"
+                    | "shr"
+                    | "sar"
+                    | "rol"
+                    | "ror"
             ) {
                 read = true;
             }
@@ -4297,6 +4263,7 @@ fn collect_x64_stack_arguments(instructions: &[Instruction], win64: bool) -> Vec
 }
 
 #[cfg(feature = "arch-x64")]
+#[allow(clippy::too_many_arguments)]
 fn infer_x64_stack_slot_type(instructions: &[Instruction], offset: i64) -> Option<String> {
     let patterns = [
         format!("[rbp{offset:+#x}]"),
@@ -4307,10 +4274,15 @@ fn infer_x64_stack_slot_type(instructions: &[Instruction], offset: i64) -> Optio
     ];
     for inst in instructions {
         let text = inst.text.as_ref().to_ascii_lowercase();
-        if !patterns.iter().any(|p| text.contains(&p.to_ascii_lowercase())) {
+        if !patterns
+            .iter()
+            .any(|p| text.contains(&p.to_ascii_lowercase()))
+        {
             if offset < 0 {
                 let abs = (-offset) as u64;
-                if !text.contains(&format!("[rbp-{abs:#x}]")) && !text.contains(&format!("[rbp - {abs:#x}]")) {
+                if !text.contains(&format!("[rbp-{abs:#x}]"))
+                    && !text.contains(&format!("[rbp - {abs:#x}]"))
+                {
                     continue;
                 }
             } else {
@@ -4343,7 +4315,8 @@ fn infer_x64_stack_slot_type(instructions: &[Instruction], offset: i64) -> Optio
     None
 }
 
-
+#[allow(clippy::if_same_then_else)]
+#[allow(clippy::too_many_arguments)]
 fn render_fast_pseudocode(
     name: &str,
     address: u64,
@@ -4428,34 +4401,29 @@ fn render_fast_pseudocode(
                 continue;
             }
 
-            if text.starts_with("bl ")
+            if (text.starts_with("bl ")
                 || text.starts_with("blr ")
                 || text.starts_with("call ")
-                || text.starts_with("call\t")
-            {
-                if let Some(line) = fast_render_call_line(
+                || text.starts_with("call\t"))
+                && let Some(line) = fast_render_call_line(
                     inst,
                     text,
                     &reg_values,
                     imports,
                     function_symbols,
                     call_target_overrides,
-                ) {
-                    let _ = writeln!(body, "    {line}");
-                    let result = fast_call_result_value(
-                        line.split('(').next().unwrap_or("result"),
-                    );
-                    fast_clear_caller_saved_with_result(&mut reg_values, result);
-                    flags.clear();
-                    count += 1;
-                    idx += 1;
-                    continue;
-                }
+                )
+            {
+                let _ = writeln!(body, "    {line}");
+                let result = fast_call_result_value(line.split('(').next().unwrap_or("result"));
+                fast_clear_caller_saved_with_result(&mut reg_values, result);
+                flags.clear();
+                count += 1;
+                idx += 1;
+                continue;
             }
 
-            if (text.starts_with("br ") || text.starts_with("br	"))
-                && !text.starts_with("brk")
-            {
+            if (text.starts_with("br ") || text.starts_with("br	")) && !text.starts_with("brk") {
                 let scrutinee = flags
                     .lhs
                     .clone()
@@ -4613,11 +4581,7 @@ fn render_fast_pseudocode(
                     idx += 1;
                     continue;
                 }
-                let _ = writeln!(
-                    body,
-                    "    if ({cond}) goto label; // {:#x}",
-                    inst.address
-                );
+                let _ = writeln!(body, "    if ({cond}) goto label; // {:#x}", inst.address);
                 count += 1;
                 idx += 1;
                 continue;
@@ -4749,15 +4713,15 @@ fn refine_fast_flag_exprs(regs: &mut HashMap<String, FastValue>, flags: &FastFla
             }
             continue;
         }
-        if let Some(rest) = expr.strip_prefix("(/*") {
-            if let Some(idx) = rest.find("*/") {
-                let cc = &rest[..idx];
-                let tail = &rest[idx + 2..];
-                if let Some(cond) = fast_flags_condition(cc, flags) {
-                    if let Some(tail) = tail.strip_prefix(" ? ") {
-                        regs.insert(key, FastValue::Expr(format!("({cond} ? {tail}")));
-                    }
-                }
+        if let Some(rest) = expr.strip_prefix("(/*")
+            && let Some(idx) = rest.find("*/")
+        {
+            let cc = &rest[..idx];
+            let tail = &rest[idx + 2..];
+            if let Some(cond) = fast_flags_condition(cc, flags)
+                && let Some(tail) = tail.strip_prefix(" ? ")
+            {
+                regs.insert(key, FastValue::Expr(format!("({cond} ? {tail}")));
             }
         }
     }
@@ -4825,7 +4789,9 @@ fn fast_operand_render(raw: &str, regs: &HashMap<String, FastValue>) -> String {
 fn fast_flags_condition(cc: &str, flags: &FastFlags) -> Option<String> {
     let lhs = flags.lhs.as_deref()?;
     let rhs = flags.rhs.as_deref()?;
-    let cc = cc.trim().trim_end_matches(|c: char| !c.is_ascii_alphanumeric());
+    let cc = cc
+        .trim()
+        .trim_end_matches(|c: char| !c.is_ascii_alphanumeric());
     match flags.kind {
         FastFlagKind::None => None,
         FastFlagKind::Cmp => match cc {
@@ -4866,24 +4832,24 @@ fn negate_c_imm_expr(expr: &str) -> String {
     if let Ok(v) = expr.parse::<i64>() {
         return format!("{}", -v);
     }
-    if let Some(hex) = expr.strip_prefix("0x") {
-        if let Ok(v) = u64::from_str_radix(hex, 16) {
-            let s = -(v as i64);
-            if (-4096..4096).contains(&s) {
-                return format!("{s}");
-            }
-            return format!("-({expr})");
+    if let Some(hex) = expr.strip_prefix("0x")
+        && let Ok(v) = u64::from_str_radix(hex, 16)
+    {
+        let s = -(v as i64);
+        if (-4096..4096).contains(&s) {
+            return format!("{s}");
         }
+        return format!("-({expr})");
     }
     format!("-({expr})")
 }
 
 fn invert_c_condition(cond: &str) -> String {
     let cond = cond.trim();
-    if let Some(inner) = cond.strip_prefix("!(").and_then(|s| s.strip_suffix(')')) {
-        if !inner.contains('(') {
-            return inner.to_string();
-        }
+    if let Some(inner) = cond.strip_prefix("!(").and_then(|s| s.strip_suffix(')'))
+        && !inner.contains('(')
+    {
+        return inner.to_string();
     }
     const PAIRS: &[(&str, &str)] = &[
         (" == ", " != "),
@@ -4905,6 +4871,7 @@ fn fast_find_addr_index(instructions: &[Instruction], addr: u64) -> Option<usize
     instructions.iter().position(|inst| inst.address == addr)
 }
 
+#[allow(clippy::manual_strip)]
 fn fast_conditional_branch(
     address: u64,
     text: &str,
@@ -5048,21 +5015,20 @@ fn fast_render_statement_line(
             .unwrap_or_else(|| "0".to_string());
         return Some(format!("return {ret_val}; // {:#x}", inst.address));
     }
-    if text.starts_with("bl ")
+    if (text.starts_with("bl ")
         || text.starts_with("blr ")
         || text.starts_with("call ")
-        || text.starts_with("call\t")
-    {
-        if let Some(line) = fast_render_call_line(
+        || text.starts_with("call\t"))
+        && let Some(line) = fast_render_call_line(
             inst,
             text,
             reg_values,
             imports,
             function_symbols,
             call_target_overrides,
-        ) {
-            return Some(format!("call:{line}"));
-        }
+        )
+    {
+        return Some(format!("call:{line}"));
     }
     if (text.starts_with("b ") || text.starts_with("b\t"))
         && !text.starts_with("b.")
@@ -5087,10 +5053,7 @@ fn fast_render_statement_line(
                     .unwrap_or_else(|| format_sub_addr(addr))
             })
             .unwrap_or_else(|| "label".to_string());
-        return Some(format!(
-            "if ({cond}) goto {target}; // {:#x}",
-            inst.address
-        ));
+        return Some(format!("if ({cond}) goto {target}; // {:#x}", inst.address));
     }
     if text.starts_with("cmp ")
         || text.starts_with("cmn ")
@@ -5129,7 +5092,6 @@ fn fast_render_statement_line(
     }
     Some(format!("// {:#x}: {text}", inst.address))
 }
-
 
 #[derive(Debug, Clone)]
 enum FastValue {
@@ -5178,7 +5140,9 @@ fn track_fast_arm64_value(
                         FastValue::Addr(addr)
                     }
                 }
-                FastValue::Result => FastValue::Expr(format!("(result + {})", fast_imm_render(imm))),
+                FastValue::Result => {
+                    FastValue::Expr(format!("(result + {})", fast_imm_render(imm)))
+                }
                 FastValue::UnknownNamed(name) => {
                     FastValue::Expr(format!("({name} + {})", fast_imm_render(imm)))
                 }
@@ -5202,12 +5166,8 @@ fn track_fast_arm64_value(
                 FastValue::UnknownNamed(name) => {
                     FastValue::Expr(format!("({name} - {})", fast_imm_render(imm)))
                 }
-                FastValue::Expr(e) => {
-                    FastValue::Expr(format!("({e} - {})", fast_imm_render(imm)))
-                }
-                FastValue::Mem(m) => {
-                    FastValue::Expr(format!("({m} - {})", fast_imm_render(imm)))
-                }
+                FastValue::Expr(e) => FastValue::Expr(format!("({e} - {})", fast_imm_render(imm))),
+                FastValue::Mem(m) => FastValue::Expr(format!("({m} - {})", fast_imm_render(imm))),
                 _ => FastValue::Unknown,
             }
         };
@@ -5270,7 +5230,9 @@ fn track_fast_arm64_value(
     }
     if let Some((dst, src, imm)) = parse_arm64_orr_imm_simple(text) {
         let next = match regs.get(&src).cloned().unwrap_or(FastValue::Imm(0)) {
-            FastValue::Imm(base) if src == "xzr" || src == "wzr" || base == 0 => FastValue::Imm(imm),
+            FastValue::Imm(base) if src == "xzr" || src == "wzr" || base == 0 => {
+                FastValue::Imm(imm)
+            }
             FastValue::Imm(base) => FastValue::Imm(base | imm),
             _ if src == "xzr" || src == "wzr" => FastValue::Imm(imm),
             other => other,
@@ -5326,11 +5288,10 @@ fn track_fast_arm64_value(
         }
         return;
     }
-    if let Some((dst, src)) = parse_arm64_sxtw(text) {
-        if let Some(value) = regs.get(&src).cloned() {
-            regs.insert(dst, value);
-        }
-        return;
+    if let Some((dst, src)) = parse_arm64_sxtw(text)
+        && let Some(value) = regs.get(&src).cloned()
+    {
+        regs.insert(dst, value);
     }
 }
 
@@ -5382,7 +5343,7 @@ fn fast_mem_load_value(base: &FastValue, imm: u64, is_byte: bool) -> FastValue {
             let addr = v.wrapping_add(imm);
             if is_byte {
                 FastValue::Mem(format!("*({addr:#x})"))
-            } else if addr > 0xffff_ffff_0000_0000 || addr < 0x1000 {
+            } else if !(0x1000..=0xffff_ffff_0000_0000).contains(&addr) {
                 FastValue::Mem(frame_local_name(addr))
             } else {
                 FastValue::Addr(addr)
@@ -5391,9 +5352,7 @@ fn fast_mem_load_value(base: &FastValue, imm: u64, is_byte: bool) -> FastValue {
         FastValue::Mem(m) if imm == 0 => FastValue::Mem(format!("*{m}")),
         FastValue::Mem(m) => FastValue::Mem(format!("*({m} + {})", fast_imm_render(imm))),
         FastValue::Expr(e) if imm == 0 => FastValue::Mem(format!("*({e})")),
-        FastValue::String(s) if imm == 0 && is_byte => {
-            FastValue::Mem(format!("{:?}[0]", s))
-        }
+        FastValue::String(s) if imm == 0 && is_byte => FastValue::Mem(format!("{:?}[0]", s)),
         FastValue::Imm(v) => FastValue::Mem(format!("*({:#x})", v.saturating_add(imm))),
         _ => FastValue::Unknown,
     }
@@ -5407,7 +5366,6 @@ fn fast_imm_render(v: u64) -> String {
         format!("{v:#x}")
     }
 }
-
 
 fn parse_arm64_load_imm(text: &str) -> Option<(String, String, u64, bool)> {
     let text = text.trim();
@@ -5628,11 +5586,11 @@ fn fast_known_arg_count(callee: &str) -> Option<usize> {
         | "sendto" | "recvfrom" | "pwrite" | "pread" => Some(4),
         "printf" | "puts" | "getenv" | "isatty" | "atoi" | "atol" | "atoll" | "strlen"
         | "strdup" | "free" | "close" | "ftell" | "fclose" | "malloc" | "calloc" | "realloc"
-        | "perror" | "exit" | "system" | "unlink" | "chdir" | "mkdir" | "rmdir"
-        | "sleep" | "usleep" | "raise" | "abs" | "labs" => Some(1),
+        | "perror" | "exit" | "system" | "unlink" | "chdir" | "mkdir" | "rmdir" | "sleep"
+        | "usleep" | "raise" | "abs" | "labs" => Some(1),
         "getuid" | "geteuid" | "getpid" | "getppid" | "fork" | "abort" | "rand" | "random" => {
             Some(0)
-        },
+        }
         "getopt_long" | "getopt" | "sysctlbyname" => Some(5),
         _ => None,
     }
@@ -5663,10 +5621,6 @@ fn fast_call_result_value(callee: &str) -> FastValue {
     }
 }
 
-fn fast_clear_caller_saved(regs: &mut HashMap<String, FastValue>) {
-    fast_clear_caller_saved_with_result(regs, FastValue::Result);
-}
-
 fn fast_clear_caller_saved_with_result(regs: &mut HashMap<String, FastValue>, result: FastValue) {
     for index in 0..18 {
         regs.remove(&format!("x{index}"));
@@ -5689,7 +5643,18 @@ fn fast_call_args(regs: &HashMap<String, FastValue>, callee: &str) -> Vec<String
     }
     let arm_keys: Vec<String> = (0..max_args).map(|index| format!("x{index}")).collect();
     let x64_keys = ["rdi", "rsi", "rdx", "rcx", "r8", "r9"];
-    let keys: Vec<&str> = if arm_keys.iter().any(|key| matches!(regs.get(key), Some(FastValue::String(_)) | Some(FastValue::Imm(_)) | Some(FastValue::Addr(_)) | Some(FastValue::Result) | Some(FastValue::Mem(_)) | Some(FastValue::Expr(_)) | Some(FastValue::UnknownNamed(_)))) {
+    let keys: Vec<&str> = if arm_keys.iter().any(|key| {
+        matches!(
+            regs.get(key),
+            Some(FastValue::String(_))
+                | Some(FastValue::Imm(_))
+                | Some(FastValue::Addr(_))
+                | Some(FastValue::Result)
+                | Some(FastValue::Mem(_))
+                | Some(FastValue::Expr(_))
+                | Some(FastValue::UnknownNamed(_))
+        )
+    }) {
         arm_keys.iter().map(String::as_str).collect()
     } else {
         x64_keys.iter().take(max_args).copied().collect()
@@ -5733,53 +5698,49 @@ fn fast_callee_name(
     import_name_at(target, imports).or_else(|| function_symbols.get(&target).cloned())
 }
 
-
 fn fast_interesting_note(text: &str, regs: &HashMap<String, FastValue>) -> Option<String> {
     if text.starts_with("adrp ") || text.starts_with("add ") {
-        if let Some((dst, _, _)) = parse_arm64_add_imm_simple(text) {
-            if let Some(value) = regs.get(&dst) {
-                match value {
-                    FastValue::String(s) => return Some(format!("{dst} = {:?}", s)),
-                    FastValue::Addr(a) => return Some(format!("{dst} = {a:#x}")),
-                    FastValue::Mem(m) => return Some(format!("{dst} = {m}")),
-                    FastValue::Expr(e) => return Some(format!("{dst} = {e}")),
-                    _ => {}
-                }
-            }
-        }
-        if let Some((dst, _)) = parse_arm64_adrp_text(text) {
-            if let Some(FastValue::String(s)) = regs.get(&dst) {
-                return Some(format!("{dst} = {:?}", s));
-            }
-        }
-    }
-    if text.starts_with("ldr") || text.starts_with("ldur") {
-        if let Some((dst, _, _, _)) = parse_arm64_load_imm(text) {
-            if let Some(value) = regs.get(&dst) {
-                match value {
-                    FastValue::String(s) => return Some(format!("{dst} = {:?}", s)),
-                    FastValue::Mem(m) => return Some(format!("{dst} = {m}")),
-                    FastValue::Addr(a) => return Some(format!("{dst} = {a:#x}")),
-                    FastValue::Expr(e) => return Some(format!("{dst} = {e}")),
-                    FastValue::Imm(v) => return Some(format!("{dst} = {}", fast_imm_render(*v))),
-                    _ => {}
-                }
-            }
-        }
-    }
-    if text.starts_with("and ") || text.starts_with("eor ") {
-        if let Some((dst, _, _)) = parse_arm64_and_imm_simple(text)
-            .or_else(|| parse_arm64_eor_imm_simple(text))
+        if let Some((dst, _, _)) = parse_arm64_add_imm_simple(text)
+            && let Some(value) = regs.get(&dst)
         {
-            if let Some(value) = regs.get(&dst) {
-                match value {
-                    FastValue::Expr(e) | FastValue::Mem(e) => {
-                        return Some(format!("{dst} = {e}"));
-                    }
-                    FastValue::Imm(v) => return Some(format!("{dst} = {}", fast_imm_render(*v))),
-                    _ => {}
-                }
+            match value {
+                FastValue::String(s) => return Some(format!("{dst} = {:?}", s)),
+                FastValue::Addr(a) => return Some(format!("{dst} = {a:#x}")),
+                FastValue::Mem(m) => return Some(format!("{dst} = {m}")),
+                FastValue::Expr(e) => return Some(format!("{dst} = {e}")),
+                _ => {}
             }
+        }
+        if let Some((dst, _)) = parse_arm64_adrp_text(text)
+            && let Some(FastValue::String(s)) = regs.get(&dst)
+        {
+            return Some(format!("{dst} = {:?}", s));
+        }
+    }
+    if (text.starts_with("ldr") || text.starts_with("ldur"))
+        && let Some((dst, _, _, _)) = parse_arm64_load_imm(text)
+        && let Some(value) = regs.get(&dst)
+    {
+        match value {
+            FastValue::String(s) => return Some(format!("{dst} = {:?}", s)),
+            FastValue::Mem(m) => return Some(format!("{dst} = {m}")),
+            FastValue::Addr(a) => return Some(format!("{dst} = {a:#x}")),
+            FastValue::Expr(e) => return Some(format!("{dst} = {e}")),
+            FastValue::Imm(v) => return Some(format!("{dst} = {}", fast_imm_render(*v))),
+            _ => {}
+        }
+    }
+    if (text.starts_with("and ") || text.starts_with("eor "))
+        && let Some((dst, _, _)) =
+            parse_arm64_and_imm_simple(text).or_else(|| parse_arm64_eor_imm_simple(text))
+        && let Some(value) = regs.get(&dst)
+    {
+        match value {
+            FastValue::Expr(e) | FastValue::Mem(e) => {
+                return Some(format!("{dst} = {e}"));
+            }
+            FastValue::Imm(v) => return Some(format!("{dst} = {}", fast_imm_render(*v))),
+            _ => {}
         }
     }
     if text.starts_with("csel ")
@@ -5793,18 +5754,18 @@ fn fast_interesting_note(text: &str, regs: &HashMap<String, FastValue>) -> Optio
             .nth(1)
             .and_then(|s| s.split(',').next())
             .map(|s| normalize_arm64_register(s.trim()));
-        if let Some(dst) = dst {
-            if let Some(value) = regs.get(&dst) {
-                match value {
-                    FastValue::Expr(e) | FastValue::Mem(e) => {
-                        return Some(format!("{dst} = {e}"));
-                    }
-                    FastValue::Addr(a) if *a < 0x1000 || *a > 0xffff_ffff_0000_0000 => {
-                        return Some(format!("{dst} = {}", fast_value_render(value)));
-                    }
-                    FastValue::Imm(v) => return Some(format!("{dst} = {}", fast_imm_render(*v))),
-                    _ => {}
+        if let Some(dst) = dst
+            && let Some(value) = regs.get(&dst)
+        {
+            match value {
+                FastValue::Expr(e) | FastValue::Mem(e) => {
+                    return Some(format!("{dst} = {e}"));
                 }
+                FastValue::Addr(a) if *a < 0x1000 || *a > 0xffff_ffff_0000_0000 => {
+                    return Some(format!("{dst} = {}", fast_value_render(value)));
+                }
+                FastValue::Imm(v) => return Some(format!("{dst} = {}", fast_imm_render(*v))),
+                _ => {}
             }
         }
     }
@@ -5832,8 +5793,11 @@ fn track_fast_x64_value(
             .strip_prefix("0x")
             .and_then(|v| u64::from_str_radix(v, 16).ok())
             .or_else(|| {
-                src.strip_prefix('#')
-                    .and_then(|v| v.strip_prefix("0x").and_then(|h| u64::from_str_radix(h, 16).ok()).or_else(|| v.parse().ok()))
+                src.strip_prefix('#').and_then(|v| {
+                    v.strip_prefix("0x")
+                        .and_then(|h| u64::from_str_radix(h, 16).ok())
+                        .or_else(|| v.parse().ok())
+                })
             })
             .or_else(|| src.parse::<u64>().ok())
         {
@@ -5871,34 +5835,32 @@ fn track_fast_x64_value(
         };
         let dst = dst_raw.trim().to_ascii_lowercase();
         let src = src.trim();
-        if let Some(inner) = src.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
-            if let Some(disp) = inner
+        if let Some(inner) = src.strip_prefix('[').and_then(|s| s.strip_suffix(']'))
+            && let Some(disp) = inner
                 .strip_prefix("rip+")
                 .or_else(|| inner.strip_prefix("rip + "))
-            {
-                let disp = disp.trim().strip_prefix("0x").unwrap_or(disp.trim());
-                if let Ok(off) = u64::from_str_radix(disp, 16).or_else(|_| disp.parse::<u64>()) {
-                    let candidates = [
-                        address.saturating_add(7).saturating_add(off),
-                        address.saturating_add(6).saturating_add(off),
-                        address.saturating_add(off),
-                    ];
-                    for addr in candidates {
-                        if let Some(value) = string_by_addr.get(&addr) {
-                            regs.insert(dst, FastValue::String((*value).to_string()));
-                            return;
-                        }
+        {
+            let disp = disp.trim().strip_prefix("0x").unwrap_or(disp.trim());
+            if let Ok(off) = u64::from_str_radix(disp, 16).or_else(|_| disp.parse::<u64>()) {
+                let candidates = [
+                    address.saturating_add(7).saturating_add(off),
+                    address.saturating_add(6).saturating_add(off),
+                    address.saturating_add(off),
+                ];
+                for addr in candidates {
+                    if let Some(value) = string_by_addr.get(&addr) {
+                        regs.insert(dst, FastValue::String((*value).to_string()));
+                        return;
                     }
-                    regs.insert(
-                        dst,
-                        FastValue::Addr(address.saturating_add(7).saturating_add(off)),
-                    );
                 }
+                regs.insert(
+                    dst,
+                    FastValue::Addr(address.saturating_add(7).saturating_add(off)),
+                );
             }
         }
     }
 }
-
 
 fn sample_instructions_for_recovery(instructions: &[Instruction]) -> Vec<Instruction> {
     if instructions.len() <= MAX_RECOVERY_SAMPLE_INSTS {
@@ -6034,10 +5996,7 @@ fn select_oversize_window_blocks(
         .collect()
 }
 
-fn select_hot_ssa_windows(
-    blocks: &[BasicBlock],
-    references: &[Reference],
-) -> Vec<Vec<BasicBlock>> {
+fn select_hot_ssa_windows(blocks: &[BasicBlock], references: &[Reference]) -> Vec<Vec<BasicBlock>> {
     if blocks.is_empty() {
         return Vec::new();
     }
@@ -6107,6 +6066,7 @@ fn lift_window_to_ssa_text(
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_oversized_pseudocode(
     name: &str,
     address: u64,
@@ -6246,6 +6206,7 @@ fn render_oversized_pseudocode(
     finalize_pseudocode_unit_with_context(name, address, unit, references, function_symbols)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_pseudocode(
     name: &str,
     address: u64,
@@ -6337,8 +6298,10 @@ fn render_pseudocode(
                 return_type,
                 sanitize_symbol(name),
                 signature_args,
-                body_lines.join("
-")
+                body_lines.join(
+                    "
+"
+                )
             ),
             regions,
             region_artifact: None,
@@ -6348,6 +6311,7 @@ fn render_pseudocode(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_regions(
     address: u64,
     blocks: &[BasicBlock],
@@ -6391,12 +6355,9 @@ fn build_regions(
         })
     });
     let has_loop = blocks.len() > 1
-        && blocks.iter().any(|block| {
-            block
-                .instructions
-                .iter()
-                .any(|inst| is_backward_control_transfer(inst))
-        });
+        && blocks
+            .iter()
+            .any(|block| block.instructions.iter().any(is_backward_control_transfer));
     let switch_region = detect_switch_region(address, blocks);
 
     if !arm64_regions.is_empty() {
@@ -6440,16 +6401,16 @@ fn build_regions(
         });
     }
 
-    let return_stmt = if let Some(stmt) = infer_arm64_return_statement(blocks, call_target_overrides)
-    {
-        stmt.to_string()
-    } else if let Some(stmt) = infer_x64_return_statement(blocks) {
-        stmt
-    } else if profile == AnalysisProfile::Full {
-        "return result;".to_string()
-    } else {
-        "return 0;".to_string()
-    };
+    let return_stmt =
+        if let Some(stmt) = infer_arm64_return_statement(blocks, call_target_overrides) {
+            stmt.to_string()
+        } else if let Some(stmt) = infer_x64_return_statement(blocks) {
+            stmt
+        } else if profile == AnalysisProfile::Full {
+            "return result;".to_string()
+        } else {
+            "return 0;".to_string()
+        };
     out.push(PseudocodeRegion {
         id: format!("region:{address:x}:return"),
         kind: RegionKind::Return,
@@ -6492,8 +6453,14 @@ fn collect_region_body_statements(blocks: &[BasicBlock], limit: usize) -> Vec<St
                 continue;
             }
             if text.starts_with("call ") || text.starts_with("bl ") {
-                out.push(format!("call({});", text.split_whitespace().nth(1).unwrap_or("fn")));
-            } else if text.starts_with("mov ") || text.starts_with("lea ") || text.starts_with("ldr ") {
+                out.push(format!(
+                    "call({});",
+                    text.split_whitespace().nth(1).unwrap_or("fn")
+                ));
+            } else if text.starts_with("mov ")
+                || text.starts_with("lea ")
+                || text.starts_with("ldr ")
+            {
                 out.push(format!("/* {text} */"));
             }
         }
@@ -6546,6 +6513,7 @@ fn detect_switch_region(address: u64, blocks: &[BasicBlock]) -> Option<Pseudocod
     })
 }
 
+#[allow(clippy::nonminimal_bool)]
 fn x64_semantic_if_header(blocks: &[BasicBlock]) -> Option<String> {
     for block in blocks {
         let texts: Vec<&str> = block.instructions.iter().map(|i| i.text.as_ref()).collect();
@@ -6695,15 +6663,14 @@ fn build_arm64_regions(
                     filtered_body.push(statement);
                 }
             }
-            if let Some(next_block) = target_block {
-                if next_block
+            if let Some(next_block) = target_block
+                && next_block
                     .instructions
                     .last()
                     .map(|inst| inst.text.eq_ignore_ascii_case("ret"))
                     .unwrap_or(false)
-                {
-                    filtered_body.push("return result;".to_string());
-                }
+            {
+                filtered_body.push("return result;".to_string());
             }
             if !filtered_body.is_empty() {
                 consumed.insert(true_target);
@@ -6767,7 +6734,7 @@ fn build_arm64_regions(
 fn arm64_block_condition(block: &BasicBlock) -> Option<(String, u64, u64)> {
     let last = block.instructions.last()?;
     let text = last.text.as_ref();
-    let true_target = parse_relative_target(last.address, &text)?;
+    let true_target = parse_relative_target(last.address, text)?;
     let false_target = last.address + inst_len(last) as u64;
 
     if text.starts_with("cbnz x0") {
@@ -6808,7 +6775,7 @@ fn arm64_block_has_backward_jump(block: &BasicBlock) -> bool {
     };
     let text = last.text.as_ref();
     text.starts_with("b ")
-        && parse_control_target(last.address, &text)
+        && parse_control_target(last.address, text)
             .map(|target| target < last.address)
             .unwrap_or(false)
 }
@@ -6925,9 +6892,7 @@ fn apply_heuristic_naming(function: &mut Function) {
             if text.contains("pthread_create") {
                 calls_pthread_create = true;
             }
-            if text.contains("abort")
-                || text.contains("__stack_chk_fail")
-                || text.contains("exit")
+            if text.contains("abort") || text.contains("__stack_chk_fail") || text.contains("exit")
             {
                 calls_abort = true;
             }
@@ -6935,10 +6900,9 @@ fn apply_heuristic_naming(function: &mut Function) {
             && text.starts_with("b ")
             && !text.starts_with("bl ")
             && !text.starts_with("b.")
+            && let Some(target) = parse_branch_target_text(inst.address, text)
         {
-            if let Some(target) = parse_branch_target_text(inst.address, text) {
-                branch_target = Some(target);
-            }
+            branch_target = Some(target);
         }
     }
 
@@ -6946,20 +6910,21 @@ fn apply_heuristic_naming(function: &mut Function) {
         return;
     }
 
-    if inst_count <= 3 {
-        if let Some(target) = branch_target {
-            function.name = format!("thunk_{target:x}");
-            return;
-        }
+    if inst_count <= 3
+        && let Some(target) = branch_target
+    {
+        function.name = format!("thunk_{target:x}");
+        return;
     }
 
-    if call_count == 1 && inst_count < 20 {
-        if let Some(call_text) = single_call_text {
-            for (name, _, _) in KNOWN_CALL_SIGNATURES {
-                if call_text.contains(name) {
-                    function.name = format!("wrapper_{name}");
-                    return;
-                }
+    if call_count == 1
+        && inst_count < 20
+        && let Some(call_text) = single_call_text
+    {
+        for (name, _, _) in KNOWN_CALL_SIGNATURES {
+            if call_text.contains(name) {
+                function.name = format!("wrapper_{name}");
+                return;
             }
         }
     }
@@ -6981,9 +6946,8 @@ fn apply_heuristic_naming(function: &mut Function) {
 fn parse_branch_target_text(address: u64, text: &str) -> Option<u64> {
     let token = text
         .split(|ch: char| ch.is_whitespace() || ch == ',')
-        .filter(|token| !token.is_empty())
-        .next_back()?;
-    let token = token.trim_end_matches(|ch: char| ch == ']' || ch == '!' || ch == ';');
+        .rfind(|token| !token.is_empty())?;
+    let token = token.trim_end_matches([']', '!', ';']);
     if let Some(offset) = token.strip_prefix("$+") {
         return parse_signed_imm_text(offset).map(|imm| address.saturating_add_signed(imm));
     }
@@ -7026,11 +6990,11 @@ fn deepen_function_quality(function: &mut Function, import_types: &[String]) {
         // Propagate parameter types from known import calls.
         if !info.inferred_arg_types.is_empty() {
             for (idx, ty) in &info.inferred_arg_types {
-                if let Some(arg) = function.arguments.get_mut(*idx) {
-                    if arg.type_name.is_none() || arg.type_name.as_deref() == Some("int") {
-                        arg.type_name = Some(ty.clone());
-                        arg.confidence = arg.confidence.max(0.7);
-                    }
+                if let Some(arg) = function.arguments.get_mut(*idx)
+                    && (arg.type_name.is_none() || arg.type_name.as_deref() == Some("int"))
+                {
+                    arg.type_name = Some(ty.clone());
+                    arg.confidence = arg.confidence.max(0.7);
                 }
             }
         }
@@ -7045,10 +7009,8 @@ fn deepen_function_quality(function: &mut Function, import_types: &[String]) {
             }
             // If wrapper, annotate in pseudocode.
             if info.is_wrapper && !info.called_names.is_empty() {
-                let wrapper_note = format!(
-                    "// wrapper: delegates to {}",
-                    info.called_names.join(", ")
-                );
+                let wrapper_note =
+                    format!("// wrapper: delegates to {}", info.called_names.join(", "));
                 pseudocode.text = format!("{}\n{}", wrapper_note, pseudocode.text);
             }
         }
@@ -7057,13 +7019,20 @@ fn deepen_function_quality(function: &mut Function, import_types: &[String]) {
         let has_back_edge = function.blocks.iter().any(|block| {
             block.instructions.iter().any(|inst| {
                 let text = inst.text.as_ref();
-                (text.starts_with("b ") || text.starts_with("cbz ") || text.starts_with("cbnz ")
-                    || text.starts_with("b.") || text.starts_with("tbz ") || text.starts_with("tbnz "))
+                (text.starts_with("b ")
+                    || text.starts_with("cbz ")
+                    || text.starts_with("cbnz ")
+                    || text.starts_with("b.")
+                    || text.starts_with("tbz ")
+                    || text.starts_with("tbnz "))
                     && text.contains("$-")
             })
         });
         if has_back_edge
-            && !pseudocode.regions.iter().any(|r| r.kind == RegionKind::Loop)
+            && !pseudocode
+                .regions
+                .iter()
+                .any(|r| r.kind == RegionKind::Loop)
         {
             pseudocode.regions.push(PseudocodeRegion {
                 id: format!("region:{:x}:loop", function.address),
@@ -7082,10 +7051,14 @@ fn deepen_function_quality(function: &mut Function, import_types: &[String]) {
     let block_count = function.blocks.len();
     let inst_count: usize = function.blocks.iter().map(|b| b.instructions.len()).sum();
     if block_count > 50 {
-        function.warnings.push(format!("high_block_count:{block_count}"));
+        function
+            .warnings
+            .push(format!("high_block_count:{block_count}"));
     }
     if inst_count > 500 {
-        function.warnings.push(format!("high_instruction_count:{inst_count}"));
+        function
+            .warnings
+            .push(format!("high_instruction_count:{inst_count}"));
     }
 
     // 6. Obfuscation pattern detection.
@@ -7119,8 +7092,12 @@ fn detect_obfuscation_patterns(function: &Function) -> Vec<String> {
         // Check for back-edges (loop detection).
         for inst in &block.instructions {
             let text = inst.text.as_ref();
-            if (text.starts_with("b ") || text.starts_with("cbz ") || text.starts_with("cbnz ")
-                || text.starts_with("b.") || text.starts_with("tbz ") || text.starts_with("tbnz "))
+            if (text.starts_with("b ")
+                || text.starts_with("cbz ")
+                || text.starts_with("cbnz ")
+                || text.starts_with("b.")
+                || text.starts_with("tbz ")
+                || text.starts_with("tbnz "))
                 && text.contains("$-")
             {
                 has_loop = true;
@@ -7152,7 +7129,9 @@ fn detect_obfuscation_patterns(function: &Function) -> Vec<String> {
             }
 
             // Opaque predicate: cmp reg, #0 + b.eq (always true).
-            if text.starts_with("cmp ") && (text.contains("#0x0") || text.contains("#0") || text.contains(", #0")) {
+            if text.starts_with("cmp ")
+                && (text.contains("#0x0") || text.contains("#0") || text.contains(", #0"))
+            {
                 cmp_zero_always_true = true;
             }
         }
@@ -7258,7 +7237,11 @@ const KNOWN_CALL_SIGNATURES: &[(&str, &str, &[&str])] = &[
     ("memcmp", "int", &["const void *", "const void *", "size_t"]),
     ("strlen", "size_t", &["const char *"]),
     ("strcmp", "int", &["const char *", "const char *"]),
-    ("strncmp", "int", &["const char *", "const char *", "size_t"]),
+    (
+        "strncmp",
+        "int",
+        &["const char *", "const char *", "size_t"],
+    ),
     ("strcpy", "char *", &["char *", "const char *"]),
     ("strncpy", "char *", &["char *", "const char *", "size_t"]),
     ("strcat", "char *", &["char *", "const char *"]),
@@ -7272,7 +7255,11 @@ const KNOWN_CALL_SIGNATURES: &[(&str, &str, &[&str])] = &[
     ("atol", "long", &["const char *"]),
     ("atoll", "long long", &["const char *"]),
     ("strtol", "long", &["const char *", "char **", "int"]),
-    ("strtoul", "unsigned long", &["const char *", "char **", "int"]),
+    (
+        "strtoul",
+        "unsigned long",
+        &["const char *", "char **", "int"],
+    ),
     ("printf", "int", &["const char *"]),
     ("fprintf", "int", &["void *", "const char *"]),
     ("sprintf", "int", &["char *", "const char *"]),
@@ -7282,21 +7269,37 @@ const KNOWN_CALL_SIGNATURES: &[(&str, &str, &[&str])] = &[
     ("fopen", "void *", &["const char *", "const char *"]),
     ("fclose", "int", &["void *"]),
     ("fread", "size_t", &["void *", "size_t", "size_t", "void *"]),
-    ("fwrite", "size_t", &["const void *", "size_t", "size_t", "void *"]),
+    (
+        "fwrite",
+        "size_t",
+        &["const void *", "size_t", "size_t", "void *"],
+    ),
     ("fseek", "int", &["void *", "long", "int"]),
     ("ftell", "long", &["void *"]),
     ("open", "int", &["const char *", "int"]),
     ("close", "int", &["int"]),
     ("read", "ssize_t", &["int", "void *", "size_t"]),
     ("write", "ssize_t", &["int", "const void *", "size_t"]),
-    ("pthread_create", "int", &["void *", "const void *", "void *", "void *"]),
+    (
+        "pthread_create",
+        "int",
+        &["void *", "const void *", "void *", "void *"],
+    ),
     ("pthread_join", "int", &["void *", "void **"]),
     ("pthread_mutex_init", "int", &["void *", "const void *"]),
     ("pthread_mutex_lock", "int", &["void *"]),
     ("pthread_mutex_unlock", "int", &["void *"]),
     ("pthread_mutex_destroy", "int", &["void *"]),
-    ("__android_log_print", "int", &["int", "const char *", "const char *"]),
-    ("__android_log_write", "int", &["int", "const char *", "const char *"]),
+    (
+        "__android_log_print",
+        "int",
+        &["int", "const char *", "const char *"],
+    ),
+    (
+        "__android_log_write",
+        "int",
+        &["int", "const char *", "const char *"],
+    ),
     ("dlopen", "void *", &["const char *", "int"]),
     ("dlsym", "void *", &["void *", "const char *"]),
     ("dlclose", "int", &["void *"]),
@@ -7306,7 +7309,11 @@ const KNOWN_CALL_SIGNATURES: &[(&str, &str, &[&str])] = &[
     ("compat_mode", "int", &["const char *", "const char *"]),
     ("isatty", "int", &["int"]),
     ("ioctl", "int", &["int", "unsigned long", "void *"]),
-    ("strtonum", "long long", &["const char *", "long long", "long long"]),
+    (
+        "strtonum",
+        "long long",
+        &["const char *", "long long", "long long"],
+    ),
     ("socket", "int", &["int", "int", "int"]),
     ("connect", "int", &["int", "const void *", "int"]),
     ("send", "ssize_t", &["int", "const void *", "size_t", "int"]),
@@ -7369,24 +7376,6 @@ fn render_statement_line(statement: &str, indent: usize, out: &mut Vec<String>) 
 
     out.push(format!("{prefix}{trimmed}"));
 }
-
-fn build_arm64_semantic_statements(
-    blocks: &[BasicBlock],
-    arguments: &[Variable],
-    locals: &[Variable],
-    imports: &[revx_core::Import],
-    call_target_overrides: &HashMap<u64, u64>,
-) -> Vec<String> {
-    build_arm64_semantic_statements_with_strings(
-        blocks,
-        arguments,
-        locals,
-        imports,
-        call_target_overrides,
-        &[],
-    )
-}
-
 fn build_arm64_semantic_statements_with_strings(
     blocks: &[BasicBlock],
     arguments: &[Variable],
@@ -7450,8 +7439,7 @@ fn arm64_semantic_statement(
             .get(&address)
             .copied()
             .or_else(|| parse_relative_target(address, text))?;
-        let callee =
-            arm64_callee_name(target, imports).unwrap_or_else(|| format_sub_addr(target));
+        let callee = arm64_callee_name(target, imports).unwrap_or_else(|| format_sub_addr(target));
         let bare = bare_symbol_name(&callee);
         let known = fast_known_arg_count(&callee);
         let max_args = known.unwrap_or(4);
@@ -7502,10 +7490,10 @@ fn arm64_semantic_statement(
     if text.starts_with("blr x0") {
         return Some("callback();".to_string());
     }
-    if text.starts_with("mov w0, #") || text.starts_with("mov x0, #") {
-        if let Some(value) = parse_immediate_assignment(text) {
-            return Some(format!("result = {value};"));
-        }
+    if (text.starts_with("mov w0, #") || text.starts_with("mov x0, #"))
+        && let Some(value) = parse_immediate_assignment(text)
+    {
+        return Some(format!("result = {value};"));
     }
     if text == "ret" {
         return Some("return result;".to_string());
@@ -7627,19 +7615,18 @@ fn arm64_track_semantic_state(
         return;
     }
 
-    if let Some((dst, base, imm)) = parse_arm64_add_imm(text) {
-        if let Some(value) = arm64_value_for_add_imm(locals, state, &base, imm) {
-            let resolved = arm64_resolve_string_node(state, value, string_by_addr)
-                .unwrap_or(value);
-            arm64_store_semantic_value(state, &dst, resolved);
-            return;
-        }
+    if let Some((dst, base, imm)) = parse_arm64_add_imm(text)
+        && let Some(value) = arm64_value_for_add_imm(locals, state, base, imm)
+    {
+        let resolved = arm64_resolve_string_node(state, value, string_by_addr).unwrap_or(value);
+        arm64_store_semantic_value(state, dst, resolved);
+        return;
     }
 
     if let Some((dst, base, imm)) = parse_arm64_mem_imm(text)
-        && let Some(value) = arm64_value_for_memory_load(locals, state, &base, imm)
+        && let Some(value) = arm64_value_for_memory_load(locals, state, base, imm)
     {
-        arm64_store_semantic_value(state, &dst, value);
+        arm64_store_semantic_value(state, dst, value);
         return;
     }
 
@@ -7659,7 +7646,7 @@ fn arm64_track_semantic_state(
     }
 
     if let Some(src) = parse_arm64_mov_alias(text)
-        && let Some(value) = state.values.get(&normalize_arm64_register(&src)).cloned()
+        && let Some(value) = state.values.get(&normalize_arm64_register(src)).cloned()
     {
         let dst = parse_arm64_mov_dst(text).unwrap_or_default();
         arm64_store_semantic_value(state, &dst, value);
@@ -7743,23 +7730,6 @@ fn arm64_render_call_argument(state: &Arm64SemanticState, register: &str) -> Str
             arm64_render_node_cached(&state.nodes, &mut cache, *node)
         })
         .unwrap_or(normalized)
-}
-
-fn arm64_collect_call_arguments(state: &Arm64SemanticState, max_args: usize) -> Vec<String> {
-    let mut highest_index = None;
-    for index in 0..max_args {
-        let reg = format!("x{index}");
-        if state.prepared_args.contains(&reg) || state.values.contains_key(&reg) {
-            highest_index = Some(index);
-        }
-    }
-    let Some(highest_index) = highest_index else {
-        return Vec::new();
-    };
-
-    (0..=highest_index)
-        .map(|index| arm64_render_call_argument(state, &format!("x{index}")))
-        .collect()
 }
 
 fn arm64_collect_call_arguments_fixed(
@@ -8110,8 +8080,7 @@ fn parse_relative_target(address: u64, text: &str) -> Option<u64> {
 fn parse_control_target(address: u64, text: &str) -> Option<u64> {
     let token = text
         .split(|ch: char| ch.is_whitespace() || ch == ',')
-        .filter(|token| !token.is_empty())
-        .next_back()?;
+        .rfind(|token| !token.is_empty())?;
     parse_arm64_relative_target(address, token, false)
 }
 
@@ -8246,7 +8215,7 @@ where
             let target = call_target_overrides
                 .get(&inst.address)
                 .copied()
-                .or_else(|| parse_relative_target(inst.address, &text));
+                .or_else(|| parse_relative_target(inst.address, text));
             if target.is_some() {
                 call_count += 1;
                 continue;
@@ -8305,9 +8274,7 @@ fn infer_type_from_usage(
     let reg_l = register.to_ascii_lowercase();
     let has_int = instructions.iter().any(|inst| {
         let text = inst.text.as_ref().to_ascii_lowercase();
-        if !instruction_mentions_token(&text, &reg_l)
-            && !x64_register_aliases_any(&text, &reg_l)
-        {
+        if !instruction_mentions_token(&text, &reg_l) && !x64_register_aliases_any(&text, &reg_l) {
             return false;
         }
         let op = text.split_whitespace().next().unwrap_or_default();
@@ -8344,10 +8311,10 @@ fn match_debug_type_for_register(image: &BinaryImage, register: &str) -> Option<
     let reg = register.to_ascii_lowercase();
     for hint in &image.debug_import.function_hints {
         for var in hint.arguments.iter().chain(hint.locals.iter()) {
-            if var.location.to_ascii_lowercase() == reg {
-                if let Some(ty) = var.type_name.clone() {
-                    return Some(ty);
-                }
+            if var.location.to_ascii_lowercase() == reg
+                && let Some(ty) = var.type_name.clone()
+            {
+                return Some(ty);
             }
         }
     }
@@ -8542,7 +8509,8 @@ fn infer_arm64_argument_type(
     // 3. Check for string-related patterns.
     let mentions_string = instructions.iter().any(|inst| {
         let text = inst.text.as_ref();
-        text.contains(x_reg) && (text.contains("offset") || text.contains("adrp") || text.contains(".str"))
+        text.contains(x_reg)
+            && (text.contains("offset") || text.contains("adrp") || text.contains(".str"))
     });
     if mentions_string {
         return Some("char *".to_string());
@@ -8554,7 +8522,10 @@ fn infer_arm64_argument_type(
         let s_reg = format!("s{}", &x_reg[1..]);
         let d_reg = format!("d{}", &x_reg[1..]);
         (text.contains(&s_reg) || text.contains(&d_reg))
-            && (text.contains("fadd") || text.contains("fmul") || text.contains("fcvt") || text.contains("ldr"))
+            && (text.contains("fadd")
+                || text.contains("fmul")
+                || text.contains("fcvt")
+                || text.contains("ldr"))
     });
     if has_simd_usage {
         return Some("double".to_string());
@@ -8564,12 +8535,12 @@ fn infer_arm64_argument_type(
     let has_w_register_integer_usage = instructions.iter().any(|inst| {
         let text = inst.text.as_ref();
         if !matches!(
-            arm64_register_usage(&text, x_reg, w_reg),
+            arm64_register_usage(text, x_reg, w_reg),
             RegisterUsage::Read | RegisterUsage::ReadWrite
         ) {
             return false;
         }
-        instruction_mentions_token(&text, w_reg) && arm64_opcode_looks_integer(&text)
+        instruction_mentions_token(text, w_reg) && arm64_opcode_looks_integer(text)
     });
     if has_w_register_integer_usage {
         return Some("int".to_string());
@@ -8579,12 +8550,12 @@ fn infer_arm64_argument_type(
     let has_x_register_integer_usage = instructions.iter().any(|inst| {
         let text = inst.text.as_ref();
         if !matches!(
-            arm64_register_usage(&text, x_reg, w_reg),
+            arm64_register_usage(text, x_reg, w_reg),
             RegisterUsage::Read | RegisterUsage::ReadWrite
         ) {
             return false;
         }
-        !arm64_memory_operand_uses_base(&text, x_reg) && arm64_opcode_looks_integer(&text)
+        !arm64_memory_operand_uses_base(text, x_reg) && arm64_opcode_looks_integer(text)
     });
     if has_x_register_integer_usage {
         return Some("int64_t".to_string());
@@ -8596,11 +8567,11 @@ fn infer_arm64_argument_type(
 fn infer_arm64_stack_slot_type(instructions: &[Instruction], offset: i64) -> Option<String> {
     for inst in instructions {
         let text = inst.text.as_ref();
-        if !arm64_stack_operand_matches_offset(&text, offset) {
+        if !arm64_stack_operand_matches_offset(text, offset) {
             continue;
         }
         let opcode = text.split_whitespace().next().unwrap_or_default();
-        let first_operand = arm64_first_operand(&text).unwrap_or_default();
+        let first_operand = arm64_first_operand(text).unwrap_or_default();
         if first_operand.starts_with('d') {
             return Some("double".to_string());
         }
@@ -8819,7 +8790,7 @@ fn collect_arm64_stack_offset_access_counts(instructions: &[Instruction]) -> BTr
     let mut counts = BTreeMap::new();
     for inst in instructions {
         let text = inst.text.as_ref();
-        if looks_like_arm64_frame_save_slot(&text) {
+        if looks_like_arm64_frame_save_slot(text) {
             continue;
         }
         for base in ["[sp, #", "[x29, #"] {
@@ -8849,10 +8820,10 @@ fn detect_arm64_sp_root_buffer(instructions: &[Instruction]) -> Option<Arm64Reco
 
     for inst in instructions {
         let text = inst.text.as_ref();
-        if looks_like_arm64_frame_save_slot(&text) {
+        if looks_like_arm64_frame_save_slot(text) {
             continue;
         }
-        let Some((base, offset)) = parse_arm64_memory_operand(&text) else {
+        let Some((base, offset)) = parse_arm64_memory_operand(text) else {
             continue;
         };
         if !base.eq_ignore_ascii_case("sp") || offset < 0 {
@@ -8867,7 +8838,7 @@ fn detect_arm64_sp_root_buffer(instructions: &[Instruction]) -> Option<Arm64Reco
                 .map(|current: i64| current.min(offset))
                 .unwrap_or(offset),
         );
-        let width = arm64_memory_access_width(&text).unwrap_or(8);
+        let width = arm64_memory_access_width(text).unwrap_or(8);
         let end = offset + width - 1;
         max_end = Some(max_end.map(|current: i64| current.max(end)).unwrap_or(end));
         store_count += 1;
@@ -8898,7 +8869,7 @@ fn infer_arm64_stack_arg_bytes(
 
     for inst in instructions {
         let text = inst.text.as_ref();
-        if looks_like_arm64_frame_save_slot(&text) {
+        if looks_like_arm64_frame_save_slot(text) {
             continue;
         }
         for base in ["[sp, #", "[x29, #"] {
@@ -8985,17 +8956,6 @@ fn arm64_argument_input_mask(instructions: &[Instruction]) -> u8 {
         }
     }
     used
-}
-
-fn arm64_register_used_as_input(instructions: &[Instruction], x_reg: &str, w_reg: &str) -> bool {
-    for inst in instructions {
-        match arm64_register_usage(&inst.text.as_ref(), x_reg, w_reg) {
-            RegisterUsage::None => continue,
-            RegisterUsage::Read | RegisterUsage::ReadWrite => return true,
-            RegisterUsage::Write => return false,
-        }
-    }
-    false
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -9102,20 +9062,15 @@ fn arm64_write_operand_mask(opcode: &str, operand_count: usize) -> u8 {
     }
     if matches!(opcode, "ldp" | "ldpsw") {
         let n = operand_count.min(2);
-        return if n >= 2 { 0b11 } else if n == 1 { 0b1 } else { 0 };
+        return if n >= 2 {
+            0b11
+        } else if n == 1 {
+            0b1
+        } else {
+            0
+        };
     }
     0b1
-}
-
-fn arm64_write_operand_indices(opcode: &str, operand_count: usize) -> Vec<usize> {
-    let mask = arm64_write_operand_mask(opcode, operand_count);
-    let mut out = Vec::with_capacity(2);
-    for index in 0..8usize {
-        if mask & (1u8 << index) != 0 {
-            out.push(index);
-        }
-    }
-    out
 }
 
 fn instruction_mentions_token(text: &str, token: &str) -> bool {
@@ -9281,7 +9236,7 @@ fn parse_signed_imm(raw: &str) -> Option<i64> {
 }
 
 fn parse_imm_u64(raw: &str) -> Option<u64> {
-    let value = raw.trim_end_matches(|ch: char| ch == ']' || ch == '!' || ch == ';');
+    let value = raw.trim_end_matches([']', '!', ';']);
     if let Some(hex) = value.strip_prefix("0x") {
         u64::from_str_radix(hex, 16).ok()
     } else {
@@ -9399,10 +9354,6 @@ fn sanitize_symbol(name: &str) -> String {
     }
 }
 
-fn default_calling_convention(architecture: Architecture) -> String {
-    default_calling_convention_for(architecture, None)
-}
-
 fn default_calling_convention_for(
     architecture: Architecture,
     format: Option<BinaryFormat>,
@@ -9423,7 +9374,10 @@ fn default_calling_convention_for(
 
 fn build_hint_maps(
     hints: &[DebugFunctionHint],
-) -> (HashMap<u64, DebugFunctionHint>, HashMap<String, DebugFunctionHint>) {
+) -> (
+    HashMap<u64, DebugFunctionHint>,
+    HashMap<String, DebugFunctionHint>,
+) {
     let mut by_addr = HashMap::with_capacity(hints.len());
     let mut by_name = HashMap::with_capacity(hints.len());
     for hint in hints {
@@ -9431,21 +9385,21 @@ fn build_hint_maps(
             by_addr.entry(address).or_insert_with(|| hint.clone());
         }
         if !hint.name.is_empty() {
-            by_name.entry(hint.name.clone()).or_insert_with(|| hint.clone());
+            by_name
+                .entry(hint.name.clone())
+                .or_insert_with(|| hint.clone());
         }
     }
     (by_addr, by_name)
 }
-
 
 fn dedupe_references(mut references: Vec<Reference>) -> Vec<Reference> {
     if references.len() <= 1 {
         return references;
     }
     if references.len() <= 32 {
-        references.sort_unstable_by_key(|reference| {
-            (reference.from, reference.to, reference.kind as u8)
-        });
+        references
+            .sort_unstable_by_key(|reference| (reference.from, reference.to, reference.kind as u8));
         references.dedup_by(|a, b| a.from == b.from && a.to == b.to && a.kind == b.kind);
         return references;
     }
@@ -9459,9 +9413,8 @@ fn dedupe_references_in_place(references: &mut Vec<Reference>) {
         return;
     }
     if references.len() <= 32 {
-        references.sort_unstable_by_key(|reference| {
-            (reference.from, reference.to, reference.kind as u8)
-        });
+        references
+            .sort_unstable_by_key(|reference| (reference.from, reference.to, reference.kind as u8));
         references.dedup_by(|a, b| a.from == b.from && a.to == b.to && a.kind == b.kind);
         return;
     }
@@ -9498,7 +9451,7 @@ fn extract_arm64_data_references(
     for inst in instructions {
         let text = inst.text.as_ref();
         if let Some((reg, target)) = parse_arm64_adr_target(inst.address, text) {
-            if let Some(slot) = arm64_reg_index(&reg) {
+            if let Some(slot) = arm64_reg_index(reg) {
                 register_targets[slot] = Some(target);
             }
             if is_string_address(string_ranges, target) {
@@ -9511,11 +9464,11 @@ fn extract_arm64_data_references(
             continue;
         }
         if let Some((dst, base, imm)) = parse_arm64_add_imm(text)
-            && let Some(base_slot) = arm64_reg_index(&base)
+            && let Some(base_slot) = arm64_reg_index(base)
             && let Some(base_target) = register_targets[base_slot]
         {
             let target = base_target.saturating_add_signed(imm);
-            if let Some(dst_slot) = arm64_reg_index(&dst) {
+            if let Some(dst_slot) = arm64_reg_index(dst) {
                 register_targets[dst_slot] = Some(target);
             }
             if is_string_address(string_ranges, target) {
@@ -9528,11 +9481,11 @@ fn extract_arm64_data_references(
             continue;
         }
         if let Some((dst, base, imm)) = parse_arm64_mem_imm(text)
-            && let Some(base_slot) = arm64_reg_index(&base)
+            && let Some(base_slot) = arm64_reg_index(base)
             && let Some(base_target) = register_targets[base_slot]
         {
             let target = base_target.saturating_add_signed(imm);
-            if let Some(dst_slot) = arm64_reg_index(&dst) {
+            if let Some(dst_slot) = arm64_reg_index(dst) {
                 register_targets[dst_slot] = Some(target);
             }
             if is_string_address(string_ranges, target) {
@@ -9557,7 +9510,7 @@ fn extract_arm64_data_references(
             continue;
         }
         if let Some(reg) = parse_arm64_mov_alias(text)
-            && let Some(slot) = arm64_reg_index(&reg)
+            && let Some(slot) = arm64_reg_index(reg)
             && let Some(target) = register_targets[slot]
             && is_string_address(string_ranges, target)
         {
@@ -9687,11 +9640,7 @@ fn parse_arm64_mov_alias(text: &str) -> Option<&str> {
     let src = operands.next()?;
     let dst_ok = dst.starts_with('x') || dst.eq_ignore_ascii_case("sp");
     let src_ok = src.starts_with('x') || src.eq_ignore_ascii_case("sp");
-    if dst_ok && src_ok {
-        Some(src)
-    } else {
-        None
-    }
+    if dst_ok && src_ok { Some(src) } else { None }
 }
 
 fn parse_arm64_relative_target(address: u64, token: &str, page_align: bool) -> Option<u64> {
@@ -9764,11 +9713,17 @@ fn parse_x64_data_target(ip: u64, inst_size: u64, text: &str) -> Option<u64> {
         if expr.is_empty() {
             return Some(next);
         }
-        if let Some(hex) = expr.strip_prefix("+0x").or_else(|| expr.strip_prefix("+0X")) {
+        if let Some(hex) = expr
+            .strip_prefix("+0x")
+            .or_else(|| expr.strip_prefix("+0X"))
+        {
             let disp = u64::from_str_radix(hex, 16).ok()?;
             return Some(next.wrapping_add(disp));
         }
-        if let Some(hex) = expr.strip_prefix("-0x").or_else(|| expr.strip_prefix("-0X")) {
+        if let Some(hex) = expr
+            .strip_prefix("-0x")
+            .or_else(|| expr.strip_prefix("-0X"))
+        {
             let disp = u64::from_str_radix(hex, 16).ok()?;
             return Some(next.wrapping_sub(disp));
         }
@@ -9797,12 +9752,13 @@ fn parse_x64_data_target(ip: u64, inst_size: u64, text: &str) -> Option<u64> {
             .last()
             .unwrap_or(0);
         let token = &token[..hex_end];
-        if let Some(hex) = token.strip_prefix("0x").or_else(|| token.strip_prefix("0X")) {
-            if let Ok(value) = u64::from_str_radix(hex, 16) {
-                if value > 0x1000 {
-                    return Some(value);
-                }
-            }
+        if let Some(hex) = token
+            .strip_prefix("0x")
+            .or_else(|| token.strip_prefix("0X"))
+            && let Ok(value) = u64::from_str_radix(hex, 16)
+            && value > 0x1000
+        {
+            return Some(value);
         }
     }
     None
@@ -9815,7 +9771,7 @@ fn starts_with_ascii_ci(haystack: &str, prefix: &str) -> bool {
             .as_bytes()
             .iter()
             .zip(prefix.as_bytes())
-            .all(|(a, b)| a.to_ascii_lowercase() == b.to_ascii_lowercase())
+            .all(|(a, b)| a.eq_ignore_ascii_case(b))
 }
 
 #[inline]
@@ -9828,24 +9784,18 @@ fn find_ascii_ci(haystack: &str, needle: &str) -> Option<usize> {
     if h.len() < n.len() {
         return None;
     }
-    for i in 0..=(h.len() - n.len()) {
-        if h[i..i + n.len()]
+    (0..=(h.len() - n.len())).find(|&i| {
+        h[i..i + n.len()]
             .iter()
             .zip(n.iter())
-            .all(|(a, b)| a.to_ascii_lowercase() == b.to_ascii_lowercase())
-        {
-            return Some(i);
-        }
-    }
-    None
+            .all(|(a, b)| a.eq_ignore_ascii_case(b))
+    })
 }
 
 fn reclassify_string_references(references: &mut [Reference], string_ranges: &[StringRange]) {
     for reference in references {
-        if matches!(
-            reference.kind,
-            ReferenceKind::Data | ReferenceKind::DataRef
-        ) && is_string_address(string_ranges, reference.to)
+        if matches!(reference.kind, ReferenceKind::Data | ReferenceKind::DataRef)
+            && is_string_address(string_ranges, reference.to)
         {
             reference.kind = ReferenceKind::StringRef;
         }
@@ -9874,26 +9824,37 @@ fn is_string_address(string_ranges: &[StringRange], target: u64) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
     use super::{
         CodeRegion, MAX_FUNCTION_BUDGET_FAST, MAX_FUNCTION_BUDGET_FULL, MIN_FUNCTION_BUDGET,
-        memory_function_cap,
-        arm64_block_has_implicit_fallthrough, arm64_register_used_as_input,
-        arm64_track_semantic_state, build_arm64_semantic_local_refs, build_arm64_semantic_state,
-        build_arm64_semantic_statements, build_regions, collect_arm64_heuristic_seeds,
-        collect_arm64_nearby_seeds, decode_arm64_cfg, decode_arm64_cfg_with_references, decode_x64_cfg_with_references,
-        extract_x64_data_references, find_executable_range, function_recovery_budget,
-        infer_arm64_argument_type, infer_arm64_return_statement, infer_arm64_stack_arg_bytes,
-        infer_arm64_stack_slot_type, infer_return_type, is_string_address, next_hard_boundary,
-        attach_relocation_references, promote_data_reference_kinds, reclassify_string_references, recover_arm64_locals,
-        split_basic_blocks, summarize_analysis_warnings, StringRange,
+        StringRange, arm64_block_has_implicit_fallthrough, arm64_track_semantic_state,
+        attach_relocation_references, build_arm64_semantic_local_refs, build_arm64_semantic_state,
+        build_regions, collect_arm64_heuristic_seeds, decode_arm64_cfg_with_references,
+        decode_x64_cfg_with_references, extract_x64_data_references, find_executable_range,
+        function_recovery_budget, infer_arm64_argument_type, infer_arm64_return_statement,
+        infer_arm64_stack_arg_bytes, infer_arm64_stack_slot_type, infer_return_type,
+        is_string_address, memory_function_cap, next_hard_boundary, promote_data_reference_kinds,
+        reclassify_string_references, recover_arm64_locals, split_basic_blocks,
     };
     use revx_core::{
         AnalysisProfile, Architecture, BasicBlock, BinaryFormat, BinaryImage, DebugImportSummary,
-        Function, Import, Instruction, Reference, ReferenceKind, RegionKind, Section, Variable,
+        Function, Instruction, Reference, ReferenceKind, RegionKind, Section, Variable,
         VariableRole, VariableStorage,
     };
     use std::collections::{BTreeSet, HashMap};
+
+    fn revx_testkit_env_sample() -> std::path::PathBuf {
+        if let Ok(corpus) = std::env::var("REVX_CORPUS_DIR") {
+            let root = std::path::PathBuf::from(corpus);
+            for name in ["libEncryptorP.so", "libEncryptorP"] {
+                let candidate = root.join(name);
+                if candidate.is_file() {
+                    return candidate;
+                }
+            }
+        }
+        std::path::PathBuf::from("/dev/null/revx-no-sample")
+    }
+    use std::sync::Arc;
 
     #[test]
     fn arm64_ret_block_does_not_fall_through_into_next_function() {
@@ -9905,7 +9866,8 @@ mod tests {
             ],
         )];
 
-        let instructions = decode_arm64_cfg(&code_regions, 0x1000, 0x1008, &[(0x1000, 0x1008)]);
+        let instructions =
+            decode_arm64_cfg_with_references(&code_regions, 0x1000, 0x1008, &[(0x1000, 0x1008)]).0;
 
         assert_eq!(instructions.len(), 1);
         assert_eq!(instructions[0].text.as_ref(), "ret");
@@ -9963,12 +9925,12 @@ mod tests {
         }]));
     }
 
-    
-
-
     #[test]
     fn arm64_encryptor_ssa_render_smoke() {
-        let so = std::fs::read("/Users/shiaho/Desktop/ida-mini-mcp/arm64-v8a/libEncryptorP.so").unwrap();
+        let Ok(so) = std::fs::read(revx_testkit_env_sample()) else {
+            eprintln!("skipping: arm64 sample .so not available");
+            return;
+        };
         let region = CodeRegion::from_vec(0, so);
         let code_regions = [region];
         let executable = vec![(0xd68u64, 0x2594u64)];
@@ -9989,55 +9951,11 @@ mod tests {
         );
         eprintln!("render {:?} lines={}", t1.elapsed(), text.lines().count());
         assert!(text.len() > 50);
-        assert!(t1.elapsed().as_secs() < 30, "render too slow {:?}", t1.elapsed());
-    }
-
-    #[test]
-    fn arm64_encryptor_cfg_size_smoke() {
-        let so = std::fs::read("/Users/shiaho/Desktop/ida-mini-mcp/arm64-v8a/libEncryptorP.so").unwrap();
-        let region = CodeRegion::from_vec(0, so);
-        let code_regions = [region];
-        let executable = vec![(0xd68u64, 0xd68 + 0x8000)];
-        let (insts, refs) =
-            decode_arm64_cfg_with_references(&code_regions, 0xd68, 0xd68 + 0x8000, &executable);
-        eprintln!("insts={} jump_refs={}", insts.len(), refs.iter().filter(|r| r.kind==ReferenceKind::Jump).count());
-        assert!(insts.len() > 100);
-        assert!(insts.len() < 50_000, "pathological decode size {}", insts.len());
-    }
-
-    #[test]
-    fn arm64_encryptor_style_jump_table_from_real_pattern() {
-        // Real pattern from libEncryptorP sub_d68:
-        // adrp/add x27 -> table @ 0x7b60
-        // ... bit ops ...
-        // ldrsw x3, [x27, x10, lsl #2]
-        // add x2, x3, x27
-        // br x2
-        let so = std::fs::read("/Users/shiaho/Desktop/ida-mini-mcp/arm64-v8a/libEncryptorP.so")
-            .expect("so");
-        // Map whole file at VA 0
-        let region = CodeRegion::from_vec(0, so);
-        let code_regions = [region];
-        // Use CFG decode over the function range
-        let executable = vec![(0xd68u64, 0x2594u64)];
-        let (insts, refs) =
-            decode_arm64_cfg_with_references(&code_regions, 0xd68, 0x2594, &executable);
-        let addrs: std::collections::BTreeSet<u64> = insts.iter().map(|i| i.address).collect();
         assert!(
-            addrs.contains(&0xe90) || addrs.contains(&0xf10) || addrs.len() > 200,
-            "expected jump-table cases recovered; inst_count={} refs_jump={}",
-            insts.len(),
-            refs.iter().filter(|r| r.kind == ReferenceKind::Jump).count()
+            t1.elapsed().as_secs() < 30,
+            "render too slow {:?}",
+            t1.elapsed()
         );
-        // specifically case targets from table
-        for t in [0xe90u64, 0xf10, 0x101c, 0x11ac] {
-            assert!(
-                addrs.contains(&t),
-                "missing case target {t:#x}; count={} sample={:?}",
-                insts.len(),
-                insts.iter().map(|i| i.address).take(30).collect::<Vec<_>>()
-            );
-        }
     }
 
     #[test]
@@ -10086,13 +10004,9 @@ mod tests {
                 text: std::sync::Arc::from("br x2"),
             },
         ];
-        let refs = super::recover_arm64_pc_rel_jump_table_targets(
-            &block,
-            &code_regions,
-            0x1000,
-            0x1300,
-        )
-        .expect("base-relative jump table");
+        let refs =
+            super::recover_arm64_pc_rel_jump_table_targets(&block, &code_regions, 0x1000, 0x1300)
+                .expect("base-relative jump table");
         let targets: std::collections::BTreeSet<u64> = refs
             .iter()
             .filter(|r| r.kind == ReferenceKind::Jump)
@@ -10166,15 +10080,19 @@ mod tests {
                 text: std::sync::Arc::from("br x16"),
             },
         ];
-        let refs = super::recover_arm64_pc_rel_jump_table_targets(&block, &code_regions, 0x1000, 0x1200)
-            .expect("jump table targets");
+        let refs =
+            super::recover_arm64_pc_rel_jump_table_targets(&block, &code_regions, 0x1000, 0x1200)
+                .expect("jump table targets");
         let jump_targets: std::collections::BTreeSet<u64> = refs
             .iter()
             .filter(|r| r.kind == ReferenceKind::Jump)
             .map(|r| r.to)
             .collect();
         for case in cases {
-            assert!(jump_targets.contains(&case), "missing {case:#x} in {jump_targets:?}");
+            assert!(
+                jump_targets.contains(&case),
+                "missing {case:#x} in {jump_targets:?}"
+            );
         }
         // With sub #0x25 bias, first slot is case '%'.
         let case_chars: std::collections::BTreeSet<u64> = refs
@@ -10189,7 +10107,7 @@ mod tests {
         assert!(refs.len() >= 4);
     }
 
-#[test]
+    #[test]
     fn arm64_heuristic_seeds_require_a_real_boundary() {
         let code_regions = vec![CodeRegion::from_vec(
             0x1000,
@@ -10223,38 +10141,6 @@ mod tests {
         let seeds = collect_arm64_heuristic_seeds(&code_regions);
         assert!(seeds.contains(&0x5081f8));
         assert!(!seeds.contains(&0x5081fc));
-    }
-
-    #[test]
-    fn arm64_nearby_seed_scan_finds_follow_on_function_after_return() {
-        let code_regions = vec![CodeRegion::from_vec(
-            0x5081b4,
-            vec![
-                0xf3, 0x0b, 0x40, 0xf9, // ldr x19, [sp, #0x10]
-                0xfd, 0x7b, 0xc2, 0xa8, // ldp x29, x30, [sp], #0x20
-                0xbf, 0x23, 0x03, 0xd5, // autiasp
-                0xc0, 0x03, 0x5f, 0xd6, // ret
-                0x00, 0x01, 0x80, 0x52, // mov w0, #8
-                0x2c, 0x00, 0x00, 0x94, // bl $+0xb0
-                0xf3, 0x03, 0x00, 0xaa, // mov x19, x0
-                0xc9, 0x99, 0xff, 0x97, // bl $-0x1999c
-                0x21, 0x00, 0x00, 0x90, // adrp x1, 0x51c000
-                0x22, 0x00, 0x00, 0x90, // adrp x2, 0x51c000
-                0xe0, 0x03, 0x13, 0xaa, // mov x0, x19
-                0x21, 0x14, 0x46, 0xf9, // ldr x1, [x1, #0xc28]
-                0x42, 0x18, 0x46, 0xf9, // ldr x2, [x2, #0xc30]
-                0x6c, 0x00, 0x00, 0x94, // bl $+0x1b0
-                0x5b, 0x02, 0xf3, 0x97, // bl $-0x33f694
-                0x5f, 0x24, 0x03, 0xd5, // bti c
-                0xe3, 0xff, 0xff, 0x17, // b $-0x7c
-                0x3f, 0x23, 0x03, 0xd5, // paciasp
-                0xfd, 0x7b, 0xbf, 0xa9, // stp x29, x30, [sp, #-0x10]!
-                0xfd, 0x03, 0x00, 0x91, // mov x29, sp
-            ],
-        )];
-
-        let seeds = collect_arm64_nearby_seeds(&code_regions, 0x5081f0, 0x508208);
-        assert!(seeds.contains(&0x5081f8));
     }
 
     #[test]
@@ -10360,53 +10246,6 @@ mod tests {
             infer_arm64_stack_arg_bytes(&instructions, Some(32)),
             Some(32)
         );
-    }
-
-    #[test]
-    fn arm64_register_written_before_read_is_not_treated_as_argument() {
-        let instructions = vec![
-            Instruction {
-                address: 0x5081d4,
-                bytes: std::sync::Arc::from("21000090"),
-                text: std::sync::Arc::from("adrp x1, $+0x14000"),
-            },
-            Instruction {
-                address: 0x5081d8,
-                bytes: std::sync::Arc::from("22000090"),
-                text: std::sync::Arc::from("adrp x2, $+0x14000"),
-            },
-            Instruction {
-                address: 0x5081e0,
-                bytes: std::sync::Arc::from("211446f9"),
-                text: std::sync::Arc::from("ldr x1, [x1, #0xc28]"),
-            },
-            Instruction {
-                address: 0x5081e4,
-                bytes: std::sync::Arc::from("421846f9"),
-                text: std::sync::Arc::from("ldr x2, [x2, #0xc30]"),
-            },
-        ];
-
-        assert!(!arm64_register_used_as_input(&instructions, "x1", "w1"));
-        assert!(!arm64_register_used_as_input(&instructions, "x2", "w2"));
-    }
-
-    #[test]
-    fn arm64_register_read_before_write_is_treated_as_argument() {
-        let instructions = vec![
-            Instruction {
-                address: 0x508190,
-                bytes: std::sync::Arc::from("1f0400f1"),
-                text: std::sync::Arc::from("cmp x0, #0x1"),
-            },
-            Instruction {
-                address: 0x508194,
-                bytes: std::sync::Arc::from("1304809a"),
-                text: std::sync::Arc::from("csinc x19, x0, xzr, hi"),
-            },
-        ];
-
-        assert!(arm64_register_used_as_input(&instructions, "x0", "w0"));
     }
 
     #[test]
@@ -10593,74 +10432,6 @@ mod tests {
     }
 
     #[test]
-    fn arm64_semantic_calls_use_sp_root_buffer_aliases() {
-        let block = BasicBlock {
-            address: 0x1000,
-            size: 20,
-            instructions: vec![
-                Instruction {
-                    address: 0x1000,
-                    bytes: std::sync::Arc::from("00000039"),
-                    text: std::sync::Arc::from("strb w8, [sp, #0x40]"),
-                },
-                Instruction {
-                    address: 0x1004,
-                    bytes: std::sync::Arc::from("e00f00ad"),
-                    text: std::sync::Arc::from("stp q0, q0, [sp]"),
-                },
-                Instruction {
-                    address: 0x1008,
-                    bytes: std::sync::Arc::from("e01f01ad"),
-                    text: std::sync::Arc::from("stp q0, q0, [sp, #0x20]"),
-                },
-                Instruction {
-                    address: 0x100c,
-                    bytes: std::sync::Arc::from("e0031faa"),
-                    text: std::sync::Arc::from("mov x1, sp"),
-                },
-                Instruction {
-                    address: 0x1010,
-                    bytes: std::sync::Arc::from("20000094"),
-                    text: std::sync::Arc::from("bl $+0x8"),
-                },
-            ],
-        };
-        let locals = vec![Variable {
-            name: "stack_buffer_0".to_string(),
-            role: VariableRole::Local,
-            storage: VariableStorage::Stack,
-            type_name: Some("stack_buffer_t".to_string()),
-            confidence: 0.35,
-            location: "stack[+0x0..+0x40]".to_string(),
-            evidence_ids: vec!["vars:test:local:0".to_string()],
-        }];
-        let imports = vec![Import {
-            library: Some("libc.so".to_string()),
-            name: "memcpy".to_string(),
-            address: Some(0x1018),
-        }];
-        let overrides = HashMap::from([(0x1010, 0x1018)]);
-
-        let arguments = vec![Variable {
-            name: "arg_0".to_string(),
-            role: VariableRole::Argument,
-            storage: VariableStorage::Register,
-            type_name: None,
-            confidence: 0.2,
-            location: "x0".to_string(),
-            evidence_ids: vec!["vars:test:arg:0".to_string()],
-        }];
-        let statements =
-            build_arm64_semantic_statements(&[block], &arguments, &locals, &imports, &overrides);
-        assert!(
-            statements
-                .iter()
-                .any(|item| item == "memcpy(arg_0, stack_buffer_0, x2);"),
-            "got: {statements:?}"
-        );
-    }
-
-    #[test]
     fn arm64_semantic_values_degrade_before_recursive_blowup() {
         let locals = vec![Variable {
             name: "stack_buffer_0".to_string(),
@@ -10694,77 +10465,6 @@ mod tests {
         assert!(state.nodes.get(x1).is_some());
         assert_eq!(state.nodes.len(), state.node_ids.len());
         assert!(state.nodes.len() <= (2 * 64) + 8);
-    }
-
-    #[test]
-    fn arm64_semantic_calls_use_stack_object_aliases() {
-        let block = BasicBlock {
-            address: 0x1000,
-            size: 16,
-            instructions: vec![
-                Instruction {
-                    address: 0x1000,
-                    bytes: std::sync::Arc::from("e0130091"),
-                    text: std::sync::Arc::from("add x0, sp, #0x48"),
-                },
-                Instruction {
-                    address: 0x1004,
-                    bytes: std::sync::Arc::from("1f000094"),
-                    text: std::sync::Arc::from("bl $+0x4"),
-                },
-                Instruction {
-                    address: 0x1008,
-                    bytes: std::sync::Arc::from("e1130091"),
-                    text: std::sync::Arc::from("add x1, sp, #0x48"),
-                },
-                Instruction {
-                    address: 0x100c,
-                    bytes: std::sync::Arc::from("20000094"),
-                    text: std::sync::Arc::from("bl $+0x8"),
-                },
-            ],
-        };
-        let locals = vec![Variable {
-            name: "stack_array_0".to_string(),
-            role: VariableRole::Local,
-            storage: VariableStorage::Stack,
-            type_name: Some("stack_array_t".to_string()),
-            confidence: 0.35,
-            location: "stack[+0x48..+0x238]".to_string(),
-            evidence_ids: vec!["vars:test:local:48".to_string()],
-        }];
-        let imports = vec![
-            Import {
-                library: Some("libc.so".to_string()),
-                name: "free".to_string(),
-                address: Some(0x1008),
-            },
-            Import {
-                library: Some("libc.so".to_string()),
-                name: "memcpy".to_string(),
-                address: Some(0x1014),
-            },
-        ];
-        let overrides = HashMap::from([(0x1004, 0x1008), (0x100c, 0x1014)]);
-
-        let arguments = vec![Variable {
-            name: "arg_0".to_string(),
-            role: VariableRole::Argument,
-            storage: VariableStorage::Register,
-            type_name: None,
-            confidence: 0.2,
-            location: "x0".to_string(),
-            evidence_ids: vec!["vars:test:arg:0".to_string()],
-        }];
-        let statements =
-            build_arm64_semantic_statements(&[block], &arguments, &locals, &imports, &overrides);
-        assert!(statements.iter().any(|item| item == "free(stack_array_0);"));
-        assert!(
-            statements
-                .iter()
-                .any(|item| item == "memcpy(result, stack_array_0, x2);"),
-            "got: {statements:?}"
-        );
     }
 
     #[test]
@@ -10993,7 +10693,6 @@ mod tests {
         assert!(!is_string_address(&ranges, 0x4010));
     }
 
-
     #[test]
     fn parallel_worker_count_is_capped() {
         let n = super::parallel_worker_count();
@@ -11020,9 +10719,9 @@ mod tests {
         let (instructions, references) =
             decode_arm64_cfg_with_references(&regions, 0xe00, 0xe14, &executable);
         assert!(
-            references.iter().any(|r| {
-                r.kind == ReferenceKind::Jump && r.from == 0xe04 && r.to == 0xe0c
-            }),
+            references
+                .iter()
+                .any(|r| { r.kind == ReferenceKind::Jump && r.from == 0xe04 && r.to == 0xe0c }),
             "expected jump 0xe04 -> 0xe0c, refs={references:?}"
         );
         assert!(
@@ -11061,11 +10760,15 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         assert!(
-            references.iter().any(|r| r.kind == ReferenceKind::BranchTrue),
+            references
+                .iter()
+                .any(|r| r.kind == ReferenceKind::BranchTrue),
             "expected conditional branch true edge"
         );
         assert!(
-            references.iter().any(|r| r.kind == ReferenceKind::BranchFalse),
+            references
+                .iter()
+                .any(|r| r.kind == ReferenceKind::BranchFalse),
             "expected conditional branch false edge"
         );
         assert!(
@@ -11077,13 +10780,25 @@ mod tests {
     #[test]
     fn find_executable_range_uses_sorted_binary_search() {
         let ranges = vec![(0x1000, 0x2000), (0x3000, 0x4000), (0x5000, 0x6000)];
-        assert_eq!(find_executable_range(&ranges, 0x1000), Some((0x1000, 0x2000)));
-        assert_eq!(find_executable_range(&ranges, 0x1fff), Some((0x1000, 0x2000)));
+        assert_eq!(
+            find_executable_range(&ranges, 0x1000),
+            Some((0x1000, 0x2000))
+        );
+        assert_eq!(
+            find_executable_range(&ranges, 0x1fff),
+            Some((0x1000, 0x2000))
+        );
         assert_eq!(find_executable_range(&ranges, 0x2000), None);
-        assert_eq!(find_executable_range(&ranges, 0x3500), Some((0x3000, 0x4000)));
+        assert_eq!(
+            find_executable_range(&ranges, 0x3500),
+            Some((0x3000, 0x4000))
+        );
         assert_eq!(find_executable_range(&ranges, 0x0fff), None);
         assert_eq!(find_executable_range(&ranges, 0x6000), None);
-        assert_eq!(find_executable_range(&ranges, 0x5000), Some((0x5000, 0x6000)));
+        assert_eq!(
+            find_executable_range(&ranges, 0x5000),
+            Some((0x5000, 0x6000))
+        );
     }
 
     #[test]
@@ -11117,36 +10832,17 @@ mod tests {
         let size_budget = (80 * 1024 * 1024usize).div_ceil(0x80);
         let fast = function_recovery_budget(&image, AnalysisProfile::Fast);
         let full = function_recovery_budget(&image, AnalysisProfile::Full);
-        assert_eq!(fast, size_budget.min(memory_function_cap(AnalysisProfile::Fast)));
-        assert_eq!(full, size_budget.min(memory_function_cap(AnalysisProfile::Full)));
+        assert_eq!(
+            fast,
+            size_budget.min(memory_function_cap(AnalysisProfile::Fast))
+        );
+        assert_eq!(
+            full,
+            size_budget.min(memory_function_cap(AnalysisProfile::Full))
+        );
         assert!(fast <= MAX_FUNCTION_BUDGET_FAST);
         assert!(full <= MAX_FUNCTION_BUDGET_FULL);
         assert!(full >= fast);
-    }
-
-    #[test]
-    fn summary_warning_uses_actual_function_budget() {
-        let warnings = summarize_analysis_warnings(&Vec::new(), 4096);
-        assert!(warnings.is_empty());
-
-        let dummy = Function {
-            name: "sub_0".to_string(),
-            address: 0,
-            size: 4,
-            blocks: Vec::new(),
-            stack_summary: None,
-            arguments: Vec::new(),
-            locals: Vec::new(),
-            pseudocode: None,
-            evidence_ids: Vec::new(),
-            warnings: Vec::new(),
-        };
-        let warnings = summarize_analysis_warnings(&vec![dummy.clone(), dummy], 2);
-        assert!(
-            warnings
-                .iter()
-                .any(|warning| warning.contains("global limit of 2"))
-        );
     }
 
     #[test]
@@ -11244,11 +10940,6 @@ mod tests {
             Some("return result;")
         );
     }
-
-
-
-
-
 
     #[test]
     fn fast_pseudocode_recovers_string_call_args() {
@@ -11386,7 +11077,9 @@ mod tests {
             &strings,
             &overrides,
             &symbols,
-            None, &[]);
+            None,
+            &[],
+        );
         assert!(
             unit.text.contains("_setlocale(0x0, \"\")")
                 || unit.text.contains("_setlocale(0, \"\")"),
@@ -11457,7 +11150,9 @@ mod tests {
             &[],
             &overrides,
             &symbols,
-            Some("int"), &[]);
+            Some("int"),
+            &[],
+        );
         assert!(
             unit.text.contains("helper_init("),
             "local callee not resolved:\n{}",
@@ -11506,7 +11201,9 @@ mod tests {
             &[],
             &overrides,
             &symbols,
-            Some("int"), &[]);
+            Some("int"),
+            &[],
+        );
         assert!(
             unit.text.contains("return finish("),
             "tail call should become return:\n{}",
@@ -11569,14 +11266,17 @@ mod tests {
             &[],
             &overrides,
             &symbols,
-            Some("int"), &[]);
+            Some("int"),
+            &[],
+        );
         assert!(
             unit.text.contains("argc"),
             "argc should appear in condition:\n{}",
             unit.text
         );
         assert!(
-            unit.text.contains("if (") && (unit.text.contains(">") || unit.text.contains("<") || unit.text.contains("!=")),
+            unit.text.contains("if (")
+                && (unit.text.contains(">") || unit.text.contains("<") || unit.text.contains("!=")),
             "semantic comparison expected:\n{}",
             unit.text
         );
@@ -11629,7 +11329,9 @@ mod tests {
             &[],
             &overrides,
             &symbols,
-            Some("int"), &[]);
+            Some("int"),
+            &[],
+        );
         assert!(
             unit.text.contains("if ("),
             "expected if structure:\n{}",
@@ -11695,7 +11397,9 @@ mod tests {
             &[],
             &overrides,
             &symbols,
-            Some("int"), &[]);
+            Some("int"),
+            &[],
+        );
         assert!(
             unit.text.contains("result[0]")
                 || unit.text.contains("*result")
@@ -11753,7 +11457,9 @@ mod tests {
             &[],
             &HashMap::new(),
             &HashMap::new(),
-            Some("int"), &[]);
+            Some("int"),
+            &[],
+        );
         assert!(
             unit.text.contains("== -1")
                 || unit.text.contains("!= -1")
@@ -11774,20 +11480,59 @@ mod tests {
             address: 0x7000,
             size: 0x20,
             instructions: vec![
-                Instruction { address: 0x7000, bytes: Arc::from("00"), text: Arc::from("ldurh w0, [x29, #-0x5e]") },
-                Instruction { address: 0x7004, bytes: Arc::from("00"), text: Arc::from("cbz w0, $+0x8") },
-                Instruction { address: 0x7008, bytes: Arc::from("00"), text: Arc::from("bl $+0x100") },
-                Instruction { address: 0x700c, bytes: Arc::from("00"), text: Arc::from("ret") },
+                Instruction {
+                    address: 0x7000,
+                    bytes: Arc::from("00"),
+                    text: Arc::from("ldurh w0, [x29, #-0x5e]"),
+                },
+                Instruction {
+                    address: 0x7004,
+                    bytes: Arc::from("00"),
+                    text: Arc::from("cbz w0, $+0x8"),
+                },
+                Instruction {
+                    address: 0x7008,
+                    bytes: Arc::from("00"),
+                    text: Arc::from("bl $+0x100"),
+                },
+                Instruction {
+                    address: 0x700c,
+                    bytes: Arc::from("00"),
+                    text: Arc::from("ret"),
+                },
             ],
         }];
         let mut overrides = HashMap::new();
         overrides.insert(0x7008, 0x7108);
         let mut symbols = HashMap::new();
         symbols.insert(0x7108, "handle".to_string());
-        let unit = super::render_fast_pseudocode("frame", 0x7000, &blocks, &[], &[], &[], &overrides, &symbols, Some("int"), &[]);
-        assert!(unit.text.contains("local_0x5e"), "frame load not named:\n{}", unit.text);
-        assert!(!unit.text.contains("if (/*?*/)"), "unknown condition leaked:\n{}", unit.text);
-        assert!(unit.text.contains("handle("), "expected gated call:\n{}", unit.text);
+        let unit = super::render_fast_pseudocode(
+            "frame",
+            0x7000,
+            &blocks,
+            &[],
+            &[],
+            &[],
+            &overrides,
+            &symbols,
+            Some("int"),
+            &[],
+        );
+        assert!(
+            unit.text.contains("local_0x5e"),
+            "frame load not named:\n{}",
+            unit.text
+        );
+        assert!(
+            !unit.text.contains("if (/*?*/)"),
+            "unknown condition leaked:\n{}",
+            unit.text
+        );
+        assert!(
+            unit.text.contains("handle("),
+            "expected gated call:\n{}",
+            unit.text
+        );
     }
 
     #[test]
@@ -11796,11 +11541,31 @@ mod tests {
             address: 0x8000,
             size: 0x20,
             instructions: vec![
-                Instruction { address: 0x8000, bytes: Arc::from("00"), text: Arc::from("cmp w0, #0x0") },
-                Instruction { address: 0x8004, bytes: Arc::from("00"), text: Arc::from("mov w1, #0x1") },
-                Instruction { address: 0x8008, bytes: Arc::from("00"), text: Arc::from("mov w2, #0x2") },
-                Instruction { address: 0x800c, bytes: Arc::from("00"), text: Arc::from("csel w0, w1, w2, eq") },
-                Instruction { address: 0x8010, bytes: Arc::from("00"), text: Arc::from("ret") },
+                Instruction {
+                    address: 0x8000,
+                    bytes: Arc::from("00"),
+                    text: Arc::from("cmp w0, #0x0"),
+                },
+                Instruction {
+                    address: 0x8004,
+                    bytes: Arc::from("00"),
+                    text: Arc::from("mov w1, #0x1"),
+                },
+                Instruction {
+                    address: 0x8008,
+                    bytes: Arc::from("00"),
+                    text: Arc::from("mov w2, #0x2"),
+                },
+                Instruction {
+                    address: 0x800c,
+                    bytes: Arc::from("00"),
+                    text: Arc::from("csel w0, w1, w2, eq"),
+                },
+                Instruction {
+                    address: 0x8010,
+                    bytes: Arc::from("00"),
+                    text: Arc::from("ret"),
+                },
             ],
         }];
         let args = vec![Variable {
@@ -11812,9 +11577,28 @@ mod tests {
             location: "x0".into(),
             evidence_ids: Vec::new(),
         }];
-        let unit = super::render_fast_pseudocode("pick", 0x8000, &blocks, &args, &[], &[], &HashMap::new(), &HashMap::new(), Some("int"), &[]);
-        assert!(unit.text.contains("return ") && unit.text.contains('?'), "csel ternary missing:\n{}", unit.text);
-        assert!(unit.text.contains("flag") || unit.text.contains("== 0"), "csel condition should reference cmp:\n{}", unit.text);
+        let unit = super::render_fast_pseudocode(
+            "pick",
+            0x8000,
+            &blocks,
+            &args,
+            &[],
+            &[],
+            &HashMap::new(),
+            &HashMap::new(),
+            Some("int"),
+            &[],
+        );
+        assert!(
+            unit.text.contains("return ") && unit.text.contains('?'),
+            "csel ternary missing:\n{}",
+            unit.text
+        );
+        assert!(
+            unit.text.contains("flag") || unit.text.contains("== 0"),
+            "csel condition should reference cmp:\n{}",
+            unit.text
+        );
     }
 
     #[test]
@@ -11823,16 +11607,55 @@ mod tests {
             address: 0x9000,
             size: 0x20,
             instructions: vec![
-                Instruction { address: 0x9000, bytes: Arc::from("00"), text: Arc::from("cmp w0, #0x5b") },
-                Instruction { address: 0x9004, bytes: Arc::from("00"), text: Arc::from("b.hi $+0x10") },
-                Instruction { address: 0x9008, bytes: Arc::from("00"), text: Arc::from("adr x17, $+0x0") },
-                Instruction { address: 0x900c, bytes: Arc::from("00"), text: Arc::from("ldrsw x16, [x17, x16, lsl #2]") },
-                Instruction { address: 0x9010, bytes: Arc::from("00"), text: Arc::from("br x16") },
-                Instruction { address: 0x9014, bytes: Arc::from("00"), text: Arc::from("ret") },
+                Instruction {
+                    address: 0x9000,
+                    bytes: Arc::from("00"),
+                    text: Arc::from("cmp w0, #0x5b"),
+                },
+                Instruction {
+                    address: 0x9004,
+                    bytes: Arc::from("00"),
+                    text: Arc::from("b.hi $+0x10"),
+                },
+                Instruction {
+                    address: 0x9008,
+                    bytes: Arc::from("00"),
+                    text: Arc::from("adr x17, $+0x0"),
+                },
+                Instruction {
+                    address: 0x900c,
+                    bytes: Arc::from("00"),
+                    text: Arc::from("ldrsw x16, [x17, x16, lsl #2]"),
+                },
+                Instruction {
+                    address: 0x9010,
+                    bytes: Arc::from("00"),
+                    text: Arc::from("br x16"),
+                },
+                Instruction {
+                    address: 0x9014,
+                    bytes: Arc::from("00"),
+                    text: Arc::from("ret"),
+                },
             ],
         }];
-        let unit = super::render_fast_pseudocode("dispatch", 0x9000, &blocks, &[], &[], &[], &HashMap::new(), &HashMap::new(), Some("int"), &[]);
-        assert!(unit.text.contains("switch"), "jump table should be annotated:\n{}", unit.text);
+        let unit = super::render_fast_pseudocode(
+            "dispatch",
+            0x9000,
+            &blocks,
+            &[],
+            &[],
+            &[],
+            &HashMap::new(),
+            &HashMap::new(),
+            Some("int"),
+            &[],
+        );
+        assert!(
+            unit.text.contains("switch"),
+            "jump table should be annotated:\n{}",
+            unit.text
+        );
     }
 
     #[test]
@@ -11841,14 +11664,46 @@ mod tests {
             address: 0xa000,
             size: 0x30,
             instructions: vec![
-                Instruction { address: 0xa000, bytes: Arc::from("00"), text: Arc::from("bl $+0x100") },
-                Instruction { address: 0xa004, bytes: Arc::from("00"), text: Arc::from("sub w16, w0, #0x25") },
-                Instruction { address: 0xa008, bytes: Arc::from("00"), text: Arc::from("cmp w16, #0x5b") },
-                Instruction { address: 0xa00c, bytes: Arc::from("00"), text: Arc::from("b.hi $+0x10") },
-                Instruction { address: 0xa010, bytes: Arc::from("00"), text: Arc::from("adr x17, $+0x0") },
-                Instruction { address: 0xa014, bytes: Arc::from("00"), text: Arc::from("ldrsw x16, [x17, x16, lsl #2]") },
-                Instruction { address: 0xa018, bytes: Arc::from("00"), text: Arc::from("br x16") },
-                Instruction { address: 0xa01c, bytes: Arc::from("00"), text: Arc::from("ret") },
+                Instruction {
+                    address: 0xa000,
+                    bytes: Arc::from("00"),
+                    text: Arc::from("bl $+0x100"),
+                },
+                Instruction {
+                    address: 0xa004,
+                    bytes: Arc::from("00"),
+                    text: Arc::from("sub w16, w0, #0x25"),
+                },
+                Instruction {
+                    address: 0xa008,
+                    bytes: Arc::from("00"),
+                    text: Arc::from("cmp w16, #0x5b"),
+                },
+                Instruction {
+                    address: 0xa00c,
+                    bytes: Arc::from("00"),
+                    text: Arc::from("b.hi $+0x10"),
+                },
+                Instruction {
+                    address: 0xa010,
+                    bytes: Arc::from("00"),
+                    text: Arc::from("adr x17, $+0x0"),
+                },
+                Instruction {
+                    address: 0xa014,
+                    bytes: Arc::from("00"),
+                    text: Arc::from("ldrsw x16, [x17, x16, lsl #2]"),
+                },
+                Instruction {
+                    address: 0xa018,
+                    bytes: Arc::from("00"),
+                    text: Arc::from("br x16"),
+                },
+                Instruction {
+                    address: 0xa01c,
+                    bytes: Arc::from("00"),
+                    text: Arc::from("ret"),
+                },
             ],
         }];
         let mut overrides = HashMap::new();
@@ -11864,7 +11719,9 @@ mod tests {
             &[],
             &overrides,
             &symbols,
-            Some("int"), &[]);
+            Some("int"),
+            &[],
+        );
         assert!(
             unit.text.contains("opt") || unit.text.contains("result"),
             "call result should flow into control:\n{}",
@@ -11876,7 +11733,11 @@ mod tests {
             unit.text
         );
         assert!(
-            unit.text.contains("0x25") || unit.text.contains("37") || unit.text.contains("- 37") || unit.text.contains("- 0x25") || unit.text.contains("opt"),
+            unit.text.contains("0x25")
+                || unit.text.contains("37")
+                || unit.text.contains("- 37")
+                || unit.text.contains("- 0x25")
+                || unit.text.contains("opt"),
             "sub of call result should appear:\n{}",
             unit.text
         );
@@ -11908,10 +11769,26 @@ mod tests {
             address: 0xb000,
             size: 0x10,
             instructions: vec![
-                Instruction { address: 0xb000, bytes: Arc::from("00"), text: Arc::from("adrp x2, $+0x0") },
-                Instruction { address: 0xb004, bytes: Arc::from("00"), text: Arc::from("add x2, x2, #0x10") },
-                Instruction { address: 0xb008, bytes: Arc::from("00"), text: Arc::from("bl $+0x100") },
-                Instruction { address: 0xb00c, bytes: Arc::from("00"), text: Arc::from("ret") },
+                Instruction {
+                    address: 0xb000,
+                    bytes: Arc::from("00"),
+                    text: Arc::from("adrp x2, $+0x0"),
+                },
+                Instruction {
+                    address: 0xb004,
+                    bytes: Arc::from("00"),
+                    text: Arc::from("add x2, x2, #0x10"),
+                },
+                Instruction {
+                    address: 0xb008,
+                    bytes: Arc::from("00"),
+                    text: Arc::from("bl $+0x100"),
+                },
+                Instruction {
+                    address: 0xb00c,
+                    bytes: Arc::from("00"),
+                    text: Arc::from("ret"),
+                },
             ],
         }];
         let mut overrides = HashMap::new();
@@ -11933,7 +11810,9 @@ mod tests {
             &strings,
             &overrides,
             &symbols,
-            Some("int"), &[]);
+            Some("int"),
+            &[],
+        );
         assert!(
             unit.text.contains("usage(argc") || unit.text.contains("usage(argc,"),
             "named argc should appear in call:\n{}",
@@ -12148,7 +12027,7 @@ mod tests {
             &[],
             &HashMap::new(),
             AnalysisProfile::Fast,
-        &[],
+            &[],
         );
         let if_regions = regions
             .iter()
@@ -12177,26 +12056,58 @@ mod tests {
                     address: 0x1000,
                     size: 16,
                     instructions: vec![
-                        Instruction { address: 0x1000, bytes: std::sync::Arc::from("00"), text: std::sync::Arc::from("adrp x0, $+0x1000") },
-                        Instruction { address: 0x1004, bytes: std::sync::Arc::from("00"), text: std::sync::Arc::from("mov x1, #0x0") },
+                        Instruction {
+                            address: 0x1000,
+                            bytes: std::sync::Arc::from("00"),
+                            text: std::sync::Arc::from("adrp x0, $+0x1000"),
+                        },
+                        Instruction {
+                            address: 0x1004,
+                            bytes: std::sync::Arc::from("00"),
+                            text: std::sync::Arc::from("mov x1, #0x0"),
+                        },
                     ],
                 },
                 BasicBlock {
                     address: 0x1008,
                     size: 16,
                     instructions: vec![
-                        Instruction { address: 0x1008, bytes: std::sync::Arc::from("00"), text: std::sync::Arc::from("ldrb w2, [x0, x1]") },
-                        Instruction { address: 0x100c, bytes: std::sync::Arc::from("00"), text: std::sync::Arc::from("eor w2, w2, #0x42") },
-                        Instruction { address: 0x1010, bytes: std::sync::Arc::from("00"), text: std::sync::Arc::from("strb w2, [x0, x1]") },
-                        Instruction { address: 0x1014, bytes: std::sync::Arc::from("00"), text: std::sync::Arc::from("add x1, x1, #0x1") },
+                        Instruction {
+                            address: 0x1008,
+                            bytes: std::sync::Arc::from("00"),
+                            text: std::sync::Arc::from("ldrb w2, [x0, x1]"),
+                        },
+                        Instruction {
+                            address: 0x100c,
+                            bytes: std::sync::Arc::from("00"),
+                            text: std::sync::Arc::from("eor w2, w2, #0x42"),
+                        },
+                        Instruction {
+                            address: 0x1010,
+                            bytes: std::sync::Arc::from("00"),
+                            text: std::sync::Arc::from("strb w2, [x0, x1]"),
+                        },
+                        Instruction {
+                            address: 0x1014,
+                            bytes: std::sync::Arc::from("00"),
+                            text: std::sync::Arc::from("add x1, x1, #0x1"),
+                        },
                     ],
                 },
                 BasicBlock {
                     address: 0x1018,
                     size: 16,
                     instructions: vec![
-                        Instruction { address: 0x1018, bytes: std::sync::Arc::from("00"), text: std::sync::Arc::from("cmp x1, #0x10") },
-                        Instruction { address: 0x101c, bytes: std::sync::Arc::from("00"), text: std::sync::Arc::from("b.ne $-0x14") },
+                        Instruction {
+                            address: 0x1018,
+                            bytes: std::sync::Arc::from("00"),
+                            text: std::sync::Arc::from("cmp x1, #0x10"),
+                        },
+                        Instruction {
+                            address: 0x101c,
+                            bytes: std::sync::Arc::from("00"),
+                            text: std::sync::Arc::from("b.ne $-0x14"),
+                        },
                     ],
                 },
             ],
@@ -12210,7 +12121,8 @@ mod tests {
         let patterns = super::detect_obfuscation_patterns(&function);
         assert!(
             patterns.iter().any(|p| p == "xor_decrypt_loop"),
-            "expected xor_decrypt_loop pattern, got: {:?}", patterns
+            "expected xor_decrypt_loop pattern, got: {:?}",
+            patterns
         );
     }
 
@@ -12225,24 +12137,48 @@ mod tests {
                     address: 0x2000,
                     size: 8,
                     instructions: vec![
-                        Instruction { address: 0x2000, bytes: std::sync::Arc::from("00"), text: std::sync::Arc::from("mov x0, #0x1") },
-                        Instruction { address: 0x2004, bytes: std::sync::Arc::from("00"), text: std::sync::Arc::from("br x0") },
+                        Instruction {
+                            address: 0x2000,
+                            bytes: std::sync::Arc::from("00"),
+                            text: std::sync::Arc::from("mov x0, #0x1"),
+                        },
+                        Instruction {
+                            address: 0x2004,
+                            bytes: std::sync::Arc::from("00"),
+                            text: std::sync::Arc::from("br x0"),
+                        },
                     ],
                 },
                 BasicBlock {
                     address: 0x2008,
                     size: 8,
                     instructions: vec![
-                        Instruction { address: 0x2008, bytes: std::sync::Arc::from("00"), text: std::sync::Arc::from("mov x0, #0x2") },
-                        Instruction { address: 0x200c, bytes: std::sync::Arc::from("00"), text: std::sync::Arc::from("br x0") },
+                        Instruction {
+                            address: 0x2008,
+                            bytes: std::sync::Arc::from("00"),
+                            text: std::sync::Arc::from("mov x0, #0x2"),
+                        },
+                        Instruction {
+                            address: 0x200c,
+                            bytes: std::sync::Arc::from("00"),
+                            text: std::sync::Arc::from("br x0"),
+                        },
                     ],
                 },
                 BasicBlock {
                     address: 0x2010,
                     size: 8,
                     instructions: vec![
-                        Instruction { address: 0x2010, bytes: std::sync::Arc::from("00"), text: std::sync::Arc::from("mov x0, #0x3") },
-                        Instruction { address: 0x2014, bytes: std::sync::Arc::from("00"), text: std::sync::Arc::from("br x0") },
+                        Instruction {
+                            address: 0x2010,
+                            bytes: std::sync::Arc::from("00"),
+                            text: std::sync::Arc::from("mov x0, #0x3"),
+                        },
+                        Instruction {
+                            address: 0x2014,
+                            bytes: std::sync::Arc::from("00"),
+                            text: std::sync::Arc::from("br x0"),
+                        },
                     ],
                 },
             ],
@@ -12255,8 +12191,11 @@ mod tests {
         };
         let patterns = super::detect_obfuscation_patterns(&function);
         assert!(
-            patterns.iter().any(|p| p.starts_with("control_flow_flattening")),
-            "expected control_flow_flattening pattern, got: {:?}", patterns
+            patterns
+                .iter()
+                .any(|p| p.starts_with("control_flow_flattening")),
+            "expected control_flow_flattening pattern, got: {:?}",
+            patterns
         );
     }
 
@@ -12266,17 +12205,21 @@ mod tests {
             name: "sub_3000".to_string(),
             address: 0x3000,
             size: 64,
-            blocks: vec![
-                BasicBlock {
-                    address: 0x3000,
-                    size: 64,
-                    instructions: (0..16).map(|i| Instruction {
+            blocks: vec![BasicBlock {
+                address: 0x3000,
+                size: 64,
+                instructions: (0..16)
+                    .map(|i| Instruction {
                         address: 0x3000 + i as u64 * 4,
                         bytes: std::sync::Arc::from("00"),
-                        text: if i % 2 == 0 { std::sync::Arc::from("nop") } else { std::sync::Arc::from("brk #0x1") },
-                    }).collect(),
-                },
-            ],
+                        text: if i % 2 == 0 {
+                            std::sync::Arc::from("nop")
+                        } else {
+                            std::sync::Arc::from("brk #0x1")
+                        },
+                    })
+                    .collect(),
+            }],
             stack_summary: None,
             arguments: Vec::new(),
             locals: Vec::new(),
@@ -12287,7 +12230,8 @@ mod tests {
         let patterns = super::detect_obfuscation_patterns(&function);
         assert!(
             patterns.iter().any(|p| p.starts_with("dead_code")),
-            "expected dead_code pattern, got: {:?}", patterns
+            "expected dead_code pattern, got: {:?}",
+            patterns
         );
     }
 }

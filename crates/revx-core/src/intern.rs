@@ -39,15 +39,17 @@ fn intern_in_shard(value: &str) -> Arc<str> {
     }
 
     let shard = &tables()[shard_index(value)];
-    if let Ok(guard) = shard.read() {
-        if let Some(existing) = guard.get(value) {
-            let owned = Arc::clone(existing);
-            cache_local(value, Arc::clone(&owned));
-            return owned;
-        }
+    if let Ok(guard) = shard.read()
+        && let Some(existing) = guard.get(value)
+    {
+        let owned = Arc::clone(existing);
+        cache_local(value, Arc::clone(&owned));
+        return owned;
     }
 
-    let mut guard = shard.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut guard = shard
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     if let Some(existing) = guard.get(value) {
         let owned = Arc::clone(existing);
         drop(guard);
@@ -131,15 +133,17 @@ pub fn intern_string(value: String) -> Arc<str> {
     }
 
     let shard = &tables()[shard_index(value.as_str())];
-    if let Ok(guard) = shard.read() {
-        if let Some(existing) = guard.get(value.as_str()) {
-            let owned = Arc::clone(existing);
-            cache_local(value.as_str(), Arc::clone(&owned));
-            return owned;
-        }
+    if let Ok(guard) = shard.read()
+        && let Some(existing) = guard.get(value.as_str())
+    {
+        let owned = Arc::clone(existing);
+        cache_local(value.as_str(), Arc::clone(&owned));
+        return owned;
     }
 
-    let mut guard = shard.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut guard = shard
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     if let Some(existing) = guard.get(value.as_str()) {
         let owned = Arc::clone(existing);
         drop(guard);

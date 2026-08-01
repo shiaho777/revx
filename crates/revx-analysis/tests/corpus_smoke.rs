@@ -20,15 +20,6 @@ fn corpus_paths() -> Vec<PathBuf> {
             out.push(root);
         }
     }
-    // built-in optional local samples
-    for candidate in [
-        "/Users/shiaho/Downloads/AndMX/app/build/intermediates/cxx/Debug/5e11264s/obj/arm64-v8a/libandmxpty.so",
-    ] {
-        let p = PathBuf::from(candidate);
-        if p.exists() {
-            out.push(p);
-        }
-    }
     out.sort();
     out.dedup();
     out.into_iter().take(12).collect()
@@ -43,7 +34,11 @@ fn looks_like_binary(path: &Path) -> bool {
     }
     matches!(
         &bytes[0..4],
-        [0x7f, b'E', b'L', b'F'] | [b'M', b'Z', _, _] | [0xcf, 0xfa, 0xed, 0xfe] | [0xce, 0xfa, 0xed, 0xfe] | [0xca, 0xfe, 0xba, 0xbe]
+        [0x7f, b'E', b'L', b'F']
+            | [b'M', b'Z', _, _]
+            | [0xcf, 0xfa, 0xed, 0xfe]
+            | [0xce, 0xfa, 0xed, 0xfe]
+            | [0xca, 0xfe, 0xba, 0xbe]
     )
 }
 
@@ -54,7 +49,7 @@ fn corpus_smoke_load_and_analyze() {
         .filter(|p| looks_like_binary(p))
         .collect::<Vec<_>>();
     if paths.is_empty() {
-        // no corpus available in this environment
+        eprintln!("skipping: REVX_CORPUS_DIR not set or no binaries available");
         return;
     }
     let mut analyzed = 0usize;
@@ -64,7 +59,9 @@ fn corpus_smoke_load_and_analyze() {
         };
         let fast = analyze(image.clone(), AnalysisProfile::Fast);
         assert!(
-            fast.survey.summary.function_count > 0 || !image.symbols.is_empty() || image.entry.is_some(),
+            fast.survey.summary.function_count > 0
+                || !image.symbols.is_empty()
+                || image.entry.is_some(),
             "no analysis surface for {}",
             path.display()
         );

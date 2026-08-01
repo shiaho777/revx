@@ -162,7 +162,7 @@ fn set_rlimit_cpu(seconds: u64) {
 pub fn current_rss_bytes() -> Option<u64> {
     #[cfg(target_os = "macos")]
     {
-        return macos_resident_size();
+        macos_resident_size()
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {

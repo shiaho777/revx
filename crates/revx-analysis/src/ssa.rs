@@ -10,7 +10,7 @@
 //! dead code elimination) builds on top of this SSA form.
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
 use std::sync::Arc;
 
@@ -36,11 +36,15 @@ thread_local! {
         std::cell::RefCell::new(HashMap::new());
     static NAMED_RENDER_VISITING: std::cell::RefCell<HashSet<u32>> =
         std::cell::RefCell::new(HashSet::new());
-    static SSA_USE_GRAPH: std::cell::RefCell<Option<(usize, Vec<u32>, Vec<Vec<u32>>)>> =
-        std::cell::RefCell::new(None);
-    static SSA_FLAG_COND: std::cell::RefCell<Option<(usize, Vec<bool>)>> =
-        std::cell::RefCell::new(None);
+    static SSA_USE_GRAPH: std::cell::RefCell<Option<SsaUseGraph>> =
+        const { std::cell::RefCell::new(None) };
+    static SSA_FLAG_COND: std::cell::RefCell<Option<SsaFlagCond>> =
+        const { std::cell::RefCell::new(None) };
 }
+
+type SsaUseGraph = (usize, Vec<u32>, Vec<Vec<u32>>);
+type SsaFlagCond = (usize, Vec<bool>);
+type PendingBlockLabels = Vec<(BlockId, String, Vec<(BlockId, SsaValueId)>)>;
 
 const LINEAR_CACHE_CAP: usize = 96;
 const LINEAR_SHAPE_MIN_INSTS: usize = 96;
@@ -125,7 +129,10 @@ fn rebuild_linear_header(name: &str, arguments: &[revx_core::Variable], body: &s
     }
 }
 
-pub fn hash_linear_exact_key(blocks: &[revx_core::BasicBlock], arguments: &[revx_core::Variable]) -> u64 {
+pub fn hash_linear_exact_key(
+    blocks: &[revx_core::BasicBlock],
+    arguments: &[revx_core::Variable],
+) -> u64 {
     let mut hash = 0xcbf29ce484222325u64;
     hash = fnv1a_u64(hash, arg_signature(arguments).as_bytes());
     for block in blocks {
@@ -201,9 +208,7 @@ fn normalize_shape_text(text: &str, high_consts: &mut Vec<u64>) -> String {
             i = start;
             continue;
         }
-        if bytes[i] == b'0'
-            && i + 1 < bytes.len()
-            && (bytes[i + 1] == b'x' || bytes[i + 1] == b'X')
+        if bytes[i] == b'0' && i + 1 < bytes.len() && (bytes[i + 1] == b'x' || bytes[i + 1] == b'X')
         {
             let hex_start = i + 2;
             let mut j = hex_start;
@@ -211,13 +216,11 @@ fn normalize_shape_text(text: &str, high_consts: &mut Vec<u64>) -> String {
                 j += 1;
             }
             if j > hex_start {
-                if let Ok(v) = u64::from_str_radix(
-                    std::str::from_utf8(&bytes[hex_start..j]).unwrap_or(""),
-                    16,
-                ) {
-                    if v >= 0x1000 {
-                        high_consts.push(v);
-                    }
+                if let Ok(v) =
+                    u64::from_str_radix(std::str::from_utf8(&bytes[hex_start..j]).unwrap_or(""), 16)
+                    && v >= 0x1000
+                {
+                    high_consts.push(v);
                 }
                 out.push_str("IMM");
                 i = j;
@@ -258,8 +261,12 @@ fn cheap_fold_high_consts(blocks: &[revx_core::BasicBlock]) -> Vec<u64> {
             let text = inst.text.as_ref();
             if let Some(rest) = text.strip_prefix("adrp ") {
                 let mut parts = rest.split(',');
-                let Some(dst) = parts.next().map(str::trim) else { continue };
-                let Some(page_tok) = parts.next().map(str::trim) else { continue };
+                let Some(dst) = parts.next().map(str::trim) else {
+                    continue;
+                };
+                let Some(page_tok) = parts.next().map(str::trim) else {
+                    continue;
+                };
                 let page = parse_arm64_imm(page_tok)
                     .or_else(|| parse_arm64_imm(&format!("#{page_tok}")))
                     .map(|v| (v as u64) & !0xfffu64);
@@ -274,16 +281,17 @@ fn cheap_fold_high_consts(blocks: &[revx_core::BasicBlock]) -> Vec<u64> {
             }
             if let Some(rest) = text.strip_prefix("add ") {
                 let parts: Vec<&str> = rest.split(',').map(str::trim).collect();
-                if parts.len() == 3 && parts[2].starts_with('#') {
-                    if let Some(imm) = parse_arm64_imm(parts[2]) {
-                        let dn = normalize_reg(parts[0]);
-                        let sn = normalize_reg(parts[1]);
-                        if let Some(&base) = regs.get(&sn) {
-                            let v = base.wrapping_add(imm as u64);
-                            regs.insert(dn, v);
-                            if v >= 0x1000 {
-                                out.push(v);
-                            }
+                if parts.len() == 3
+                    && parts[2].starts_with('#')
+                    && let Some(imm) = parse_arm64_imm(parts[2])
+                {
+                    let dn = normalize_reg(parts[0]);
+                    let sn = normalize_reg(parts[1]);
+                    if let Some(&base) = regs.get(&sn) {
+                        let v = base.wrapping_add(imm as u64);
+                        regs.insert(dn, v);
+                        if v >= 0x1000 {
+                            out.push(v);
                         }
                     }
                 }
@@ -311,14 +319,14 @@ fn cheap_fold_high_consts(blocks: &[revx_core::BasicBlock]) -> Vec<u64> {
             }
             if let Some(rest) = text.strip_prefix("movz ") {
                 let parts: Vec<&str> = rest.split(',').map(str::trim).collect();
-                if parts.len() >= 2 {
-                    if let Some(imm) = parse_arm64_imm(parts[1]) {
-                        let dn = normalize_reg(parts[0]);
-                        let v = imm as u64;
-                        regs.insert(dn, v);
-                        if v >= 0x1000 {
-                            out.push(v);
-                        }
+                if parts.len() >= 2
+                    && let Some(imm) = parse_arm64_imm(parts[1])
+                {
+                    let dn = normalize_reg(parts[0]);
+                    let v = imm as u64;
+                    regs.insert(dn, v);
+                    if v >= 0x1000 {
+                        out.push(v);
                     }
                 }
             }
@@ -332,10 +340,10 @@ fn build_shape_pieces(text: &str, name: &str, consts: &[u64]) -> Option<Vec<Shap
         return None;
     }
     let mut work = text.to_string();
-    if !name.is_empty() {
-        if let Some(pos) = work.find(name) {
-            work.replace_range(pos..pos + name.len(), "\u{0001}N\u{0001}");
-        }
+    if !name.is_empty()
+        && let Some(pos) = work.find(name)
+    {
+        work.replace_range(pos..pos + name.len(), "\u{0001}N\u{0001}");
     }
     let mut unique: Vec<(usize, u64, String)> = Vec::new();
     let mut seen = HashSet::new();
@@ -373,10 +381,10 @@ fn build_shape_pieces(text: &str, name: &str, consts: &[u64]) -> Option<Vec<Shap
                 let token = &after[..end];
                 if token == "N" {
                     pieces.push(ShapePiece::Name);
-                } else if let Some(num) = token.strip_prefix('C') {
-                    if let Ok(idx) = num.parse::<usize>() {
-                        pieces.push(ShapePiece::Const(idx));
-                    }
+                } else if let Some(num) = token.strip_prefix('C')
+                    && let Ok(idx) = num.parse::<usize>()
+                {
+                    pieces.push(ShapePiece::Const(idx));
                 }
                 rest = &after[end + 1..];
             } else {
@@ -495,7 +503,6 @@ pub fn linear_cache_store(
     });
 }
 
-
 fn with_render_context<R>(
     strings: Arc<HashMap<u64, String>>,
     data_base: Option<u64>,
@@ -573,14 +580,15 @@ fn format_data_addr(addr: u64) -> String {
     if let Some(name) = lookup_global_name(addr) {
         return name;
     }
-    if let Some(base) = render_data_base() {
-        if addr >= base && addr.saturating_sub(base) < 0x4000 {
-            let off = addr - base;
-            if off == 0 {
-                return "g_data".to_string();
-            }
-            return format!("g_data+{off:#x}");
+    if let Some(base) = render_data_base()
+        && addr >= base
+        && addr.saturating_sub(base) < 0x4000
+    {
+        let off = addr - base;
+        if off == 0 {
+            return "g_data".to_string();
         }
+        return format!("g_data+{off:#x}");
     }
     if looks_like_got_slot_page(addr) {
         match addr & 0xfff {
@@ -599,14 +607,15 @@ fn format_data_deref(addr: u64) -> String {
     if let Some(name) = lookup_global_name(addr) {
         return name;
     }
-    if let Some(base) = render_data_base() {
-        if addr >= base && addr.saturating_sub(base) < 0x4000 {
-            let off = addr - base;
-            if off == 0 {
-                return "*g_data".to_string();
-            }
-            return format!("*(g_data + {off:#x})");
+    if let Some(base) = render_data_base()
+        && addr >= base
+        && addr.saturating_sub(base) < 0x4000
+    {
+        let off = addr - base;
+        if off == 0 {
+            return "*g_data".to_string();
         }
+        return format!("*(g_data + {off:#x})");
     }
     if looks_like_got_slot_page(addr) {
         match addr & 0xfff {
@@ -625,10 +634,11 @@ fn looks_like_got_slot_page(addr: u64) -> bool {
     if addr < 0x1000 {
         return false;
     }
-    if let Some(base) = render_data_base() {
-        if addr >= base && addr.saturating_sub(base) < 0x8000 {
-            return false;
-        }
+    if let Some(base) = render_data_base()
+        && addr >= base
+        && addr.saturating_sub(base) < 0x8000
+    {
+        return false;
     }
     // Prefer __DATA_CONST-style pages (not huge BSS).
     let page = addr & !0xfffu64;
@@ -647,18 +657,20 @@ fn format_mem_access(base_text: &str, offset: i64) -> String {
         if base_text == "g_data" {
             return "*g_data".to_string();
         }
-        if let Some(stripped) = base_text.strip_prefix('&') {
-            if stripped
+        if let Some(stripped) = base_text.strip_prefix('&')
+            && stripped
                 .chars()
                 .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '.')
-            {
-                return stripped.to_string();
-            }
+        {
+            return stripped.to_string();
         }
-        if let Some(stripped) = base_text.strip_suffix("_ptr") {
-            if matches!(stripped, "stdout" | "stderr" | "optarg" | "optind" | "stdin") {
-                return stripped.to_string();
-            }
+        if let Some(stripped) = base_text.strip_suffix("_ptr")
+            && matches!(
+                stripped,
+                "stdout" | "stderr" | "optarg" | "optind" | "stdin"
+            )
+        {
+            return stripped.to_string();
         }
         if matches!(
             base_text.as_str(),
@@ -715,11 +727,6 @@ fn frame_slot_name_from_parts(base_text: &str, offset: i64) -> Option<&'static s
     None
 }
 
-fn format_frame_addr_expr(base_text: &str, offset: i64) -> Option<String> {
-    let name = frame_slot_name_from_parts(base_text, offset)?;
-    Some(format!("&{name}"))
-}
-
 fn is_trivial_stack_prologue_store(rendered: &str) -> bool {
     let t = rendered.trim();
     if !t.contains('=') {
@@ -760,10 +767,10 @@ fn simplify_addr_expr(text: &str) -> String {
         }
         t = next;
     }
-    if let Some((base, off)) = parse_addr_chain(&t) {
-        if let Some(name) = frame_slot_name_from_parts(&base, off) {
-            return format!("&{name}");
-        }
+    if let Some((base, off)) = parse_addr_chain(&t)
+        && let Some(name) = frame_slot_name_from_parts(&base, off)
+    {
+        return format!("&{name}");
     }
     t
 }
@@ -834,13 +841,13 @@ fn split_trailing_add_imm(text: &str) -> Option<(&str, i64)> {
         }
     }
     // compact form: foo+0x10
-    if let Some(idx) = text.rfind('+') {
-        if idx > 0 {
-            let lhs = text[..idx].trim();
-            let rhs = text[idx + 1..].trim();
-            if !lhs.is_empty() && parse_hex_or_dec(rhs).is_some() {
-                return Some((lhs, parse_hex_or_dec(rhs)?));
-            }
+    if let Some(idx) = text.rfind('+')
+        && idx > 0
+    {
+        let lhs = text[..idx].trim();
+        let rhs = text[idx + 1..].trim();
+        if !lhs.is_empty() && parse_hex_or_dec(rhs).is_some() {
+            return Some((lhs, parse_hex_or_dec(rhs)?));
         }
     }
     None
@@ -854,19 +861,19 @@ fn split_trailing_sub_imm(text: &str) -> Option<(&str, i64)> {
             return Some((lhs, imm));
         }
     }
-    if let Some(idx) = text.rfind('-') {
-        if idx > 0 {
-            let lhs = text[..idx].trim();
-            let rhs = text[idx + 1..].trim();
-            if !lhs.is_empty()
-                && !lhs.ends_with(|c: char| c.is_ascii_hexdigit())
-                && parse_hex_or_dec(rhs).is_some()
-            {
-                // avoid splitting identifiers
-                let prev = lhs.chars().last().unwrap_or(' ');
-                if prev.is_ascii_alphanumeric() || prev == '_' || prev == ')' {
-                    return Some((lhs, parse_hex_or_dec(rhs)?));
-                }
+    if let Some(idx) = text.rfind('-')
+        && idx > 0
+    {
+        let lhs = text[..idx].trim();
+        let rhs = text[idx + 1..].trim();
+        if !lhs.is_empty()
+            && !lhs.ends_with(|c: char| c.is_ascii_hexdigit())
+            && parse_hex_or_dec(rhs).is_some()
+        {
+            // avoid splitting identifiers
+            let prev = lhs.chars().last().unwrap_or(' ');
+            if prev.is_ascii_alphanumeric() || prev == '_' || prev == ')' {
+                return Some((lhs, parse_hex_or_dec(rhs)?));
             }
         }
     }
@@ -881,65 +888,66 @@ fn infer_code_names(
 ) -> HashMap<u64, String> {
     let mut names: HashMap<u64, String> = HashMap::new();
     let mut used: HashSet<String> = HashSet::new();
-    let put = |addr: u64, name: &str, names: &mut HashMap<u64, String>, used: &mut HashSet<String>| {
-        if addr < 0x1000 || names.contains_key(&addr) {
-            return;
-        }
-        if used.contains(name) {
-            return;
-        }
-        names.insert(addr, name.to_string());
-        used.insert(name.to_string());
-    };
+    let put =
+        |addr: u64, name: &str, names: &mut HashMap<u64, String>, used: &mut HashSet<String>| {
+            if addr < 0x1000 || names.contains_key(&addr) {
+                return;
+            }
+            if used.contains(name) {
+                return;
+            }
+            names.insert(addr, name.to_string());
+            used.insert(name.to_string());
+        };
 
     // Call-site driven names.
     for inst in &func.values {
         match &inst.op {
             SsaOp::Call { target, args } => {
                 let bare = resolve_callee_bare_name(target, symbols, local_symbols);
-                if bare == "signal" && args.len() >= 2 {
-                    if let Some(c) = resolve_const_operand_static(func, &args[1]) {
-                        if c > 0 {
-                            put(c as u64, "color_sig_handler", &mut names, &mut used);
-                        }
-                    }
+                if bare == "signal"
+                    && args.len() >= 2
+                    && let Some(c) = resolve_const_operand_static(func, &args[1])
+                    && c > 0
+                {
+                    put(c as u64, "color_sig_handler", &mut names, &mut used);
                 }
-                if bare == "getopt_long" && args.len() >= 4 {
-                    if let Some(c) = resolve_const_operand_static(func, &args[3]) {
-                        if c > 0 {
-                            put(c as u64, "longopts", &mut names, &mut used);
-                        }
-                    }
+                if bare == "getopt_long"
+                    && args.len() >= 4
+                    && let Some(c) = resolve_const_operand_static(func, &args[3])
+                    && c > 0
+                {
+                    put(c as u64, "longopts", &mut names, &mut used);
                 }
                 if args.len() == 2 {
                     let a0 = render_operand_named_depth(func, &args[0], symbols, local_symbols, 1);
                     let a1 = render_operand_named_depth(func, &args[1], symbols, local_symbols, 1);
-                    if (a0 == "argc" || a0.contains("argc")) && (a1 == "argv" || a1.contains("argv"))
+                    if (a0 == "argc" || a0.contains("argc"))
+                        && (a1 == "argv" || a1.contains("argv"))
                     {
                         if let Operand::Symbol(n) = target {
                             if let Some(addr) = parse_sub_symbol_addr(n) {
                                 put(addr, "usage", &mut names, &mut used);
                             }
-                        } else if let Some(c) = resolve_const_operand_static(func, target) {
-                            if c > 0 {
-                                put(c as u64, "usage", &mut names, &mut used);
-                            }
+                        } else if let Some(c) = resolve_const_operand_static(func, target)
+                            && c > 0
+                        {
+                            put(c as u64, "usage", &mut names, &mut used);
                         }
                     }
                 }
-                if args.is_empty() {
-                    if let Some(labels) = func.case_labels.get(&inst.block) {
-                        if labels.iter().any(|l| l == "default") {
-                            if let Operand::Symbol(n) = target {
-                                if let Some(addr) = parse_sub_symbol_addr(n) {
-                                    put(addr, "usage", &mut names, &mut used);
-                                }
-                            } else if let Some(c) = resolve_const_operand_static(func, target) {
-                                if c > 0 {
-                                    put(c as u64, "usage", &mut names, &mut used);
-                                }
-                            }
+                if args.is_empty()
+                    && let Some(labels) = func.case_labels.get(&inst.block)
+                    && labels.iter().any(|l| l == "default")
+                {
+                    if let Operand::Symbol(n) = target {
+                        if let Some(addr) = parse_sub_symbol_addr(n) {
+                            put(addr, "usage", &mut names, &mut used);
                         }
+                    } else if let Some(c) = resolve_const_operand_static(func, target)
+                        && c > 0
+                    {
+                        put(c as u64, "usage", &mut names, &mut used);
                     }
                 }
             }
@@ -947,7 +955,7 @@ fn infer_code_names(
                 let Some(abs) = fold_absolute_addr(func, addr) else {
                     continue;
                 };
-                let gname = lookup_global_name(abs).or_else(|| {
+                let gname = lookup_global_name(abs).or({
                     // bootstrap during inference: use offset heuristics
                     None
                 });
@@ -982,12 +990,11 @@ fn infer_code_names(
         };
         // usage: loads stderr + usage string + exit
         for a in args {
-            if let Some(c) = resolve_const_operand_static(func, a) {
-                if let Some(s) = strings.get(&(c as u64)) {
-                    if s.starts_with("usage:") {
-                        put(callee_addr, "usage", &mut names, &mut used);
-                    }
-                }
+            if let Some(c) = resolve_const_operand_static(func, a)
+                && let Some(s) = strings.get(&(c as u64))
+                && s.starts_with("usage:")
+            {
+                put(callee_addr, "usage", &mut names, &mut used);
             }
         }
     }
@@ -1002,23 +1009,23 @@ fn infer_code_names(
             match &inst.op {
                 SsaOp::Call { target, args } => {
                     let bare = resolve_callee_bare_name(target, symbols, local_symbols);
-                    if bare == "getenv" && args.len() >= 1 {
-                        if let Some(c) = resolve_const_operand_static(func, &args[0]) {
-                            if strings.get(&(c as u64)).map(|s| s.as_str()) == Some("LSCOLORS") {
-                                prev_getenv_lscolors = true;
-                                continue;
-                            }
-                        }
+                    if bare == "getenv"
+                        && !args.is_empty()
+                        && let Some(c) = resolve_const_operand_static(func, &args[0])
+                        && strings.get(&(c as u64)).map(|s| s.as_str()) == Some("LSCOLORS")
+                    {
+                        prev_getenv_lscolors = true;
+                        continue;
                     }
                     if prev_getenv_lscolors {
                         if let Operand::Symbol(n) = target {
                             if let Some(addr) = parse_sub_symbol_addr(n) {
                                 put(addr, "parse_colors", &mut names, &mut used);
                             }
-                        } else if let Operand::Constant(c) = target {
-                            if *c > 0 {
-                                put(*c as u64, "parse_colors", &mut names, &mut used);
-                            }
+                        } else if let Operand::Constant(c) = target
+                            && *c > 0
+                        {
+                            put(*c as u64, "parse_colors", &mut names, &mut used);
                         }
                         prev_getenv_lscolors = false;
                     }
@@ -1039,7 +1046,9 @@ fn infer_code_names(
         let addr = match target {
             Operand::Symbol(n) => parse_sub_symbol_addr(n),
             Operand::Constant(c) if *c >= 0 => Some(*c as u64),
-            _ => resolve_const_operand_static(func, target).filter(|c| *c > 0).map(|c| c as u64),
+            _ => resolve_const_operand_static(func, target)
+                .filter(|c| *c > 0)
+                .map(|c| c as u64),
         };
         let Some(addr) = addr else {
             continue;
@@ -1051,12 +1060,11 @@ fn infer_code_names(
                 usage_addrs.insert(addr);
             }
         }
-        if args.is_empty() {
-            if let Some(labels) = func.case_labels.get(&inst.block) {
-                if labels.iter().any(|l| l == "default") {
-                    usage_addrs.insert(addr);
-                }
-            }
+        if args.is_empty()
+            && let Some(labels) = func.case_labels.get(&inst.block)
+            && labels.iter().any(|l| l == "default")
+        {
+            usage_addrs.insert(addr);
         }
     }
     for addr in usage_addrs {
@@ -1067,62 +1075,57 @@ fn infer_code_names(
     let mut exit_seen = false;
     let mut traverse_cands: Vec<(u64, u64)> = Vec::new();
     for inst in &func.values {
-        match &inst.op {
-            SsaOp::Call { target, args } => {
-                let tname = match target {
-                    Operand::Symbol(n) => {
-                        if let Some(addr) = parse_sub_symbol_addr(n) {
-                            symbols
-                                .get(&addr)
-                                .or_else(|| local_symbols.get(&addr))
-                                .map(|s| s.as_str())
-                                .unwrap_or(n.as_str())
-                        } else {
-                            n.as_str()
-                        }
+        if let SsaOp::Call { target, args } = &inst.op {
+            let tname = match target {
+                Operand::Symbol(n) => {
+                    if let Some(addr) = parse_sub_symbol_addr(n) {
+                        symbols
+                            .get(&addr)
+                            .or_else(|| local_symbols.get(&addr))
+                            .map(|s| s.as_str())
+                            .unwrap_or(n.as_str())
+                    } else {
+                        n.as_str()
                     }
-                    Operand::Constant(c) if *c >= 0 => symbols
-                        .get(&(*c as u64))
-                        .or_else(|| local_symbols.get(&(*c as u64)))
-                        .map(|s| s.as_str())
-                        .unwrap_or(""),
-                    _ => "",
+                }
+                Operand::Constant(c) if *c >= 0 => symbols
+                    .get(&(*c as u64))
+                    .or_else(|| local_symbols.get(&(*c as u64)))
+                    .map(|s| s.as_str())
+                    .unwrap_or(""),
+                _ => "",
+            };
+            let bare = tname.trim_start_matches('_');
+            if bare == "ferror" {
+                ferror_seen = true;
+            }
+            if bare == "exit" || bare == "err" || bare == "errx" {
+                exit_seen = true;
+            }
+            if args.is_empty() {
+                let addr = match target {
+                    Operand::Symbol(n) => parse_sub_symbol_addr(n),
+                    Operand::Constant(c) if *c >= 0 => Some(*c as u64),
+                    _ => resolve_const_operand_static(func, target)
+                        .filter(|c| *c > 0)
+                        .map(|c| c as u64),
                 };
-                let bare = tname.trim_start_matches('_');
-                if bare == "ferror" {
-                    ferror_seen = true;
-                }
-                if bare == "exit" || bare == "err" || bare == "errx" {
-                    exit_seen = true;
-                }
-                if args.is_empty() {
-                    let addr = match target {
-                        Operand::Symbol(n) => parse_sub_symbol_addr(n),
-                        Operand::Constant(c) if *c >= 0 => Some(*c as u64),
-                        _ => resolve_const_operand_static(func, target)
-                            .filter(|c| *c > 0)
-                            .map(|c| c as u64),
-                    };
-                    if let Some(addr) = addr {
-                        if (0x100000000..0x100008000).contains(&addr)
-                            && names.get(&addr).map(|s| s.as_str()) != Some("usage")
-                        {
-                            traverse_cands.push((inst.source_addr, addr));
-                        }
-                    }
+                if let Some(addr) = addr
+                    && (0x100000000..0x100008000).contains(&addr)
+                    && names.get(&addr).map(|s| s.as_str()) != Some("usage")
+                {
+                    traverse_cands.push((inst.source_addr, addr));
                 }
             }
-            _ => {}
         }
     }
-    if ferror_seen || exit_seen {
-        if let Some((_, addr)) = traverse_cands.iter().max_by_key(|(sa, _)| *sa) {
-            if names.get(addr).map(|s| s.as_str()) != Some("usage") {
-                names.retain(|_, v| v != "traverse");
-                used.remove("traverse");
-                put(*addr, "traverse", &mut names, &mut used);
-            }
-        }
+    if (ferror_seen || exit_seen)
+        && let Some((_, addr)) = traverse_cands.iter().max_by_key(|(sa, _)| *sa)
+        && names.get(addr).map(|s| s.as_str()) != Some("usage")
+    {
+        names.retain(|_, v| v != "traverse");
+        used.remove("traverse");
+        put(*addr, "traverse", &mut names, &mut used);
     }
 
     names
@@ -1151,10 +1154,10 @@ fn infer_data_base(func: &SsaFunction) -> Option<u64> {
                 if let (Some(l), Some(r)) = (
                     resolve_const_operand_static(func, lhs),
                     resolve_const_operand_static(func, rhs),
-                ) {
-                    if l > 0 && r >= 0 {
-                        bump(&mut pages, (l as u64).wrapping_add(r as u64));
-                    }
+                ) && l > 0
+                    && r >= 0
+                {
+                    bump(&mut pages, (l as u64).wrapping_add(r as u64));
                 }
             }
             SsaOp::Store { addr, .. } | SsaOp::Load { addr } => {
@@ -1162,15 +1165,11 @@ fn infer_data_base(func: &SsaFunction) -> Option<u64> {
                     if a > 0 {
                         bump(&mut pages, a as u64);
                     }
-                } else if let Operand::Deref { base, offset } = addr {
-                    if let Some(b) = resolve_const_operand_static(func, base) {
-                        if b > 0 {
-                            bump(
-                                &mut pages,
-                                (b as u64).wrapping_add(*offset as u64),
-                            );
-                        }
-                    }
+                } else if let Operand::Deref { base, offset } = addr
+                    && let Some(b) = resolve_const_operand_static(func, base)
+                    && b > 0
+                {
+                    bump(&mut pages, (b as u64).wrapping_add(*offset as u64));
                 }
             }
             _ => {}
@@ -1182,7 +1181,6 @@ fn infer_data_base(func: &SsaFunction) -> Option<u64> {
         .max_by_key(|(_, count)| *count)
         .map(|(page, _)| page)
 }
-
 
 fn getopt_case_primary_flag(ch: u8) -> Option<&'static str> {
     Some(match ch {
@@ -1269,10 +1267,7 @@ fn infer_global_names(
                 let raw = match target {
                     Operand::Symbol(n) => {
                         if let Some(addr) = parse_sub_symbol_addr(n) {
-                            symbols
-                                .get(&addr)
-                                .cloned()
-                                .unwrap_or_else(|| n.clone())
+                            symbols.get(&addr).cloned().unwrap_or_else(|| n.clone())
                         } else {
                             n.clone()
                         }
@@ -1309,24 +1304,28 @@ fn infer_global_names(
     }
 
     let mut used_names: HashSet<String> = HashSet::new();
-    let put = |addr: u64, name: String, names: &mut HashMap<u64, String>, used: &mut HashSet<String>| {
-        if names.contains_key(&addr) {
-            return;
-        }
-        let mut candidate = name;
-        if !used.insert(candidate.clone()) {
-            candidate = format!("{candidate}_{:x}", addr.wrapping_sub(base));
-            used.insert(candidate.clone());
-        }
-        names.insert(addr, candidate);
-    };
+    let put =
+        |addr: u64, name: String, names: &mut HashMap<u64, String>, used: &mut HashSet<String>| {
+            if names.contains_key(&addr) {
+                return;
+            }
+            let mut candidate = name;
+            if !used.insert(candidate.clone()) {
+                candidate = format!("{candidate}_{:x}", addr.wrapping_sub(base));
+                used.insert(candidate.clone());
+            }
+            names.insert(addr, candidate);
+        };
 
     let mut case_starts: Vec<(u64, u8)> = Vec::new();
     for (block_id, labels) in &func.case_labels {
         if labels.iter().any(|l| l == "default") {
             continue;
         }
-        let mut chars: Vec<u8> = labels.iter().filter_map(|l| parse_case_label_char(l)).collect();
+        let mut chars: Vec<u8> = labels
+            .iter()
+            .filter_map(|l| parse_case_label_char(l))
+            .collect();
         chars.sort_unstable();
         chars.dedup();
         if chars.len() != 1 {
@@ -1390,7 +1389,10 @@ fn infer_global_names(
         if labels.iter().any(|l| l == "default") {
             continue;
         }
-        let mut chars: Vec<u8> = labels.iter().filter_map(|l| parse_case_label_char(l)).collect();
+        let mut chars: Vec<u8> = labels
+            .iter()
+            .filter_map(|l| parse_case_label_char(l))
+            .collect();
         chars.sort_unstable();
         chars.dedup();
         if chars.len() != 1 {
@@ -1401,14 +1403,10 @@ fn infer_global_names(
             .filter(|(_, b, _, c)| *b == *block_id && matches!(c, Some(v) if *v == 1))
             .map(|(a, _, _, _)| *a)
             .collect();
-        if let Some(name) = getopt_case_primary_flag(chars[0]) {
-            if set1.len() == 1 {
-                *votes
-                    .entry(set1[0])
-                    .or_default()
-                    .entry(name)
-                    .or_default() += 3;
-            }
+        if let Some(name) = getopt_case_primary_flag(chars[0])
+            && set1.len() == 1
+        {
+            *votes.entry(set1[0]).or_default().entry(name).or_default() += 3;
         }
     }
 
@@ -1417,7 +1415,10 @@ fn infer_global_names(
         if labels.iter().any(|l| l == "default") {
             continue;
         }
-        let mut chars: Vec<u8> = labels.iter().filter_map(|l| parse_case_label_char(l)).collect();
+        let mut chars: Vec<u8> = labels
+            .iter()
+            .filter_map(|l| parse_case_label_char(l))
+            .collect();
         chars.sort_unstable();
         chars.dedup();
         if chars.len() != 1 {
@@ -1448,10 +1449,7 @@ fn infer_global_names(
     let mut exclusive_for_case: HashMap<u8, Vec<u64>> = HashMap::new();
     for (addr, owners) in &set1_owners {
         if owners.len() == 1 {
-            exclusive_for_case
-                .entry(owners[0])
-                .or_default()
-                .push(*addr);
+            exclusive_for_case.entry(owners[0]).or_default().push(*addr);
         }
     }
     for addrs in exclusive_for_case.values_mut() {
@@ -1466,18 +1464,10 @@ fn infer_global_names(
         };
         if addrs.len() == 1 {
             forced.push((addrs[0], name));
-            *votes
-                .entry(addrs[0])
-                .or_default()
-                .entry(name)
-                .or_default() += 30;
+            *votes.entry(addrs[0]).or_default().entry(name).or_default() += 30;
         } else if let Some(&addr) = addrs.first() {
             forced.push((addr, name));
-            *votes
-                .entry(addr)
-                .or_default()
-                .entry(name)
-                .or_default() += 15;
+            *votes.entry(addr).or_default().entry(name).or_default() += 15;
         }
     }
     forced.sort_by(|a, b| a.0.cmp(&b.0));
@@ -1508,10 +1498,7 @@ fn infer_global_names(
         if names.contains_key(addr) {
             continue;
         }
-        let mut options: Vec<(&'static str, i32)> = cmap
-            .iter()
-            .map(|(n, s)| (*n, *s))
-            .collect();
+        let mut options: Vec<(&'static str, i32)> = cmap.iter().map(|(n, s)| (*n, *s)).collect();
         options.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
         for (name, score) in options {
             if claimed_names.contains(name) {
@@ -1564,12 +1551,11 @@ fn infer_global_names(
     ];
     let mut touched: HashSet<u64> = stores.iter().map(|(a, _, _, _)| *a).collect();
     for inst in &func.values {
-        if let SsaOp::Load { addr } = &inst.op {
-            if let Some(abs) = fold_absolute_addr(func, addr) {
-                if in_data(abs) {
-                    touched.insert(abs);
-                }
-            }
+        if let SsaOp::Load { addr } = &inst.op
+            && let Some(abs) = fold_absolute_addr(func, addr)
+            && in_data(abs)
+        {
+            touched.insert(abs);
         }
     }
     for (off, name) in bootstrap {
@@ -1603,7 +1589,10 @@ fn infer_global_names(
         if labels.iter().any(|l| l == "default") {
             continue;
         }
-        let mut chars: Vec<u8> = labels.iter().filter_map(|l| parse_case_label_char(l)).collect();
+        let mut chars: Vec<u8> = labels
+            .iter()
+            .filter_map(|l| parse_case_label_char(l))
+            .collect();
         chars.sort_unstable();
         chars.dedup();
         if chars.len() != 1 {
@@ -1691,8 +1680,7 @@ fn infer_global_names(
                 put(*addr, semantic.to_string(), &mut names, &mut used_names);
                 continue;
             }
-            if !c.starts_with("sub_")
-                && c.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+            if !c.starts_with("sub_") && c.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
             {
                 put(*addr, format!("g_{c}"), &mut names, &mut used_names);
             }
@@ -1705,7 +1693,12 @@ fn infer_global_names(
                     &mut used_names,
                 );
             } else if v == 0x50 {
-                put(*addr, "g_termwidth".to_string(), &mut names, &mut used_names);
+                put(
+                    *addr,
+                    "g_termwidth".to_string(),
+                    &mut names,
+                    &mut used_names,
+                );
             }
         }
     }
@@ -1726,14 +1719,12 @@ fn infer_invariant_reg_constants(func: &SsaFunction) -> HashMap<String, u64> {
                 None => {
                     values.insert(reg.to_string(), resolved);
                 }
-                Some(slot) => {
-                    match (*slot, resolved) {
-                        (Some(a), Some(b)) if a == b => {}
-                        (Some(_), Some(_)) => *slot = None,
-                        (Some(_), None) => *slot = None,
-                        (None, _) => {}
-                    }
-                }
+                Some(slot) => match (*slot, resolved) {
+                    (Some(a), Some(b)) if a == b => {}
+                    (Some(_), Some(_)) => *slot = None,
+                    (Some(_), None) => *slot = None,
+                    (None, _) => {}
+                },
             }
         }
     }
@@ -1768,9 +1759,7 @@ fn lookup_reg_value_preferring_invariant(
             continue;
         };
         saw_def = true;
-        let Some(c) = resolve_const_operand_static(func, &Operand::Value(id)) else {
-            return None;
-        };
+        let c = resolve_const_operand_static(func, &Operand::Value(id))?;
         if c <= 0x1000 {
             return None;
         }
@@ -1787,11 +1776,7 @@ fn lookup_reg_value_preferring_invariant(
     found.map(|(id, _)| id)
 }
 
-fn prefer_forward_pred_def(
-    func: &SsaFunction,
-    reg: &str,
-    block: BlockId,
-) -> Option<SsaValueId> {
+fn prefer_forward_pred_def(func: &SsaFunction, reg: &str, block: BlockId) -> Option<SsaValueId> {
     let preds = func.cfg.predecessors(block);
     if preds.len() < 2 {
         return None;
@@ -1808,14 +1793,11 @@ fn prefer_forward_pred_def(
         }
     }
     let has_forward = !forward.is_empty();
-    let order: Vec<BlockId> = if has_forward {
-        forward
-    } else {
-        back
-    };
+    let order: Vec<BlockId> = if has_forward { forward } else { back };
     let mut found: Option<(SsaValueId, Option<u64>)> = None;
     for pred in order {
-        let Some(id) = func.block_defs(pred)
+        let Some(id) = func
+            .block_defs(pred)
             .and_then(|m| m.get(reg))
             .copied()
             .or_else(|| func.lookup(reg, pred))
@@ -1862,12 +1844,11 @@ fn infer_reg_aliases(func: &SsaFunction) -> HashMap<String, String> {
         }
         // Only promote callee-saved aliases; x0-x18 are call-clobbered and
         // must not be frozen to entry argument names across the function.
-        if let Some(idx) = reg.strip_prefix('x') {
-            if let Ok(n) = idx.parse::<u32>() {
-                if n <= 18 {
-                    continue;
-                }
-            }
+        if let Some(idx) = reg.strip_prefix('x')
+            && let Ok(n) = idx.parse::<u32>()
+            && n <= 18
+        {
+            continue;
         }
         let Some(inst) = func.values.get(id.0 as usize) else {
             continue;
@@ -1881,15 +1862,13 @@ fn infer_reg_aliases(func: &SsaFunction) -> HashMap<String, String> {
             SsaOp::Copy {
                 src: Operand::Value(src_id),
             } => {
-                if let Some(src_inst) = func.values.get(src_id.0 as usize) {
-                    if let SsaOp::Copy {
+                if let Some(src_inst) = func.values.get(src_id.0 as usize)
+                    && let SsaOp::Copy {
                         src: Operand::Symbol(name),
                     } = &src_inst.op
-                    {
-                        if !looks_like_reg_name(name) {
-                            aliases.insert(reg.to_string(), name.clone());
-                        }
-                    }
+                    && !looks_like_reg_name(name)
+                {
+                    aliases.insert(reg.to_string(), name.clone());
                 }
             }
             _ => {}
@@ -1954,7 +1933,6 @@ fn resolve_const_operand_static_depth(
     }
 }
 
-
 // ─── SSA Value Types ───────────────────────────────────────────────────────
 
 /// A unique SSA value identifier. Each assignment to a register/variable
@@ -1987,7 +1965,11 @@ pub enum SsaOp {
     /// Store to memory: `*addr = value`
     Store { addr: Operand, value: Operand },
     /// Binary operation: `lhs OP rhs`
-    BinOp { kind: BinOpKind, lhs: Operand, rhs: Operand },
+    BinOp {
+        kind: BinOpKind,
+        lhs: Operand,
+        rhs: Operand,
+    },
     /// Unary operation: `OP src`
     UnaryOp { kind: UnaryOpKind, src: Operand },
     /// Copy: direct value move `src`
@@ -1997,25 +1979,47 @@ pub enum SsaOp {
     /// Return: `return value`
     Return { value: Option<Operand> },
     /// Branch: conditional jump
-    Branch { cond: Operand, true_block: BlockId, false_block: BlockId },
+    Branch {
+        cond: Operand,
+        true_block: BlockId,
+        false_block: BlockId,
+    },
     /// Unconditional jump
     Jump { target: BlockId },
     /// Phi node: merge of values from multiple predecessors
-    Phi { incoming: Vec<(BlockId, SsaValueId)> },
+    Phi {
+        incoming: Vec<(BlockId, SsaValueId)>,
+    },
     /// No-op / unknown instruction
     Unknown,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BinOpKind {
-    Add, Sub, Mul, Div, Mod,
-    And, Or, Xor, Shl, Shr, Sar,
-    Eq, Ne, Lt, Le, Gt, Ge,
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Mod,
+    And,
+    Or,
+    Xor,
+    Shl,
+    Shr,
+    Sar,
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UnaryOpKind {
-    Neg, Not, Bswap,
+    Neg,
+    Not,
+    Bswap,
 }
 
 /// An SSA instruction: defines a value (or is a terminator).
@@ -2050,10 +2054,7 @@ pub struct CfgBlock {
 }
 
 impl Cfg {
-    pub fn from_blocks(
-        blocks: &[(u64, Vec<u64>)],
-        edges: &[(u64, u64)],
-    ) -> Self {
+    pub fn from_blocks(blocks: &[(u64, Vec<u64>)], edges: &[(u64, u64)]) -> Self {
         Self::from_blocks_with_map(blocks, edges).0
     }
 
@@ -2063,7 +2064,11 @@ impl Cfg {
     ) -> (Self, HashMap<u64, BlockId>) {
         let n = blocks.len();
         let mut addr_to_id = HashMap::with_capacity(
-            blocks.iter().map(|(_, a)| a.len().saturating_add(1)).sum::<usize>().max(n),
+            blocks
+                .iter()
+                .map(|(_, a)| a.len().saturating_add(1))
+                .sum::<usize>()
+                .max(n),
         );
         let mut cfg_blocks = Vec::with_capacity(n);
         for (i, (addr, inst_addrs)) in blocks.iter().enumerate() {
@@ -2086,16 +2091,16 @@ impl Cfg {
         let mut preds = vec![Vec::new(); n];
         let mut succs = vec![Vec::new(); n];
         for (from_addr, to_addr) in edges {
-            if let (Some(&from), Some(&to)) = (addr_to_id.get(from_addr), addr_to_id.get(to_addr)) {
-                if from != to {
-                    let fi = from.0 as usize;
-                    let ti = to.0 as usize;
-                    if !succs[fi].contains(&to) {
-                        succs[fi].push(to);
-                    }
-                    if !preds[ti].contains(&from) {
-                        preds[ti].push(from);
-                    }
+            if let (Some(&from), Some(&to)) = (addr_to_id.get(from_addr), addr_to_id.get(to_addr))
+                && from != to
+            {
+                let fi = from.0 as usize;
+                let ti = to.0 as usize;
+                if !succs[fi].contains(&to) {
+                    succs[fi].push(to);
+                }
+                if !preds[ti].contains(&from) {
+                    preds[ti].push(from);
                 }
             }
         }
@@ -2160,16 +2165,16 @@ impl Cfg {
         let mut preds = vec![Vec::new(); n];
         let mut succs = vec![Vec::new(); n];
         for (from_addr, to_addr) in edges {
-            if let (Some(&from), Some(&to)) = (addr_to_id.get(from_addr), addr_to_id.get(to_addr)) {
-                if from != to {
-                    let fi = from.0 as usize;
-                    let ti = to.0 as usize;
-                    if !succs[fi].contains(&to) {
-                        succs[fi].push(to);
-                    }
-                    if !preds[ti].contains(&from) {
-                        preds[ti].push(from);
-                    }
+            if let (Some(&from), Some(&to)) = (addr_to_id.get(from_addr), addr_to_id.get(to_addr))
+                && from != to
+            {
+                let fi = from.0 as usize;
+                let ti = to.0 as usize;
+                if !succs[fi].contains(&to) {
+                    succs[fi].push(to);
+                }
+                if !preds[ti].contains(&from) {
+                    preds[ti].push(from);
                 }
             }
         }
@@ -2273,17 +2278,19 @@ impl DominatorTree {
                     if pi < idom.len() && idom[pi].is_some() {
                         new_idom = match new_idom {
                             None => Some(pred),
-                            Some(current) => Some(Self::intersect(pred, current, &idom, &post_order)),
+                            Some(current) => {
+                                Some(Self::intersect(pred, current, &idom, &post_order))
+                            }
                         };
                     }
                 }
-                if let Some(nd) = new_idom {
-                    if idom.get(bi).copied().flatten() != Some(nd) {
-                        if bi < idom.len() {
-                            idom[bi] = Some(nd);
-                        }
-                        changed = true;
+                if let Some(nd) = new_idom
+                    && idom.get(bi).copied().flatten() != Some(nd)
+                {
+                    if bi < idom.len() {
+                        idom[bi] = Some(nd);
                     }
+                    changed = true;
                 }
             }
         }
@@ -2296,12 +2303,7 @@ impl DominatorTree {
         }
     }
 
-    fn post_order_visit(
-        cfg: &Cfg,
-        entry: BlockId,
-        visited: &mut [bool],
-        order: &mut Vec<BlockId>,
-    ) {
+    fn post_order_visit(cfg: &Cfg, entry: BlockId, visited: &mut [bool], order: &mut Vec<BlockId>) {
         let ei = entry.0 as usize;
         if ei >= visited.len() || visited[ei] {
             return;
@@ -2330,12 +2332,9 @@ impl DominatorTree {
         idom: &[Option<BlockId>],
         post_order: &[u32],
     ) -> BlockId {
-        let po = |b: BlockId| -> u32 {
-            post_order.get(b.0 as usize).copied().unwrap_or(u32::MAX)
-        };
-        let next = |b: BlockId| -> BlockId {
-            idom.get(b.0 as usize).copied().flatten().unwrap_or(b)
-        };
+        let po = |b: BlockId| -> u32 { post_order.get(b.0 as usize).copied().unwrap_or(u32::MAX) };
+        let next =
+            |b: BlockId| -> BlockId { idom.get(b.0 as usize).copied().flatten().unwrap_or(b) };
         let mut finger1 = b1;
         let mut finger2 = b2;
         for _ in 0..4096 {
@@ -2429,7 +2428,6 @@ impl DominatorTree {
 
 // ─── SSA Construction ──────────────────────────────────────────────────────
 
-const REG_SLOT_X0: usize = 0;
 const REG_SLOT_SP: usize = 31;
 const REG_SLOT_XZR: usize = 32;
 const REG_SLOT_CMP: usize = 33;
@@ -2671,7 +2669,13 @@ impl SsaFunction {
         id
     }
 
-    pub fn define(&mut self, register: &str, block: BlockId, op: SsaOp, source_addr: u64) -> SsaValueId {
+    pub fn define(
+        &mut self,
+        register: &str,
+        block: BlockId,
+        op: SsaOp,
+        source_addr: u64,
+    ) -> SsaValueId {
         let id = self.new_value_id();
         self.values.push(SsaInstruction {
             id,
@@ -2815,8 +2819,12 @@ impl SsaFunction {
                 let l = self.render_operand_depth(lhs, depth + 1, visiting, cache);
                 let r = self.render_operand_depth(rhs, depth + 1, visiting, cache);
                 match kind {
-                    BinOpKind::Eq | BinOpKind::Ne | BinOpKind::Lt | BinOpKind::Le
-                    | BinOpKind::Gt | BinOpKind::Ge => {
+                    BinOpKind::Eq
+                    | BinOpKind::Ne
+                    | BinOpKind::Lt
+                    | BinOpKind::Le
+                    | BinOpKind::Gt
+                    | BinOpKind::Ge => {
                         format!("{} {} {}", l, Self::render_binop(*kind), r)
                     }
                     _ => format!("({} {} {})", l, Self::render_binop(*kind), r),
@@ -2833,7 +2841,10 @@ impl SsaFunction {
                 Operand::Deref { base, offset } => {
                     let base_text = self.render_operand_depth(base, depth + 1, visiting, cache);
                     if *offset == 0 {
-                        if base_text.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '_') {
+                        if base_text
+                            .chars()
+                            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+                        {
                             format!("*{base_text}")
                         } else {
                             format!("*({base_text})")
@@ -2848,7 +2859,7 @@ impl SsaFunction {
                     "*({})",
                     self.render_operand_depth(other, depth + 1, visiting, cache)
                 ),
-            }
+            },
             SsaOp::Store { addr, value } => {
                 format!(
                     "*({}) = {}",
@@ -2936,27 +2947,33 @@ impl SsaFunction {
         }
     }
 
-    fn render_operand(&self, op: &Operand) -> String {
-        let mut visiting = HashSet::new();
-        let mut cache = HashMap::new();
-        self.render_operand_depth(op, 0, &mut visiting, &mut cache)
-    }
-
     fn render_binop(kind: BinOpKind) -> &'static str {
         match kind {
-            BinOpKind::Add => "+", BinOpKind::Sub => "-", BinOpKind::Mul => "*",
-            BinOpKind::Div => "/", BinOpKind::Mod => "%",
-            BinOpKind::And => "&", BinOpKind::Or => "|", BinOpKind::Xor => "^",
-            BinOpKind::Shl => "<<", BinOpKind::Shr => ">>", BinOpKind::Sar => ">>",
-            BinOpKind::Eq => "==", BinOpKind::Ne => "!=",
-            BinOpKind::Lt => "<", BinOpKind::Le => "<=",
-            BinOpKind::Gt => ">", BinOpKind::Ge => ">=",
+            BinOpKind::Add => "+",
+            BinOpKind::Sub => "-",
+            BinOpKind::Mul => "*",
+            BinOpKind::Div => "/",
+            BinOpKind::Mod => "%",
+            BinOpKind::And => "&",
+            BinOpKind::Or => "|",
+            BinOpKind::Xor => "^",
+            BinOpKind::Shl => "<<",
+            BinOpKind::Shr => ">>",
+            BinOpKind::Sar => ">>",
+            BinOpKind::Eq => "==",
+            BinOpKind::Ne => "!=",
+            BinOpKind::Lt => "<",
+            BinOpKind::Le => "<=",
+            BinOpKind::Gt => ">",
+            BinOpKind::Ge => ">=",
         }
     }
 
     fn render_unaryop(kind: UnaryOpKind) -> &'static str {
         match kind {
-            UnaryOpKind::Neg => "-", UnaryOpKind::Not => "~", UnaryOpKind::Bswap => "bswap(",
+            UnaryOpKind::Neg => "-",
+            UnaryOpKind::Not => "~",
+            UnaryOpKind::Bswap => "bswap(",
         }
     }
 }
@@ -3082,15 +3099,14 @@ pub fn constant_propagation(func: &mut SsaFunction) {
 
     for inst in &mut func.values {
         replace_operands_with_constants(&mut inst.op, &const_map);
-        if let SsaOp::BinOp { kind, lhs, rhs } = &inst.op {
-            if let (Operand::Constant(l), Operand::Constant(r)) = (lhs, rhs) {
-                if let Some(folded) = eval_binop(*kind, *l, *r) {
-                    inst.op = SsaOp::Copy {
-                        src: Operand::Constant(folded),
-                    };
-                    continue;
-                }
-            }
+        if let SsaOp::BinOp { kind, lhs, rhs } = &inst.op
+            && let (Operand::Constant(l), Operand::Constant(r)) = (lhs, rhs)
+            && let Some(folded) = eval_binop(*kind, *l, *r)
+        {
+            inst.op = SsaOp::Copy {
+                src: Operand::Constant(folded),
+            };
+            continue;
         }
         if let SsaOp::UnaryOp {
             kind,
@@ -3132,28 +3148,49 @@ fn eval_operand_constant_vec(
     }
 }
 
-fn eval_operand_constant(op: &Operand, constants: &HashMap<SsaValueId, Option<i64>>) -> Option<i64> {
-    match op {
-        Operand::Constant(c) => Some(*c),
-        Operand::Value(id) => constants.get(id).copied().flatten(),
-        Operand::Deref { base, .. } => eval_operand_constant(base, constants),
-        _ => None,
-    }
-}
-
 fn eval_binop(kind: BinOpKind, l: i64, r: i64) -> Option<i64> {
     match kind {
         BinOpKind::Add => l.checked_add(r),
         BinOpKind::Sub => l.checked_sub(r),
         BinOpKind::Mul => l.checked_mul(r),
-        BinOpKind::Div => if r != 0 { l.checked_div(r) } else { None },
-        BinOpKind::Mod => if r != 0 { l.checked_rem(r) } else { None },
+        BinOpKind::Div => {
+            if r != 0 {
+                l.checked_div(r)
+            } else {
+                None
+            }
+        }
+        BinOpKind::Mod => {
+            if r != 0 {
+                l.checked_rem(r)
+            } else {
+                None
+            }
+        }
         BinOpKind::And => Some(l & r),
         BinOpKind::Or => Some(l | r),
         BinOpKind::Xor => Some(l ^ r),
-        BinOpKind::Shl => if r >= 0 && r < 64 { Some(l << r) } else { None },
-        BinOpKind::Shr => if r >= 0 && r < 64 { Some(((l as u64) >> r) as i64) } else { None },
-        BinOpKind::Sar => if r >= 0 && r < 64 { Some(l >> r) } else { None },
+        BinOpKind::Shl => {
+            if (0..64).contains(&r) {
+                Some(l << r)
+            } else {
+                None
+            }
+        }
+        BinOpKind::Shr => {
+            if (0..64).contains(&r) {
+                Some(((l as u64) >> r) as i64)
+            } else {
+                None
+            }
+        }
+        BinOpKind::Sar => {
+            if (0..64).contains(&r) {
+                Some(l >> r)
+            } else {
+                None
+            }
+        }
         BinOpKind::Eq => Some((l == r) as i64),
         BinOpKind::Ne => Some((l != r) as i64),
         BinOpKind::Lt => Some((l < r) as i64),
@@ -3177,21 +3214,34 @@ fn replace_operand_constants(operand: &mut Operand, constants: &HashMap<SsaValue
     }
 }
 
+#[allow(clippy::collapsible_match)]
 fn replace_operands_with_constants(op: &mut SsaOp, constants: &HashMap<SsaValueId, Option<i64>>) {
     let replace = |operand: &mut Operand| {
         replace_operand_constants(operand, constants);
     };
     match op {
         SsaOp::Copy { src } => replace(src),
-        SsaOp::BinOp { lhs, rhs, .. } => { replace(lhs); replace(rhs); }
+        SsaOp::BinOp { lhs, rhs, .. } => {
+            replace(lhs);
+            replace(rhs);
+        }
         SsaOp::UnaryOp { src, .. } => replace(src),
         SsaOp::Load { addr } => replace(addr),
-        SsaOp::Store { addr, value } => { replace(addr); replace(value); }
+        SsaOp::Store { addr, value } => {
+            replace(addr);
+            replace(value);
+        }
         SsaOp::Call { target, args } => {
             replace(target);
-            for a in args.iter_mut() { replace(a); }
+            for a in args.iter_mut() {
+                replace(a);
+            }
         }
-        SsaOp::Return { value } => { if let Some(v) = value { replace(v); } }
+        SsaOp::Return { value } => {
+            if let Some(v) = value {
+                replace(v);
+            }
+        }
         SsaOp::Branch { cond, .. } => replace(cond),
         _ => {}
     }
@@ -3199,14 +3249,7 @@ fn replace_operands_with_constants(op: &mut SsaOp, constants: &HashMap<SsaValueI
 
 // ─── Dead Code Elimination ─────────────────────────────────────────────────
 
-fn collect_operand_recursive(operand: &Operand, used: &mut HashSet<SsaValueId>) {
-    match operand {
-        Operand::Value(id) => { used.insert(*id); }
-        Operand::Deref { base, .. } => { collect_operand_recursive(base, used); }
-        _ => {}
-    }
-}
-
+#[allow(clippy::collapsible_match)]
 pub fn copy_propagation(func: &mut SsaFunction) {
     if func.values.is_empty() {
         return;
@@ -3229,12 +3272,11 @@ pub fn copy_propagation(func: &mut SsaFunction) {
             if let Some(replacement) = aliases.get(id) {
                 *operand = replacement.clone();
             }
-        } else if let Operand::Deref { base, .. } = operand {
-            if let Operand::Value(id) = base.as_ref() {
-                if let Some(replacement) = aliases.get(id) {
-                    *base = Box::new(replacement.clone());
-                }
-            }
+        } else if let Operand::Deref { base, .. } = operand
+            && let Operand::Value(id) = base.as_ref()
+            && let Some(replacement) = aliases.get(id)
+        {
+            **base = replacement.clone();
         }
     };
     for inst in &mut func.values {
@@ -3350,7 +3392,11 @@ pub fn lift_arm64_to_ssa(
     arguments: &[revx_core::Variable],
 ) -> SsaFunction {
     let trace = ssa_trace_enabled();
-    let t0 = if trace { Some(std::time::Instant::now()) } else { None };
+    let t0 = if trace {
+        Some(std::time::Instant::now())
+    } else {
+        None
+    };
     let inst_count: usize = blocks.iter().map(|b| b.instructions.len()).sum();
     let large = blocks.len() > 24 || inst_count > 128;
     let mut edges: Vec<(u64, u64)> = Vec::with_capacity(references.len());
@@ -3376,7 +3422,11 @@ pub fn lift_arm64_to_ssa(
         }
     }
     let (cfg, block_addr_to_id) = Cfg::from_basic_blocks(blocks, &edges);
-    let t1 = if trace { Some(std::time::Instant::now()) } else { None };
+    let t1 = if trace {
+        Some(std::time::Instant::now())
+    } else {
+        None
+    };
 
     let mut func = if large {
         SsaFunction::new_shallow(cfg)
@@ -3414,15 +3464,32 @@ pub fn lift_arm64_to_ssa(
             continue;
         };
         for inst in &block.instructions {
-            lift_arm64_instruction(inst, block_id, &mut func, &block_addr_to_id, references, &call_targets, &jump_targets, &mut call_names);
+            lift_arm64_instruction(
+                inst,
+                block_id,
+                &mut func,
+                &block_addr_to_id,
+                references,
+                &call_targets,
+                &jump_targets,
+                &mut call_names,
+            );
         }
     }
-    let t2 = if trace { Some(std::time::Instant::now()) } else { None };
+    let t2 = if trace {
+        Some(std::time::Instant::now())
+    } else {
+        None
+    };
 
     if !(large && blocks.len() > 48) {
         insert_register_phis(&mut func);
     }
-    let t3 = if trace { Some(std::time::Instant::now()) } else { None };
+    let t3 = if trace {
+        Some(std::time::Instant::now())
+    } else {
+        None
+    };
     let needs_switch = references.iter().any(|r| {
         matches!(
             r.kind,
@@ -3445,7 +3512,11 @@ pub fn lift_arm64_to_ssa(
         }
         polish_switch_markers_with_map(&mut func, references, &block_addr_to_id);
     }
-    let t4 = if trace { Some(std::time::Instant::now()) } else { None };
+    let t4 = if trace {
+        Some(std::time::Instant::now())
+    } else {
+        None
+    };
     let needs_rewrite = !large
         || func
             .values
@@ -3454,7 +3525,11 @@ pub fn lift_arm64_to_ssa(
     if needs_rewrite {
         rewrite_symbol_regs_to_values(&mut func);
     }
-    let t5 = if trace { Some(std::time::Instant::now()) } else { None };
+    let t5 = if trace {
+        Some(std::time::Instant::now())
+    } else {
+        None
+    };
     if !large {
         rewrite_low_constant_mem_bases(&mut func);
         constant_propagation(&mut func);
@@ -3486,12 +3561,12 @@ pub fn lift_arm64_to_ssa(
 fn light_constant_fold(func: &mut SsaFunction) {
     for inst in &mut func.values {
         if let SsaOp::BinOp { kind, lhs, rhs } = &inst.op {
-            if let (Operand::Constant(l), Operand::Constant(r)) = (lhs, rhs) {
-                if let Some(folded) = eval_binop(*kind, *l, *r) {
-                    inst.op = SsaOp::Copy {
-                        src: Operand::Constant(folded),
-                    };
-                }
+            if let (Operand::Constant(l), Operand::Constant(r)) = (lhs, rhs)
+                && let Some(folded) = eval_binop(*kind, *l, *r)
+            {
+                inst.op = SsaOp::Copy {
+                    src: Operand::Constant(folded),
+                };
             }
         } else if let SsaOp::UnaryOp {
             kind,
@@ -3510,22 +3585,6 @@ fn light_constant_fold(func: &mut SsaFunction) {
             }
         }
     }
-}
-
-fn attach_jump_table_case_labels(
-    func: &mut SsaFunction,
-    blocks: &[revx_core::BasicBlock],
-    references: &[revx_core::Reference],
-) {
-    let mut addr_to_block: HashMap<u64, BlockId> = HashMap::new();
-    for (i, b) in blocks.iter().enumerate() {
-        let id = BlockId(i as u32);
-        addr_to_block.insert(b.address, id);
-        for inst in &b.instructions {
-            addr_to_block.insert(inst.address, id);
-        }
-    }
-    attach_jump_table_case_labels_with_map(func, blocks, references, &addr_to_block);
 }
 
 fn attach_jump_table_case_labels_with_map(
@@ -3597,21 +3656,6 @@ fn format_case_char_label(ch: i64) -> String {
     format!("case {ch:#x}")
 }
 
-fn polish_switch_markers(
-    func: &mut SsaFunction,
-    references: &[revx_core::Reference],
-    blocks: &[revx_core::BasicBlock],
-) {
-    let mut addr_to_block: HashMap<u64, BlockId> = HashMap::new();
-    for (i, b) in blocks.iter().enumerate() {
-        addr_to_block.insert(b.address, BlockId(i as u32));
-        for inst in &b.instructions {
-            addr_to_block.insert(inst.address, BlockId(i as u32));
-        }
-    }
-    polish_switch_markers_with_map(func, references, &addr_to_block);
-}
-
 fn polish_switch_markers_with_map(
     func: &mut SsaFunction,
     references: &[revx_core::Reference],
@@ -3649,10 +3693,10 @@ fn polish_switch_markers_with_map(
         for bid in &case_blocks {
             if let Some(labels) = func.case_labels.get(bid) {
                 for lab in labels {
-                    if let Some(rest) = lab.strip_prefix("case ") {
-                        if rest.starts_with('\'') {
-                            chars.push(rest.to_string());
-                        }
+                    if let Some(rest) = lab.strip_prefix("case ")
+                        && rest.starts_with('\'')
+                    {
+                        chars.push(rest.to_string());
                     }
                 }
             }
@@ -3666,8 +3710,7 @@ fn polish_switch_markers_with_map(
                 let Some(c) = body.chars().next() else {
                     return false;
                 };
-                body.len() == 1
-                    && (c.is_ascii_alphanumeric() || matches!(c, '@' | '%' | ','))
+                body.len() == 1 && (c.is_ascii_alphanumeric() || matches!(c, '@' | '%' | ','))
             })
             .cloned()
             .collect();
@@ -3700,32 +3743,27 @@ fn polish_switch_markers_with_map(
             };
             format!("/* switch -> {}{} */", head.join(", "), more)
         };
-        if let Some(&bid) = addr_to_block.get(&br) {
-            if let Some(cfg_block) = func.cfg.blocks.get(bid.0 as usize) {
-                let inst_ids = cfg_block.insts.clone();
-                for iid in inst_ids {
-                    if let Some(inst) = func.values.get_mut(iid.0 as usize) {
-                        if let SsaOp::Copy {
-                            src: Operand::Symbol(name),
-                        } = &inst.op
-                        {
-                            if name.starts_with("/* switch") {
-                                inst.op = SsaOp::Copy {
-                                    src: Operand::Symbol(summary.clone()),
-                                };
-                            }
-                        }
-                    }
+        if let Some(&bid) = addr_to_block.get(&br)
+            && let Some(cfg_block) = func.cfg.blocks.get(bid.0 as usize)
+        {
+            let inst_ids = cfg_block.insts.clone();
+            for iid in inst_ids {
+                if let Some(inst) = func.values.get_mut(iid.0 as usize)
+                    && let SsaOp::Copy {
+                        src: Operand::Symbol(name),
+                    } = &inst.op
+                    && name.starts_with("/* switch")
+                {
+                    inst.op = SsaOp::Copy {
+                        src: Operand::Symbol(summary.clone()),
+                    };
                 }
             }
         }
     }
 }
 
-pub fn refine_call_arguments_with_symbols(
-    func: &mut SsaFunction,
-    symbols: &HashMap<u64, String>,
-) {
+pub fn refine_call_arguments_with_symbols(func: &mut SsaFunction, symbols: &HashMap<u64, String>) {
     let call_ids: Vec<SsaValueId> = func
         .values
         .iter()
@@ -3783,10 +3821,10 @@ pub fn refine_call_arguments_with_symbols(
                     else {
                         continue;
                     };
-                    if let Some(off) = stack_slot_offset(func, st_addr) {
-                        if (0..0x20).contains(&off) {
-                            stack_args.push((off, value.clone()));
-                        }
+                    if let Some(off) = stack_slot_offset(func, st_addr)
+                        && (0..0x20).contains(&off)
+                    {
+                        stack_args.push((off, value.clone()));
                     }
                 }
                 stack_args.sort_by_key(|(off, _)| *off);
@@ -3795,22 +3833,21 @@ pub fn refine_call_arguments_with_symbols(
                     cur_args.push(op);
                 }
             }
-            if let Some(inst) = func.values.get_mut(id.0 as usize) {
-                if let SsaOp::Call { args, .. } = &mut inst.op {
-                    *args = cur_args;
-                }
+            if let Some(inst) = func.values.get_mut(id.0 as usize)
+                && let SsaOp::Call { args, .. } = &mut inst.op
+            {
+                *args = cur_args;
             }
             continue;
         }
         let Some(max_args) = known_call_arg_count(&name) else {
             continue;
         };
-        if let Some(inst) = func.values.get_mut(id.0 as usize) {
-            if let SsaOp::Call { args, .. } = &mut inst.op {
-                if args.len() > max_args {
-                    args.truncate(max_args);
-                }
-            }
+        if let Some(inst) = func.values.get_mut(id.0 as usize)
+            && let SsaOp::Call { args, .. } = &mut inst.op
+            && args.len() > max_args
+        {
+            args.truncate(max_args);
         }
     }
 }
@@ -3934,12 +3971,7 @@ fn lift_x64_instruction(
                         func.define(&dst, block, SsaOp::Copy { src: operand }, addr);
                     }
                 } else if src.starts_with('[') {
-                    func.define(
-                        &dst,
-                        block,
-                        SsaOp::Load { addr: operand },
-                        addr,
-                    );
+                    func.define(&dst, block, SsaOp::Load { addr: operand }, addr);
                 } else {
                     func.define(&dst, block, SsaOp::Copy { src: operand }, addr);
                 }
@@ -4104,21 +4136,20 @@ fn lift_x64_instruction(
                         r.kind,
                         revx_core::ReferenceKind::Jump | revx_core::ReferenceKind::IndirectJump
                     )
-            }) {
-                if let Some(&target_block) = block_addr_to_id.get(&target_ref.to) {
-                    let id = func.new_value_id();
-                    let inst = SsaInstruction {
-                        id,
-                        op: SsaOp::Jump {
-                            target: target_block,
-                        },
-                        source_addr: addr,
-                        block,
-                    };
-                    func.cfg.block_mut(block).insts.push(inst.id);
+            }) && let Some(&target_block) = block_addr_to_id.get(&target_ref.to)
+            {
+                let id = func.new_value_id();
+                let inst = SsaInstruction {
+                    id,
+                    op: SsaOp::Jump {
+                        target: target_block,
+                    },
+                    source_addr: addr,
+                    block,
+                };
+                func.cfg.block_mut(block).insts.push(inst.id);
 
-                    func.values.push(inst);
-                }
+                func.values.push(inst);
             }
         }
         op if op.starts_with('j') && op != "jmp" => {
@@ -4182,13 +4213,7 @@ fn x64_binop_kind(opcode: &str) -> BinOpKind {
     }
 }
 
-fn lift_x64_binop(
-    text: &str,
-    kind: BinOpKind,
-    block: BlockId,
-    func: &mut SsaFunction,
-    addr: u64,
-) {
+fn lift_x64_binop(text: &str, kind: BinOpKind, block: BlockId, func: &mut SsaFunction, addr: u64) {
     let Some(dst) = extract_x64_dest(text) else {
         return;
     };
@@ -4222,17 +4247,16 @@ fn lift_x64_binop(
 
         func.values.push(inst);
     } else {
-        func.define(
-            &dst,
-            block,
-            SsaOp::BinOp { kind, lhs, rhs },
-            addr,
-        );
+        func.define(&dst, block, SsaOp::BinOp { kind, lhs, rhs }, addr);
     }
 }
 
 fn extract_x64_dest(text: &str) -> Option<String> {
-    let rest = text.split_whitespace().skip(1).collect::<Vec<_>>().join(" ");
+    let rest = text
+        .split_whitespace()
+        .skip(1)
+        .collect::<Vec<_>>()
+        .join(" ");
     let first = rest.split(',').next()?.trim();
     if first.is_empty() {
         return None;
@@ -4241,7 +4265,11 @@ fn extract_x64_dest(text: &str) -> Option<String> {
 }
 
 fn extract_x64_src(text: &str) -> Option<String> {
-    let rest = text.split_whitespace().skip(1).collect::<Vec<_>>().join(" ");
+    let rest = text
+        .split_whitespace()
+        .skip(1)
+        .collect::<Vec<_>>()
+        .join(" ");
     let mut parts = rest.splitn(2, ',');
     parts.next()?;
     Some(parts.next()?.trim().to_string())
@@ -4264,11 +4292,7 @@ fn x64_mem_base(mem: &str) -> String {
         .trim_start_matches('[')
         .trim_end_matches(']')
         .trim();
-    let base = inner
-        .split(|c: char| c == '+' || c == '-' || c == '*')
-        .next()
-        .unwrap_or(inner)
-        .trim();
+    let base = inner.split(['+', '-', '*']).next().unwrap_or(inner).trim();
     base.to_string()
 }
 
@@ -4281,10 +4305,10 @@ fn x64_mem_offset(mem: &str) -> i64 {
     if let Some(idx) = inner.find('+') {
         return parse_x64_imm(inner[idx + 1..].trim()).unwrap_or(0);
     }
-    if let Some(idx) = inner.find('-') {
-        if idx > 0 {
-            return -parse_x64_imm(inner[idx + 1..].trim()).unwrap_or(0);
-        }
+    if let Some(idx) = inner.find('-')
+        && idx > 0
+    {
+        return -parse_x64_imm(inner[idx + 1..].trim()).unwrap_or(0);
     }
     0
 }
@@ -4292,13 +4316,12 @@ fn x64_mem_offset(mem: &str) -> i64 {
 /// Normalize register name (strip width suffix, lowercase).
 fn static_xreg(n: u8) -> Option<&'static str> {
     const X: [&str; 31] = [
-        "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12",
-        "x13", "x14", "x15", "x16", "x17", "x18", "x19", "x20", "x21", "x22", "x23", "x24",
-        "x25", "x26", "x27", "x28", "x29", "x30",
+        "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13",
+        "x14", "x15", "x16", "x17", "x18", "x19", "x20", "x21", "x22", "x23", "x24", "x25", "x26",
+        "x27", "x28", "x29", "x30",
     ];
     X.get(n as usize).copied()
 }
-
 
 #[inline]
 fn format_sub_addr(addr: u64) -> String {
@@ -4378,10 +4401,7 @@ fn normalize_reg(reg: &str) -> String {
             return name.to_string();
         }
     }
-    if bytes[0] == b'x'
-        && bytes.len() > 1
-        && bytes[1..].iter().all(|b| b.is_ascii_digit())
-    {
+    if bytes[0] == b'x' && bytes.len() > 1 && bytes[1..].iter().all(|b| b.is_ascii_digit()) {
         return trimmed.to_string();
     }
     if trimmed.bytes().all(|b| !b.is_ascii_uppercase()) {
@@ -4404,7 +4424,10 @@ fn parse_arm64_imm(text: &str) -> Option<i64> {
         .find(|c: char| c.is_whitespace() || c == ',' || c == ']')
         .unwrap_or(rest.len());
     let token = &rest[..end];
-    if let Some(hex) = token.strip_prefix("0x").or_else(|| token.strip_prefix("0X")) {
+    if let Some(hex) = token
+        .strip_prefix("0x")
+        .or_else(|| token.strip_prefix("0X"))
+    {
         return i64::from_str_radix(hex, 16).ok();
     }
     if let Some(neg) = token
@@ -4416,13 +4439,8 @@ fn parse_arm64_imm(text: &str) -> Option<i64> {
     token.parse().ok()
 }
 
-/// Extract the destination register from an ARM64 instruction.
-/// e.g., "mov x0, x1" -> "x0", "add x0, x1, #0x10" -> "x0"
-fn extract_dest_reg(text: &str) -> Option<String> {
-    extract_dest_reg_ref(text).map(|value| value.to_string())
-}
-
 /// Lift a single ARM64 instruction to SSA.
+#[allow(clippy::too_many_arguments)]
 fn lift_arm64_instruction(
     inst: &revx_core::Instruction,
     block: BlockId,
@@ -4447,47 +4465,47 @@ fn lift_arm64_instruction(
 
     match opcode {
         "mov" | "movz" | "movn" => {
-            if let Some(dst) = extract_dest_reg_ref(text) {
-                if let Some((_, rest)) = text.split_once(',') {
-                    let src = rest.trim();
-                    let operand = if let Some(imm) = parse_arm64_imm(src) {
-                        Operand::Constant(imm)
-                    } else {
-                        let clean = src.split_whitespace().next().unwrap_or(src);
-                        lookup_or_symbol(func, clean, block)
-                    };
-                    func.define(dst, block, SsaOp::Copy { src: operand }, addr);
-                }
+            if let Some(dst) = extract_dest_reg_ref(text)
+                && let Some((_, rest)) = text.split_once(',')
+            {
+                let src = rest.trim();
+                let operand = if let Some(imm) = parse_arm64_imm(src) {
+                    Operand::Constant(imm)
+                } else {
+                    let clean = src.split_whitespace().next().unwrap_or(src);
+                    lookup_or_symbol(func, clean, block)
+                };
+                func.define(dst, block, SsaOp::Copy { src: operand }, addr);
             }
         }
 
         // add reg, reg, reg  /  add reg, reg, #imm
         "add" | "adds" => {
-            lift_arm64_binop(&text, BinOpKind::Add, block, func, addr);
+            lift_arm64_binop(text, BinOpKind::Add, block, func, addr);
         }
         "sub" | "subs" => {
-            lift_arm64_binop(&text, BinOpKind::Sub, block, func, addr);
+            lift_arm64_binop(text, BinOpKind::Sub, block, func, addr);
         }
         "mul" => {
-            lift_arm64_binop(&text, BinOpKind::Mul, block, func, addr);
+            lift_arm64_binop(text, BinOpKind::Mul, block, func, addr);
         }
         "and" | "ands" => {
-            lift_arm64_binop(&text, BinOpKind::And, block, func, addr);
+            lift_arm64_binop(text, BinOpKind::And, block, func, addr);
         }
         "orr" => {
-            lift_arm64_binop(&text, BinOpKind::Or, block, func, addr);
+            lift_arm64_binop(text, BinOpKind::Or, block, func, addr);
         }
         "eor" => {
-            lift_arm64_binop(&text, BinOpKind::Xor, block, func, addr);
+            lift_arm64_binop(text, BinOpKind::Xor, block, func, addr);
         }
         "lsl" => {
-            lift_arm64_binop(&text, BinOpKind::Shl, block, func, addr);
+            lift_arm64_binop(text, BinOpKind::Shl, block, func, addr);
         }
         "lsr" => {
-            lift_arm64_binop(&text, BinOpKind::Shr, block, func, addr);
+            lift_arm64_binop(text, BinOpKind::Shr, block, func, addr);
         }
         "asr" => {
-            lift_arm64_binop(&text, BinOpKind::Sar, block, func, addr);
+            lift_arm64_binop(text, BinOpKind::Sar, block, func, addr);
         }
 
         // cmp / cmn — capture operands for later condition-code materialization.
@@ -4551,7 +4569,10 @@ fn lift_arm64_instruction(
                 let id = func.new_value_id();
                 let inst = SsaInstruction {
                     id,
-                    op: SsaOp::Store { addr: addr_operand, value },
+                    op: SsaOp::Store {
+                        addr: addr_operand,
+                        value,
+                    },
                     source_addr: addr,
                     block,
                 };
@@ -4609,7 +4630,10 @@ fn lift_arm64_instruction(
                     max_args
                 };
                 let n = n.min(8);
-                for reg in ["x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7"].iter().take(n) {
+                for reg in ["x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7"]
+                    .iter()
+                    .take(n)
+                {
                     if let Some(val) = func.lookup_norm(reg, block) {
                         args.push(Operand::Value(val));
                     } else {
@@ -4641,8 +4665,8 @@ fn lift_arm64_instruction(
             let defs = block_defs_mut(&mut func.defs, block);
             defs.insert_reg("x0", id);
             for reg in [
-                "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12",
-                "x13", "x14", "x15", "x16", "x17",
+                "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13",
+                "x14", "x15", "x16", "x17",
             ] {
                 defs.remove(reg);
             }
@@ -4687,8 +4711,8 @@ fn lift_arm64_instruction(
             let defs = block_defs_mut(&mut func.defs, block);
             defs.insert_reg("x0", id);
             for reg in [
-                "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12",
-                "x13", "x14", "x15", "x16", "x17",
+                "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13",
+                "x14", "x15", "x16", "x17",
             ] {
                 defs.remove(reg);
             }
@@ -4714,19 +4738,21 @@ fn lift_arm64_instruction(
             let target_addr = jump_targets.get(&addr).copied().or_else(|| {
                 parse_branch_addr_from_refs(addr, references, &[revx_core::ReferenceKind::Jump])
             });
-            if let Some(target_addr) = target_addr {
-                if let Some(&target_block) = block_addr_to_id.get(&target_addr) {
-                    let id = func.new_value_id();
-                    let inst = SsaInstruction {
-                        id,
-                        op: SsaOp::Jump { target: target_block },
-                        source_addr: addr,
-                        block,
-                    };
-                    func.cfg.block_mut(block).insts.push(inst.id);
+            if let Some(target_addr) = target_addr
+                && let Some(&target_block) = block_addr_to_id.get(&target_addr)
+            {
+                let id = func.new_value_id();
+                let inst = SsaInstruction {
+                    id,
+                    op: SsaOp::Jump {
+                        target: target_block,
+                    },
+                    source_addr: addr,
+                    block,
+                };
+                func.cfg.block_mut(block).insts.push(inst.id);
 
-                    func.values.push(inst);
-                }
+                func.values.push(inst);
             }
         }
         "br" => {
@@ -4736,8 +4762,7 @@ fn lift_arm64_instruction(
                     r.from == addr
                         && matches!(
                             r.kind,
-                            revx_core::ReferenceKind::Jump
-                                | revx_core::ReferenceKind::IndirectJump
+                            revx_core::ReferenceKind::Jump | revx_core::ReferenceKind::IndirectJump
                         )
                         && r.to > 31
                 })
@@ -4891,17 +4916,17 @@ fn lift_arm64_instruction(
 
         // adrp — PC-relative page address (data pointer).
         "adrp" => {
-            if let Some(dst) = extract_dest_reg_ref(text) {
-                if let Some(target) = parse_arm64_page_target(addr, text) {
-                    func.define(
-                        dst,
-                        block,
-                        SsaOp::Copy {
-                            src: Operand::Constant(target as i64),
-                        },
-                        addr,
-                    );
-                }
+            if let Some(dst) = extract_dest_reg_ref(text)
+                && let Some(target) = parse_arm64_page_target(addr, text)
+            {
+                func.define(
+                    dst,
+                    block,
+                    SsaOp::Copy {
+                        src: Operand::Constant(target as i64),
+                    },
+                    addr,
+                );
             }
         }
 
@@ -4956,14 +4981,7 @@ fn lift_arm64_instruction(
                     let f_op = lookup_or_symbol(func, f_reg, block);
                     let cond = parts.get(3).map(|s| s.trim()).unwrap_or("");
                     let preferred = prefer_csel_arm(func, &t_op, &f_op, cond);
-                    func.define(
-                        dst,
-                        block,
-                        SsaOp::Copy {
-                            src: preferred,
-                        },
-                        addr,
-                    );
+                    func.define(dst, block, SsaOp::Copy { src: preferred }, addr);
                 }
             }
         }
@@ -4997,6 +5015,7 @@ fn lift_arm64_instruction(
     }
 }
 
+#[allow(clippy::if_same_then_else)]
 fn lift_arm64_stp_ldp(
     text: &str,
     is_store: bool,
@@ -5019,12 +5038,10 @@ fn lift_arm64_stp_ldp(
     let base_op = lookup_or_symbol(func, &base_reg, block);
     let addr0 = if pre {
         match &base_op {
-            Operand::Symbol(s) if s == "sp" || s == "x31" => {
-                Operand::Deref {
-                    base: Box::new(base_op.clone()),
-                    offset,
-                }
-            }
+            Operand::Symbol(s) if s == "sp" || s == "x31" => Operand::Deref {
+                base: Box::new(base_op.clone()),
+                offset,
+            },
             _ => Operand::Deref {
                 base: Box::new(base_op.clone()),
                 offset,
@@ -5092,19 +5109,18 @@ fn parse_arm64_pair_mem(mem: &str) -> (Option<String>, i64, bool, bool) {
         .unwrap_or("")
         .trim();
     let mut parts = inner.split(',').map(str::trim);
-    let base = parts.next().map(|s| normalize_reg(s));
+    let base = parts.next().map(normalize_reg);
     let mut offset = 0i64;
-    if let Some(imm_tok) = parts.next() {
-        if let Some(imm) = parse_arm64_imm(imm_tok) {
-            offset = imm;
-        }
+    if let Some(imm_tok) = parts.next()
+        && let Some(imm) = parse_arm64_imm(imm_tok)
+    {
+        offset = imm;
     }
-    if post {
-        if let Some(imm_part) = t.split("],").nth(1) {
-            if let Some(imm) = parse_arm64_imm(imm_part.trim()) {
-                offset = imm;
-            }
-        }
+    if post
+        && let Some(imm_part) = t.split("],").nth(1)
+        && let Some(imm) = parse_arm64_imm(imm_part.trim())
+    {
+        offset = imm;
     }
     (base, offset, writeback, pre)
 }
@@ -5157,7 +5173,10 @@ fn parse_tbz_bit(text: &str) -> Option<u32> {
 }
 
 fn deref_operand(base: Operand, offset: i64) -> Operand {
-    Operand::Deref { base: Box::new(base), offset }
+    Operand::Deref {
+        base: Box::new(base),
+        offset,
+    }
 }
 
 /// Look up a register's current SSA value, or create a Symbol operand if unknown.
@@ -5171,32 +5190,33 @@ fn lookup_or_symbol(func: &SsaFunction, reg_name: &str, block: BlockId) -> Opera
         return Operand::Value(val);
     }
     if let Some(s) = normalize_reg_static(raw) {
-        if s != raw {
-            if let Some(val) = func.lookup_norm(s, block) {
-                return Operand::Value(val);
-            }
+        if s != raw
+            && let Some(val) = func.lookup_norm(s, block)
+        {
+            return Operand::Value(val);
         }
-        if !func.large {
-            if let Some(val) = reaching_def(func, s, block) {
-                return Operand::Value(val);
-            }
+        if !func.large
+            && let Some(val) = reaching_def(func, s, block)
+        {
+            return Operand::Value(val);
         }
         return Operand::Symbol(s.to_string());
     }
     let reg = normalize_reg(raw);
-    if reg.as_str() != raw {
-        if let Some(val) = func.lookup_norm(&reg, block) {
-            return Operand::Value(val);
-        }
+    if reg.as_str() != raw
+        && let Some(val) = func.lookup_norm(&reg, block)
+    {
+        return Operand::Value(val);
     }
-    if !func.large {
-        if let Some(val) = reaching_def(func, &reg, block) {
-            return Operand::Value(val);
-        }
+    if !func.large
+        && let Some(val) = reaching_def(func, &reg, block)
+    {
+        return Operand::Value(val);
     }
     Operand::Symbol(reg)
 }
 
+#[allow(clippy::question_mark)]
 fn reaching_def(func: &SsaFunction, reg: &str, block: BlockId) -> Option<SsaValueId> {
     let preds = func.cfg.predecessors(block);
     if preds.is_empty() {
@@ -5204,7 +5224,8 @@ fn reaching_def(func: &SsaFunction, reg: &str, block: BlockId) -> Option<SsaValu
     }
     let mut found: Option<SsaValueId> = None;
     for &pred in preds {
-        let Some(d) = func.block_defs(pred)
+        let Some(d) = func
+            .block_defs(pred)
             .and_then(|m| m.get(reg))
             .copied()
             .or_else(|| func.lookup(reg, pred))
@@ -5226,10 +5247,10 @@ fn collect_symbol_regs_hash(op: &SsaOp, regs: &mut HashSet<String>) {
             regs.insert(normalize_reg(name));
         }
         Operand::Deref { base, .. } => {
-            if let Operand::Symbol(name) = base.as_ref() {
-                if looks_like_reg_name(name) {
-                    regs.insert(normalize_reg(name));
-                }
+            if let Operand::Symbol(name) = base.as_ref()
+                && looks_like_reg_name(name)
+            {
+                regs.insert(normalize_reg(name));
             }
         }
         _ => {}
@@ -5265,48 +5286,7 @@ fn collect_symbol_regs_hash(op: &SsaOp, regs: &mut HashSet<String>) {
     }
 }
 
-fn collect_symbol_regs(op: &SsaOp, regs: &mut BTreeSet<String>) {
-    let mut add = |operand: &Operand| match operand {
-        Operand::Symbol(name) if looks_like_reg_name(name) => {
-            regs.insert(normalize_reg(name));
-        }
-        Operand::Deref { base, .. } => {
-            if let Operand::Symbol(name) = base.as_ref() {
-                if looks_like_reg_name(name) {
-                    regs.insert(normalize_reg(name));
-                }
-            }
-        }
-        _ => {}
-    };
-    match op {
-        SsaOp::Copy { src } => add(src),
-        SsaOp::BinOp { lhs, rhs, .. } => {
-            add(lhs);
-            add(rhs);
-        }
-        SsaOp::UnaryOp { src, .. } => add(src),
-        SsaOp::Load { addr } => add(addr),
-        SsaOp::Store { addr, value } => {
-            add(addr);
-            add(value);
-        }
-        SsaOp::Call { target, args } => {
-            add(target);
-            for a in args {
-                add(a);
-            }
-        }
-        SsaOp::Return { value } => {
-            if let Some(v) = value {
-                add(v);
-            }
-        }
-        SsaOp::Branch { cond, .. } => add(cond),
-        _ => {}
-    }
-}
-
+#[allow(clippy::type_complexity)]
 fn insert_register_phis(func: &mut SsaFunction) {
     let rpo = if func.dom_tree.rpo.is_empty() {
         func.cfg.blocks.iter().map(|b| b.id).collect::<Vec<_>>()
@@ -5342,17 +5322,15 @@ fn insert_register_phis(func: &mut SsaFunction) {
                     }
                 }
                 for reg in regs {
-                    if func.block_defs(block)
-                        .and_then(|m| m.get(&reg))
-                        .is_some()
-                    {
+                    if func.block_defs(block).and_then(|m| m.get(&reg)).is_some() {
                         continue;
                     }
                     let mut incoming: Vec<(BlockId, SsaValueId)> = Vec::new();
                     let mut unique: Option<SsaValueId> = None;
                     let mut ambiguous = false;
                     for &pred in preds {
-                        let Some(d) = func.block_defs(pred)
+                        let Some(d) = func
+                            .block_defs(pred)
                             .and_then(|m| m.get(&reg))
                             .copied()
                             .or_else(|| func.lookup(&reg, pred))
@@ -5380,11 +5358,11 @@ fn insert_register_phis(func: &mut SsaFunction) {
                             block_defs_mut(&mut func.defs, block).insert(reg, id);
                             changed = true;
                         }
-                    } else if let Some(id) = prefer_forward_pred_def(func, &reg, block) {
-                        if def_is_high_const(func, id) {
-                            block_defs_mut(&mut func.defs, block).insert(reg, id);
-                            changed = true;
-                        }
+                    } else if let Some(id) = prefer_forward_pred_def(func, &reg, block)
+                        && def_is_high_const(func, id)
+                    {
+                        block_defs_mut(&mut func.defs, block).insert(reg, id);
+                        changed = true;
                     }
                 }
             }
@@ -5407,10 +5385,7 @@ fn insert_register_phis(func: &mut SsaFunction) {
                 if reg.starts_with("__") {
                     continue;
                 }
-                if func.block_defs(block)
-                    .and_then(|m| m.get(reg))
-                    .is_some()
-                {
+                if func.block_defs(block).and_then(|m| m.get(reg)).is_some() {
                     continue;
                 }
                 if def_is_high_const(func, id) {
@@ -5429,7 +5404,7 @@ fn insert_register_phis(func: &mut SsaFunction) {
         }
     }
 
-    let mut pending: Vec<(BlockId, String, Vec<(BlockId, SsaValueId)>)> = Vec::new();
+    let mut pending: PendingBlockLabels = Vec::new();
     for &block in &rpo {
         let preds = func.cfg.predecessors(block);
         if preds.len() < 2 {
@@ -5493,17 +5468,15 @@ fn insert_register_phis(func: &mut SsaFunction) {
             }
         }
         for reg in regs {
-            if func.block_defs(block)
-                .and_then(|m| m.get(&reg))
-                .is_some()
-            {
+            if func.block_defs(block).and_then(|m| m.get(&reg)).is_some() {
                 continue;
             }
             let mut incoming: Vec<(BlockId, SsaValueId)> = Vec::new();
             let mut unique: Option<SsaValueId> = None;
             let mut ok = true;
             for &pred in preds {
-                let Some(d) = func.block_defs(pred)
+                let Some(d) = func
+                    .block_defs(pred)
                     .and_then(|m| m.get(&reg))
                     .copied()
                     .or_else(|| func.lookup(&reg, pred))
@@ -5529,10 +5502,7 @@ fn insert_register_phis(func: &mut SsaFunction) {
         }
     }
     for (block, reg, incoming) in pending {
-        if func.block_defs(block)
-            .and_then(|m| m.get(&reg))
-            .is_some()
-        {
+        if func.block_defs(block).and_then(|m| m.get(&reg)).is_some() {
             continue;
         }
         let id = func.new_value_id();
@@ -5551,9 +5521,7 @@ fn insert_register_phis(func: &mut SsaFunction) {
 }
 
 fn rewrite_symbol_regs_to_values(func: &mut SsaFunction) {
-    let large = func.large
-        || func.cfg.blocks.len() > 40
-        || func.values.len() > 360;
+    let large = func.large || func.cfg.blocks.len() > 40 || func.values.len() > 360;
     if !large {
         let copy_ids: Vec<(SsaValueId, BlockId)> = func
             .values
@@ -5617,13 +5585,11 @@ fn rewrite_symbol_regs_to_values(func: &mut SsaFunction) {
                         changed = true;
                     }
                 }
-                if changed {
-                    if let Some(inst) = func.values.get_mut(id.0 as usize) {
-                        inst.op = SsaOp::Call {
-                            target,
-                            args: new_args,
-                        };
-                    }
+                if changed && let Some(inst) = func.values.get_mut(id.0 as usize) {
+                    inst.op = SsaOp::Call {
+                        target,
+                        args: new_args,
+                    };
                 }
             }
             SsaOp::Store { addr, value } => {
@@ -5632,20 +5598,16 @@ fn rewrite_symbol_regs_to_values(func: &mut SsaFunction) {
                 let mut changed = false;
                 rewrite_operand_tree(&mut addr, func, block, &mut changed);
                 rewrite_operand_tree(&mut value, func, block, &mut changed);
-                if changed {
-                    if let Some(inst) = func.values.get_mut(id.0 as usize) {
-                        inst.op = SsaOp::Store { addr, value };
-                    }
+                if changed && let Some(inst) = func.values.get_mut(id.0 as usize) {
+                    inst.op = SsaOp::Store { addr, value };
                 }
             }
             SsaOp::Load { addr } => {
                 let mut addr = addr.clone();
                 let mut changed = false;
                 rewrite_operand_tree(&mut addr, func, block, &mut changed);
-                if changed {
-                    if let Some(inst) = func.values.get_mut(id.0 as usize) {
-                        inst.op = SsaOp::Load { addr };
-                    }
+                if changed && let Some(inst) = func.values.get_mut(id.0 as usize) {
+                    inst.op = SsaOp::Load { addr };
                 }
             }
             _ => {}
@@ -5653,11 +5615,7 @@ fn rewrite_symbol_regs_to_values(func: &mut SsaFunction) {
     }
 }
 
-fn resolve_operand_reg_symbol(
-    operand: &mut Operand,
-    func: &SsaFunction,
-    block: BlockId,
-) -> bool {
+fn resolve_operand_reg_symbol(operand: &mut Operand, func: &SsaFunction, block: BlockId) -> bool {
     match operand {
         Operand::Symbol(name) if looks_like_reg_name(name) => {
             if let Some(vid) = lookup_reg_value_preferring_invariant(func, name, block) {
@@ -5702,11 +5660,11 @@ fn resolve_operand_reg_symbol(
                         kind: BinOpKind::Add,
                         ..
                     } => {
-                        if let Some(c) = resolve_const_operand_static(func, &Operand::Value(cur)) {
-                            if c > 0x1000 {
-                                *operand = Operand::Constant(c);
-                                return true;
-                            }
+                        if let Some(c) = resolve_const_operand_static(func, &Operand::Value(cur))
+                            && c > 0x1000
+                        {
+                            *operand = Operand::Constant(c);
+                            return true;
                         }
                         if cur != *id {
                             *operand = Operand::Value(cur);
@@ -5729,7 +5687,6 @@ fn resolve_operand_reg_symbol(
         _ => false,
     }
 }
-
 
 fn looks_like_reg_name(name: &str) -> bool {
     let n = name.to_ascii_lowercase();
@@ -5793,12 +5750,11 @@ fn rewrite_low_constant_mem_bases(func: &mut SsaFunction) {
                 }
             }
             other => {
-                if let Some(c) = resolve_const_operand(func, other) {
-                    if (c as u64) < 0x1000 {
-                        if let Some(page) = nearest_data_page_def(func, inst.block) {
-                            replacement = Some(Operand::Value(page));
-                        }
-                    }
+                if let Some(c) = resolve_const_operand(func, other)
+                    && (c as u64) < 0x1000
+                    && let Some(page) = nearest_data_page_def(func, inst.block)
+                {
+                    replacement = Some(Operand::Value(page));
                 }
             }
         }
@@ -5831,15 +5787,14 @@ fn nearest_data_page_def(func: &SsaFunction, block: BlockId) -> Option<SsaValueI
         }
         if let Some(map) = func.block_defs(b) {
             for id in map.values() {
-                if let Some(inst) = func.values.get(id.0 as usize) {
-                    if let SsaOp::Copy {
+                if let Some(inst) = func.values.get(id.0 as usize)
+                    && let SsaOp::Copy {
                         src: Operand::Constant(c),
                     } = &inst.op
-                    {
-                        if *c as u64 >= 0x10000 && (*c as u64) & 0xfff == 0 {
-                            return Some(*id);
-                        }
-                    }
+                    && *c as u64 >= 0x10000
+                    && (*c as u64) & 0xfff == 0
+                {
+                    return Some(*id);
                 }
             }
         }
@@ -5863,11 +5818,7 @@ fn opcode_token(text: &str) -> &str {
     while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
         i += 1;
     }
-    if start == i {
-        ""
-    } else {
-        &text[start..i]
-    }
+    if start == i { "" } else { &text[start..i] }
 }
 
 fn extract_dest_reg_ref(text: &str) -> Option<&str> {
@@ -5885,15 +5836,7 @@ fn extract_mem_base_ref(text: &str) -> Option<&str> {
     let start = text.find('[')?;
     let inner = text[start + 1..].split(']').next()?;
     let base = inner.split(',').next()?.trim();
-    if base.is_empty() {
-        None
-    } else {
-        Some(base)
-    }
-}
-
-fn extract_mem_base(text: &str) -> Option<String> {
-    extract_mem_base_ref(text).map(|v| v.to_string())
+    if base.is_empty() { None } else { Some(base) }
 }
 
 fn extract_mem_offset(text: &str) -> i64 {
@@ -5941,12 +5884,22 @@ fn parse_branch_addr(current_addr: u64, text: &str) -> Option<u64> {
 fn parse_arm64_page_target(current_addr: u64, text: &str) -> Option<u64> {
     let text = text.trim();
     if let Some(idx) = text.find("$+") {
-        let imm = parse_imm_str(text[idx + 2..].split_whitespace().next()?.trim_end_matches(','))?;
+        let imm = parse_imm_str(
+            text[idx + 2..]
+                .split_whitespace()
+                .next()?
+                .trim_end_matches(','),
+        )?;
         let page = (current_addr & !0xfffu64).wrapping_add(imm as u64);
         return Some(page & !0xfffu64);
     }
     if let Some(idx) = text.find("$-") {
-        let imm = parse_imm_str(text[idx + 2..].split_whitespace().next()?.trim_end_matches(','))?;
+        let imm = parse_imm_str(
+            text[idx + 2..]
+                .split_whitespace()
+                .next()?
+                .trim_end_matches(','),
+        )?;
         let page = (current_addr & !0xfffu64).wrapping_sub(imm as u64);
         return Some(page & !0xfffu64);
     }
@@ -6025,25 +5978,24 @@ fn materialize_flag_condition(
         return Operand::Symbol("cond".to_string());
     };
     if let Some(cmp_id) = func.lookup("__cmp", block) {
-        if let Some(inst) = func.values.get(cmp_id.0 as usize) {
-            if let SsaOp::BinOp {
+        if let Some(inst) = func.values.get(cmp_id.0 as usize)
+            && let SsaOp::BinOp {
                 kind: BinOpKind::Sub,
                 lhs,
                 rhs,
             } = &inst.op
-            {
-                let cond_id = func.define(
-                    "__cond",
-                    block,
-                    SsaOp::BinOp {
-                        kind,
-                        lhs: lhs.clone(),
-                        rhs: rhs.clone(),
-                    },
-                    addr,
-                );
-                return Operand::Value(cond_id);
-            }
+        {
+            let cond_id = func.define(
+                "__cond",
+                block,
+                SsaOp::BinOp {
+                    kind,
+                    lhs: lhs.clone(),
+                    rhs: rhs.clone(),
+                },
+                addr,
+            );
+            return Operand::Value(cond_id);
         }
         let cond_id = func.define(
             "__cond",
@@ -6067,9 +6019,7 @@ fn known_call_arg_count(callee: &str) -> Option<usize> {
         | "strstr" | "strchr" | "strrchr" | "fputs" => Some(2),
         "snprintf" | "memcpy" | "memmove" | "memset" | "memcmp" | "strncmp" | "strncpy"
         | "strncat" | "strtol" | "strtoul" | "setenv" | "socket" | "ioctl" => Some(3),
-        "strtonum" | "fread" | "fwrite" | "read" | "write" | "recv" | "send" | "connect" => {
-            Some(4)
-        }
+        "strtonum" | "fread" | "fwrite" | "read" | "write" | "recv" | "send" | "connect" => Some(4),
         "printf" | "puts" | "getenv" | "isatty" | "atoi" | "atol" | "atoll" | "strlen"
         | "strdup" | "free" | "close" | "ftell" | "fclose" | "malloc" | "calloc" | "realloc" => {
             Some(1)
@@ -6079,19 +6029,34 @@ fn known_call_arg_count(callee: &str) -> Option<usize> {
         "tgetent" | "tgetstr" | "signal" => Some(2),
         "getbsize" | "warn" | "warnx" => Some(2),
         "sysctlbyname" => Some(5),
-        "FindClass" | "GetObjectClass" | "ExceptionClear" | "DeleteLocalRef" | "DeleteGlobalRef"
-        | "NewGlobalRef" | "NewLocalRef" | "ExceptionDescribe" | "FatalError"
-        | "GetStringUTFChars" | "GetStringChars" | "GetArrayLength" | "GetVersion"
-        | "MonitorEnter" | "MonitorExit" | "ExceptionCheck" | "GetJavaVM" => Some(2),
-        "AttachCurrentThread" | "GetEnv" | "ThrowNew" | "IsInstanceOf" | "GetMethodID"
-        | "GetFieldID" | "GetStaticMethodID" | "GetStaticFieldID" | "NewStringUTF"
-        | "ReleaseStringUTFChars" | "ReleaseStringChars" | "IsAssignableFrom" => Some(3),
-        "RegisterNatives" | "NewObjectArray" | "SetObjectArrayElement" | "GetObjectArrayElement" => {
-            Some(4)
-        }
+        "FindClass" | "GetObjectClass" | "ExceptionClear" | "DeleteLocalRef"
+        | "DeleteGlobalRef" | "NewGlobalRef" | "NewLocalRef" | "ExceptionDescribe"
+        | "FatalError" | "GetStringUTFChars" | "GetStringChars" | "GetArrayLength"
+        | "GetVersion" | "MonitorEnter" | "MonitorExit" | "ExceptionCheck" | "GetJavaVM" => Some(2),
+        "AttachCurrentThread"
+        | "GetEnv"
+        | "ThrowNew"
+        | "IsInstanceOf"
+        | "GetMethodID"
+        | "GetFieldID"
+        | "GetStaticMethodID"
+        | "GetStaticFieldID"
+        | "NewStringUTF"
+        | "ReleaseStringUTFChars"
+        | "ReleaseStringChars"
+        | "IsAssignableFrom" => Some(3),
+        "RegisterNatives"
+        | "NewObjectArray"
+        | "SetObjectArrayElement"
+        | "GetObjectArrayElement" => Some(4),
         "DefineClass" => Some(5),
-        "CallVoidMethod" | "CallObjectMethod" | "CallIntMethod" | "CallBooleanMethod"
-        | "CallStaticVoidMethod" | "CallStaticObjectMethod" | "CallStaticIntMethod" => Some(2),
+        "CallVoidMethod"
+        | "CallObjectMethod"
+        | "CallIntMethod"
+        | "CallBooleanMethod"
+        | "CallStaticVoidMethod"
+        | "CallStaticObjectMethod"
+        | "CallStaticIntMethod" => Some(2),
         _ => None,
     }
 }
@@ -6124,7 +6089,6 @@ fn known_call_min_args(callee: &str) -> Option<usize> {
     }
 }
 
-
 fn resolve_callee_bare_name(
     target: &Operand,
     symbols: &HashMap<u64, String>,
@@ -6132,10 +6096,10 @@ fn resolve_callee_bare_name(
 ) -> String {
     match target {
         Operand::Symbol(n) => {
-            if let Some(addr) = parse_sub_symbol_addr(n) {
-                if let Some(s) = symbols.get(&addr).or_else(|| local_symbols.get(&addr)) {
-                    return s.trim_start_matches('_').to_string();
-                }
+            if let Some(addr) = parse_sub_symbol_addr(n)
+                && let Some(s) = symbols.get(&addr).or_else(|| local_symbols.get(&addr))
+            {
+                return s.trim_start_matches('_').to_string();
             }
             n.trim_start_matches('_').to_string()
         }
@@ -6250,6 +6214,7 @@ fn resolve_const_operand(func: &SsaFunction, op: &Operand) -> Option<i64> {
     resolve_const_operand_depth(func, op, 0)
 }
 
+#[allow(clippy::question_mark)]
 fn resolve_const_operand_depth(func: &SsaFunction, op: &Operand, depth: usize) -> Option<i64> {
     if depth > 24 {
         return None;
@@ -6308,6 +6273,7 @@ fn fold_absolute_addr(func: &SsaFunction, op: &Operand) -> Option<u64> {
     fold_absolute_addr_depth(func, op, 0)
 }
 
+#[allow(clippy::question_mark)]
 fn fold_absolute_addr_depth(func: &SsaFunction, op: &Operand, depth: usize) -> Option<u64> {
     if depth > 24 {
         return None;
@@ -6407,57 +6373,53 @@ pub fn resolve_indirect_calls(
             let text = inst.text.as_ref();
             let addr = inst.address;
             if text.starts_with("adrp ") {
-                if let Some(reg) = extract_dest_reg_ref(text) {
-                    if let Some(slot) = arm64_reg_slot(reg) {
-                        let target_str = text.split(',').last().unwrap_or("").trim();
-                        if let Some(target) = parse_branch_addr(addr, target_str) {
-                            reg_defs[slot] = Some(RegDefKind::Adrp(target & !0xfff));
-                        }
+                if let Some(reg) = extract_dest_reg_ref(text)
+                    && let Some(slot) = arm64_reg_slot(reg)
+                {
+                    let target_str = text.split(',').next_back().unwrap_or("").trim();
+                    if let Some(target) = parse_branch_addr(addr, target_str) {
+                        reg_defs[slot] = Some(RegDefKind::Adrp(target & !0xfff));
                     }
                 }
                 continue;
             }
             if text.starts_with("add ") {
-                if let Some(dst) = extract_dest_reg_ref(text) {
-                    if let Some(dst_slot) = arm64_reg_slot(dst) {
-                        let mut parts = text.splitn(4, ',');
-                        let _ = parts.next();
-                        if let (Some(src_raw), Some(imm_raw)) = (parts.next(), parts.next()) {
-                            let src_reg = src_raw.trim();
-                            if let Some(imm) = parse_arm64_imm(imm_raw.trim()) {
-                                if let Some(src_slot) = arm64_reg_slot(src_reg) {
-                                    if let Some(RegDefKind::Adrp(page)) = reg_defs[src_slot] {
-                                        reg_defs[dst_slot] = Some(RegDefKind::Address(
-                                            page.wrapping_add(imm as u64),
-                                        ));
-                                    }
-                                }
-                            }
+                if let Some(dst) = extract_dest_reg_ref(text)
+                    && let Some(dst_slot) = arm64_reg_slot(dst)
+                {
+                    let mut parts = text.splitn(4, ',');
+                    let _ = parts.next();
+                    if let (Some(src_raw), Some(imm_raw)) = (parts.next(), parts.next()) {
+                        let src_reg = src_raw.trim();
+                        if let Some(imm) = parse_arm64_imm(imm_raw.trim())
+                            && let Some(src_slot) = arm64_reg_slot(src_reg)
+                            && let Some(RegDefKind::Adrp(page)) = reg_defs[src_slot]
+                        {
+                            reg_defs[dst_slot] =
+                                Some(RegDefKind::Address(page.wrapping_add(imm as u64)));
                         }
                     }
                 }
                 continue;
             }
             if text.starts_with("ldr ") {
-                if let Some(dst) = extract_dest_reg_ref(text) {
-                    if let Some(dst_slot) = arm64_reg_slot(dst) {
-                        let offset = extract_mem_offset(text);
-                        if let Some(base_reg) = extract_mem_base_ref(text) {
-                            if let Some(base_slot) = arm64_reg_slot(base_reg) {
-                                match reg_defs[base_slot] {
-                                    Some(RegDefKind::Adrp(page)) => {
-                                        reg_defs[dst_slot] = Some(RegDefKind::GotLoad(
-                                            page.wrapping_add(offset as u64),
-                                        ));
-                                    }
-                                    Some(RegDefKind::Address(addr_val)) => {
-                                        reg_defs[dst_slot] = Some(RegDefKind::GotLoad(
-                                            addr_val.wrapping_add(offset as u64),
-                                        ));
-                                    }
-                                    _ => {}
-                                }
+                if let Some(dst) = extract_dest_reg_ref(text)
+                    && let Some(dst_slot) = arm64_reg_slot(dst)
+                {
+                    let offset = extract_mem_offset(text);
+                    if let Some(base_reg) = extract_mem_base_ref(text)
+                        && let Some(base_slot) = arm64_reg_slot(base_reg)
+                    {
+                        match reg_defs[base_slot] {
+                            Some(RegDefKind::Adrp(page)) => {
+                                reg_defs[dst_slot] =
+                                    Some(RegDefKind::GotLoad(page.wrapping_add(offset as u64)));
                             }
+                            Some(RegDefKind::Address(addr_val)) => {
+                                reg_defs[dst_slot] =
+                                    Some(RegDefKind::GotLoad(addr_val.wrapping_add(offset as u64)));
+                            }
+                            _ => {}
                         }
                     }
                 }
@@ -6556,7 +6518,12 @@ pub fn render_ssa_pseudocode_named_layered_with_string_arc(
     strings: Arc<HashMap<u64, String>>,
 ) -> String {
     render_ssa_pseudocode_named_layered_with_strings_arc_inner(
-        func, name, arguments, symbols, local_symbols, strings,
+        func,
+        name,
+        arguments,
+        symbols,
+        local_symbols,
+        strings,
     )
 }
 
@@ -6668,7 +6635,6 @@ fn render_ssa_pseudocode_named_layered_with_strings_arc_inner(
     )
 }
 
-
 pub fn render_ssa_pseudocode_linear_with_string_arc(
     func: &SsaFunction,
     name: &str,
@@ -6678,7 +6644,12 @@ pub fn render_ssa_pseudocode_linear_with_string_arc(
     strings: Arc<HashMap<u64, String>>,
 ) -> String {
     render_ssa_pseudocode_linear_with_strings_arc_inner(
-        func, name, arguments, symbols, local_symbols, strings,
+        func,
+        name,
+        arguments,
+        symbols,
+        local_symbols,
+        strings,
     )
 }
 
@@ -6739,7 +6710,13 @@ fn render_ssa_pseudocode_linear_with_strings_arc_inner(
         &reg_consts,
         &code_names,
         || {
-            let mut lines = Vec::with_capacity(if ultra { 128 } else if large { 192 } else { 256 });
+            let mut lines = Vec::with_capacity(if ultra {
+                128
+            } else if large {
+                192
+            } else {
+                256
+            });
             let args_str = if arguments.is_empty() {
                 "void".to_string()
             } else {
@@ -6769,23 +6746,17 @@ fn render_ssa_pseudocode_linear_with_strings_arc_inner(
                 case_summary.sort();
                 case_summary.dedup();
                 if case_summary.len() >= 2 {
-                    let head: Vec<&str> = case_summary.iter().take(24).map(|s| s.as_str()).collect();
+                    let head: Vec<&str> =
+                        case_summary.iter().take(24).map(|s| s.as_str()).collect();
                     let more = if case_summary.len() > 24 {
                         format!(", +{} more", case_summary.len() - 24)
                     } else {
                         String::new()
                     };
-                    lines.push(format!(
-                        "    // switch cases: {}{}",
-                        head.join(", "),
-                        more
-                    ));
+                    lines.push(format!("    // switch cases: {}{}", head.join(", "), more));
                 }
             } else if !func.case_labels.is_empty() {
-                lines.push(format!(
-                    "    // switch sites: {}",
-                    func.case_labels.len()
-                ));
+                lines.push(format!("    // switch sites: {}", func.case_labels.len()));
             }
             let mut emitted = HashSet::with_capacity(func.cfg.blocks.len().min(512));
             let mut stmt_budget = if ultra {
@@ -6862,12 +6833,23 @@ fn emit_ssa_block_linear_ultra(
     if block.id.0 > 0 {
         if let Some(cases) = func.case_labels.get(&block.id) {
             if !cases.is_empty() {
-                lines.push(format!("{pad}// bb{} @ {:#x}: {}", block.id.0, block.start_addr, cases.join(", ")));
+                lines.push(format!(
+                    "{pad}// bb{} @ {:#x}: {}",
+                    block.id.0,
+                    block.start_addr,
+                    cases.join(", ")
+                ));
             } else {
-                lines.push(format!("{pad}// bb{} @ {:#x}", block.id.0, block.start_addr));
+                lines.push(format!(
+                    "{pad}// bb{} @ {:#x}",
+                    block.id.0, block.start_addr
+                ));
             }
         } else {
-            lines.push(format!("{pad}// bb{} @ {:#x}", block.id.0, block.start_addr));
+            lines.push(format!(
+                "{pad}// bb{} @ {:#x}",
+                block.id.0, block.start_addr
+            ));
         }
     }
     for &iid in &block.insts {
@@ -6922,7 +6904,6 @@ fn emit_ssa_block_linear_ultra(
     }
 }
 
-
 fn emit_ssa_block_linear_simple(
     func: &SsaFunction,
     block: &CfgBlock,
@@ -6942,12 +6923,23 @@ fn emit_ssa_block_linear_simple(
     if block.id.0 > 0 {
         if let Some(cases) = func.case_labels.get(&block.id) {
             if !cases.is_empty() {
-                lines.push(format!("{pad}// bb{} @ {:#x}: {}", block.id.0, block.start_addr, cases.join(", ")));
+                lines.push(format!(
+                    "{pad}// bb{} @ {:#x}: {}",
+                    block.id.0,
+                    block.start_addr,
+                    cases.join(", ")
+                ));
             } else {
-                lines.push(format!("{pad}// bb{} @ {:#x}", block.id.0, block.start_addr));
+                lines.push(format!(
+                    "{pad}// bb{} @ {:#x}",
+                    block.id.0, block.start_addr
+                ));
             }
         } else {
-            lines.push(format!("{pad}// bb{} @ {:#x}", block.id.0, block.start_addr));
+            lines.push(format!(
+                "{pad}// bb{} @ {:#x}",
+                block.id.0, block.start_addr
+            ));
         }
     }
     for &iid in &block.insts {
@@ -7041,7 +7033,9 @@ fn collect_switch_case_block_ids(func: &SsaFunction) -> HashSet<BlockId> {
     func.case_labels
         .iter()
         .filter(|(_, labels)| {
-            labels.iter().any(|l| l.starts_with("case ") || l == "default")
+            labels
+                .iter()
+                .any(|l| l.starts_with("case ") || l == "default")
         })
         .map(|(id, _)| *id)
         .collect()
@@ -7055,10 +7049,9 @@ fn block_has_switch_marker(func: &SsaFunction, block: &CfgBlock) -> bool {
         if let SsaOp::Copy {
             src: Operand::Symbol(name),
         } = &inst.op
+            && name.starts_with("/* switch")
         {
-            if name.starts_with("/* switch") {
-                return true;
-            }
+            return true;
         }
     }
     false
@@ -7105,16 +7098,17 @@ fn case_sort_key(labels: &[String]) -> (u8, i64) {
             if let Ok(n) = rest.parse::<i64>() {
                 return (1, n);
             }
-            if let Some(hex) = rest.strip_prefix("0x") {
-                if let Ok(n) = i64::from_str_radix(hex, 16) {
-                    return (1, n);
-                }
+            if let Some(hex) = rest.strip_prefix("0x")
+                && let Ok(n) = i64::from_str_radix(hex, 16)
+            {
+                return (1, n);
             }
         }
     }
     (1, 0)
 }
 
+#[allow(clippy::if_same_then_else)]
 fn format_switch_case_header(labels: &[String]) -> Vec<String> {
     if labels.iter().any(|l| l == "default") {
         return vec!["default:".to_string()];
@@ -7135,6 +7129,8 @@ fn format_switch_case_header(labels: &[String]) -> Vec<String> {
     out
 }
 
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::redundant_guards)]
 fn clone_linear_store_body(
     func: &SsaFunction,
     target: BlockId,
@@ -7227,23 +7223,18 @@ fn clone_linear_store_body(
             None
         }
     });
-    if let Some(t) = next {
-        if let Some(more) = clone_linear_store_body(
-            func,
-            t,
-            symbols,
-            local_symbols,
-            local_consts,
-            depth + 1,
-        ) {
-            if stmts.len() + more.len() <= 8 {
-                stmts.extend(more);
-            }
-        }
+    if let Some(t) = next
+        && let Some(more) =
+            clone_linear_store_body(func, t, symbols, local_symbols, local_consts, depth + 1)
+        && stmts.len() + more.len() <= 8
+    {
+        stmts.extend(more);
     }
     Some(stmts)
 }
 
+#[allow(clippy::redundant_guards)]
+#[allow(clippy::too_many_arguments)]
 fn emit_block_statements_for_switch(
     func: &SsaFunction,
     block: &CfgBlock,
@@ -7354,8 +7345,8 @@ fn emit_block_statements_for_switch(
                         emitted,
                         &format!("{pad}    "),
                         lines,
-                         0,
-                    &local_consts,
+                        0,
+                        local_consts,
                     );
                     lines.push(format!("{pad}}} else {{"));
                     emit_switch_tail_chain(
@@ -7368,8 +7359,8 @@ fn emit_block_statements_for_switch(
                         emitted,
                         &format!("{pad}    "),
                         lines,
-                         0,
-                    &local_consts,
+                        0,
+                        local_consts,
                     );
                     lines.push(format!("{pad}}}"));
                 } else {
@@ -7378,11 +7369,14 @@ fn emit_block_statements_for_switch(
                     let compact = cond_text.replace(' ', "");
                     if compact.contains("g_compat_mode!=1") || compact.contains("compat!=1") {
                         f_consts.insert("__path_const_1".to_string(), 1);
-                    } else if compact.contains("g_compat_mode==1") || compact.contains("compat==1") {
+                    } else if compact.contains("g_compat_mode==1") || compact.contains("compat==1")
+                    {
                         t_consts.insert("__path_const_1".to_string(), 1);
                     }
-                    let t_body = clone_linear_store_body(func, t, symbols, local_symbols, &t_consts, 0);
-                    let f_body = clone_linear_store_body(func, f, symbols, local_symbols, &f_consts, 0);
+                    let t_body =
+                        clone_linear_store_body(func, t, symbols, local_symbols, &t_consts, 0);
+                    let f_body =
+                        clone_linear_store_body(func, f, symbols, local_symbols, &f_consts, 0);
                     if t_body.is_some() || f_body.is_some() {
                         lines.push(format!("{pad}if ({cond_text}) {{"));
                         if let Some(body) = t_body {
@@ -7440,10 +7434,9 @@ fn emit_block_statements_for_switch(
                 if let SsaOp::Copy {
                     src: Operand::Symbol(name),
                 } = &inst.op
+                    && name.starts_with("/* switch")
                 {
-                    if name.starts_with("/* switch") {
-                        continue;
-                    }
+                    continue;
                 }
                 if should_suppress_temp_emit(func, inst.id) {
                     continue;
@@ -7545,9 +7538,7 @@ fn specialize_flag_store_rhs(
         }
         return rendered.to_string();
     }
-    if local_consts.get("__path_const_1") == Some(&1)
-        && matches!(rhs, "g_compat_mode" | "compat")
-    {
+    if local_consts.get("__path_const_1") == Some(&1) && matches!(rhs, "g_compat_mode" | "compat") {
         return format!("{lhs} = 1");
     }
     if let Some(&c) = local_consts
@@ -7558,10 +7549,9 @@ fn specialize_flag_store_rhs(
         .or_else(|| local_consts.get("w10"))
         .or_else(|| local_consts.get("x10"))
         .or_else(|| local_consts.get("__path_const_1"))
+        && (c == 0 || c == 1)
     {
-        if c == 0 || c == 1 {
-            return format!("{lhs} = {c}");
-        }
+        return format!("{lhs} = {c}");
     }
     rendered.to_string()
 }
@@ -7595,6 +7585,7 @@ fn collect_block_const_defs(func: &SsaFunction, block: BlockId) -> HashMap<Strin
     out
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_switch_tail_chain(
     func: &SsaFunction,
     start: BlockId,
@@ -7646,7 +7637,7 @@ fn emit_switch_tail_chain(
         case_blocks,
         join,
         emitted,
-        &local_consts,
+        local_consts,
     );
     if let Some(target) = term {
         if join == Some(target) {
@@ -7666,7 +7657,7 @@ fn emit_switch_tail_chain(
                 pad,
                 lines,
                 depth + 1,
-            &local_consts,
+                local_consts,
             );
         } else {
             lines.push(format!("{pad}goto bb{};", target.0));
@@ -7689,7 +7680,7 @@ fn emit_switch_tail_chain(
                 pad,
                 lines,
                 depth + 1,
-            &local_consts,
+                local_consts,
             );
         }
     }
@@ -7731,7 +7722,7 @@ fn emit_structured_switch(
     cases.sort_by(|a, b| {
         case_sort_key(&a.1)
             .cmp(&case_sort_key(&b.1))
-            .then_with(|| a.0 .0.cmp(&b.0 .0))
+            .then_with(|| a.0.0.cmp(&b.0.0))
     });
 
     let mut join_votes: HashMap<BlockId, usize> = HashMap::new();
@@ -7740,8 +7731,15 @@ fn emit_structured_switch(
         if succs.len() == 1 {
             *join_votes.entry(succs[0]).or_default() += 1;
         } else {
-            for &iid in &func.cfg.blocks.get(id.0 as usize).map(|b| b.insts.clone()).unwrap_or_default() {
-                if let Some(SsaOp::Jump { target }) = func.values.get(iid.0 as usize).map(|i| &i.op) {
+            for &iid in &func
+                .cfg
+                .blocks
+                .get(id.0 as usize)
+                .map(|b| b.insts.clone())
+                .unwrap_or_default()
+            {
+                if let Some(SsaOp::Jump { target }) = func.values.get(iid.0 as usize).map(|i| &i.op)
+                {
                     *join_votes.entry(*target).or_default() += 1;
                 }
             }
@@ -7880,8 +7878,8 @@ fn emit_structured_switch(
                             emitted,
                             inner,
                             lines,
-                             0,
-                        &local_consts,
+                            0,
+                            &local_consts,
                         );
                         lines.push(format!("{inner}break;"));
                     }
@@ -7922,8 +7920,12 @@ fn is_pure_jump_block(func: &SsaFunction, block_id: BlockId) -> bool {
             } if name.starts_with("/* switch") => {
                 return false;
             }
-            SsaOp::Copy { .. } | SsaOp::BinOp { .. } | SsaOp::UnaryOp { .. } | SsaOp::Load { .. }
-                if should_suppress_temp_emit(func, inst.id) || is_flag_or_cond_value(func, inst.id) => {}
+            SsaOp::Copy { .. }
+            | SsaOp::BinOp { .. }
+            | SsaOp::UnaryOp { .. }
+            | SsaOp::Load { .. }
+                if should_suppress_temp_emit(func, inst.id)
+                    || is_flag_or_cond_value(func, inst.id) => {}
             _ => {
                 saw_side = true;
             }
@@ -8100,7 +8102,10 @@ fn value_only_used_as_zero_test(func: &SsaFunction, id: SsaValueId) -> bool {
                     return false;
                 }
             }
-            SsaOp::UnaryOp { src: Operand::Value(v), .. } if *v == id => {
+            SsaOp::UnaryOp {
+                src: Operand::Value(v),
+                ..
+            } if *v == id => {
                 pure += 1;
             }
             _ => return false,
@@ -8109,10 +8114,8 @@ fn value_only_used_as_zero_test(func: &SsaFunction, id: SsaValueId) -> bool {
     uses > 0 && pure == uses
 }
 
-fn peel_zero_test(
-    func: &SsaFunction,
-    cond: &Operand,
-) -> Option<(SsaValueId, bool)> {
+#[allow(clippy::question_mark)]
+fn peel_zero_test(func: &SsaFunction, cond: &Operand) -> Option<(SsaValueId, bool)> {
     // returns (value, is_negated) where is_negated means "value == 0" / "!value"
     let mut cur = match cond {
         Operand::Value(id) => *id,
@@ -8190,15 +8193,21 @@ fn block_is_strcmp_zero_branch(
     for &iid in &block.insts {
         let inst = func.values.get(iid.0 as usize)?;
         match &inst.op {
-            SsaOp::Call { .. } if call_is_strcmp(func, inst.id, symbols, local_symbols) => call_id = Some(inst.id),
+            SsaOp::Call { .. } if call_is_strcmp(func, inst.id, symbols, local_symbols) => {
+                call_id = Some(inst.id)
+            }
             SsaOp::Branch {
                 cond,
                 true_block,
                 false_block,
             } => branch = Some((cond.clone(), *true_block, *false_block)),
             SsaOp::Phi { .. } | SsaOp::Unknown | SsaOp::Jump { .. } => {}
-            SsaOp::Copy { .. } | SsaOp::BinOp { .. } | SsaOp::UnaryOp { .. } | SsaOp::Load { .. }
-                if should_suppress_temp_emit(func, inst.id) || is_flag_or_cond_value(func, inst.id) => {}
+            SsaOp::Copy { .. }
+            | SsaOp::BinOp { .. }
+            | SsaOp::UnaryOp { .. }
+            | SsaOp::Load { .. }
+                if should_suppress_temp_emit(func, inst.id)
+                    || is_flag_or_cond_value(func, inst.id) => {}
             SsaOp::BinOp {
                 kind: BinOpKind::Eq | BinOpKind::Ne,
                 ..
@@ -8277,7 +8286,6 @@ fn ssa_value_is_used_by(func: &SsaFunction, id: SsaValueId, op: &Operand) -> boo
     }
 }
 
-
 fn block_simple_global_store_jump(
     func: &SsaFunction,
     block_id: BlockId,
@@ -8315,7 +8323,8 @@ fn block_simple_global_store_jump(
             | SsaOp::BinOp { .. }
             | SsaOp::UnaryOp { .. }
             | SsaOp::Load { .. }
-                if should_suppress_temp_emit(func, inst.id) || is_flag_or_cond_value(func, inst.id) => {}
+                if should_suppress_temp_emit(func, inst.id)
+                    || is_flag_or_cond_value(func, inst.id) => {}
             _ => return None,
         }
     }
@@ -8359,7 +8368,8 @@ fn block_is_null_check_branch(
             | SsaOp::BinOp { .. }
             | SsaOp::UnaryOp { .. }
             | SsaOp::Load { .. }
-                if should_suppress_temp_emit(func, inst.id) || is_flag_or_cond_value(func, inst.id) => {}
+                if should_suppress_temp_emit(func, inst.id)
+                    || is_flag_or_cond_value(func, inst.id) => {}
             SsaOp::BinOp {
                 kind: BinOpKind::Eq | BinOpKind::Ne,
                 ..
@@ -8373,8 +8383,7 @@ fn block_is_null_check_branch(
     let is_nullish = c == "!optarg"
         || c == "optarg==0"
         || c == "!env"
-        || c.starts_with("!")
-            && (c.contains("optarg") || c.ends_with("env"));
+        || c.starts_with("!") && (c.contains("optarg") || c.ends_with("env"));
     if !is_nullish && !(c.contains("optarg") && (c.contains("==0") || c.contains("!=0"))) {
         return None;
     }
@@ -8387,13 +8396,17 @@ fn block_is_null_check_branch(
     }
 }
 
-
+#[allow(clippy::type_complexity)]
 fn block_collect_side_effects(
     func: &SsaFunction,
     block_id: BlockId,
     symbols: &HashMap<u64, String>,
     local_symbols: &HashMap<u64, String>,
-) -> Option<(Vec<String>, Option<BlockId>, Option<(String, BlockId, BlockId)>)> {
+) -> Option<(
+    Vec<String>,
+    Option<BlockId>,
+    Option<(String, BlockId, BlockId)>,
+)> {
     let block = func.cfg.blocks.get(block_id.0 as usize)?;
     let mut lines = Vec::new();
     let mut jump = None;
@@ -8443,9 +8456,11 @@ fn block_collect_side_effects(
             | SsaOp::BinOp { .. }
             | SsaOp::UnaryOp { .. }
             | SsaOp::Load { .. }
-                if should_suppress_temp_emit(func, inst.id) || is_flag_or_cond_value(func, inst.id) => {}
+                if should_suppress_temp_emit(func, inst.id)
+                    || is_flag_or_cond_value(func, inst.id) => {}
             SsaOp::BinOp {
-                kind: BinOpKind::Eq
+                kind:
+                    BinOpKind::Eq
                     | BinOpKind::Ne
                     | BinOpKind::Lt
                     | BinOpKind::Le
@@ -8646,221 +8661,6 @@ fn try_emit_early_usage(
     true
 }
 
-fn try_emit_tty_termwidth(
-    func: &SsaFunction,
-    start: BlockId,
-    symbols: &HashMap<u64, String>,
-    local_symbols: &HashMap<u64, String>,
-    emitted: &mut HashSet<BlockId>,
-    lines: &mut Vec<String>,
-) -> bool {
-    // if (is_tty) { default width; COLUMNS?/ioctl? } else { singlecol; COLUMNS? }
-    // Keep only when both arms are short and join cleanly without leftover stores.
-    if emitted.contains(&start) {
-        return false;
-    }
-    let Some((prelude, _, branch)) =
-        block_collect_side_effects(func, start, symbols, local_symbols)
-    else {
-        return false;
-    };
-    if !prelude.iter().any(|s| s.contains("isatty") || s.contains("is_tty =")) {
-        return false;
-    }
-    let Some((cond, t, f)) = branch else {
-        return false;
-    };
-    if !(cond.contains("is_tty") || cond.contains("isatty")) {
-        return false;
-    }
-    let fall = resolve_jump_target(func, BlockId(start.0.saturating_add(1)));
-    // if (is_tty) goto TTY; fallthrough NON_TTY
-    let (tty, nontty, tty_cond) = if t != fall && f == fall {
-        if cond.starts_with('!') {
-            (f, t, negate_condition_text(&cond))
-        } else {
-            (t, f, cond.clone())
-        }
-    } else if f != fall && t == fall {
-        if cond.starts_with('!') {
-            (t, f, negate_condition_text(&cond))
-        } else {
-            (f, t, cond.clone())
-        }
-    } else {
-        return false;
-    };
-
-    let collect = |arm: BlockId| -> Option<(Vec<BlockId>, Vec<String>, BlockId)> {
-        let mut blocks = Vec::new();
-        let mut out = Vec::new();
-        let mut cur = arm;
-        for _ in 0..10 {
-            if blocks.contains(&cur) {
-                break;
-            }
-            let (blines, bjump, bbranch) =
-                block_collect_side_effects(func, cur, symbols, local_symbols)?;
-            if blines.iter().any(|s| {
-                s.contains("LS_SAMESORT")
-                    || s.contains("CLICOLOR")
-                    || s.contains("getopt")
-                    || s.contains("usage(")
-            }) {
-                return Some((blocks, out, cur));
-            }
-            // Don't swallow pure join stores that are also reachable from other arm
-            // without being part of this arm's exclusive path - handled by join detect
-            blocks.push(cur);
-            out.extend(blines);
-            if let Some((c, bt, bf)) = bbranch {
-                let fall2 = resolve_jump_target(func, BlockId(cur.0.saturating_add(1)));
-                // Prefer path that continues arm-local setup; treat goto-out as arm exit
-                // if (c) goto OUT; fallthrough continue
-                if bt != fall2 && bf == fall2 {
-                    // if going to a block that looks like join (later getenv), exit arm
-                    let target_is_join = func
-                        .cfg
-                        .blocks
-                        .get(bt.0 as usize)
-                        .map(|b| {
-                            b.insts.iter().any(|&iid| {
-                                func.values.get(iid.0 as usize).map(|i| {
-                                    matches!(i.op, SsaOp::Call { .. })
-                                        && render_named_value(func, i.id, symbols, local_symbols)
-                                            .contains("getenv")
-                                }).unwrap_or(false)
-                            })
-                        })
-                        .unwrap_or(false);
-                    if target_is_join {
-                        return Some((blocks, out, bt));
-                    }
-                    // continue fallthrough for empty checks etc
-                    if c.contains("env") || c.contains('*') || c.contains("ioctl") || c.contains("ws_col") {
-                        cur = fall2;
-                        continue;
-                    }
-                    cur = bt;
-                    continue;
-                }
-                if bf != fall2 && bt == fall2 {
-                    cur = fall2;
-                    continue;
-                }
-                cur = fall2;
-                continue;
-            }
-            if let Some(j) = bjump {
-                // unconditional jump often to join
-                let joinish = func
-                    .cfg
-                    .blocks
-                    .get(j.0 as usize)
-                    .map(|b| {
-                        b.insts.iter().any(|&iid| {
-                            func.values.get(iid.0 as usize).map(|i| {
-                                matches!(i.op, SsaOp::Call { .. })
-                                    && render_named_value(func, i.id, symbols, local_symbols)
-                                        .contains("getenv")
-                            }).unwrap_or(false)
-                        })
-                    })
-                    .unwrap_or(false);
-                if joinish {
-                    return Some((blocks, out, j));
-                }
-                cur = j;
-                continue;
-            }
-            let succs = func.cfg.successors(cur);
-            if succs.len() == 1 {
-                cur = resolve_jump_target(func, succs[0]);
-                continue;
-            }
-            return Some((blocks, out, cur));
-        }
-        Some((blocks, out, cur))
-    };
-
-    let Some((tb, tl, tj)) = collect(tty) else {
-        return false;
-    };
-    let Some((nb, nl, nj)) = collect(nontty) else {
-        return false;
-    };
-    if tl.is_empty() && nl.is_empty() {
-        return false;
-    }
-    if !tl.iter().chain(nl.iter()).any(|s| {
-        s.contains("COLUMNS")
-            || s.contains("g_termwidth")
-            || s.contains("TIOCGWINSZ")
-            || s.contains("g_f_singlecol")
-            || s.contains("g_f_nonprint")
-    }) {
-        return false;
-    }
-    // Require both arms mention termwidth or COLUMNS-ish
-    let tty_ok = tl.iter().any(|s| s.contains("termwidth") || s.contains("COLUMNS") || s.contains("0x50") || s.contains("ioctl"));
-    let non_ok = nl.iter().any(|s| s.contains("singlecol") || s.contains("COLUMNS") || s.contains("termwidth") || s.contains("strtonum"));
-    if !tty_ok || !non_ok {
-        return false;
-    }
-
-    // Only accept if join targets agree OR both end at same post-block id neighborhood
-    if tj != nj {
-        // still ok if both joins are getenv LS_SAMESORT region - allow
-        let j_ok = |j: BlockId| {
-            func.cfg.blocks.get(j.0 as usize).map(|b| {
-                b.insts.iter().any(|&iid| {
-                    func.values.get(iid.0 as usize).map(|i| {
-                        let t = render_named_value(func, i.id, symbols, local_symbols);
-                        t.contains("LS_SAMESORT") || t.contains("CLICOLOR") || t.contains("getenv")
-                    }).unwrap_or(false)
-                })
-            }).unwrap_or(false)
-        };
-        if !(j_ok(tj) && j_ok(nj)) && (tj.0 as i32 - nj.0 as i32).abs() > 2 {
-            return false;
-        }
-    }
-
-    // Reject if either arm is too long (likely incomplete internal structure)
-    if tl.len() > 10 || nl.len() > 10 {
-        return false;
-    }
-
-    let pad = "    ";
-    emitted.insert(start);
-    for b in tb.iter().chain(nb.iter()) {
-        emitted.insert(*b);
-    }
-    for s in prelude {
-        lines.push(format!("{pad}{s}"));
-    }
-    lines.push(format!("{pad}if ({tty_cond}) {{"));
-    for s in &tl {
-        lines.push(format!("{pad}    {s}"));
-    }
-    lines.push(format!("{pad}}} else {{"));
-    for s in &nl {
-        lines.push(format!("{pad}    {s}"));
-    }
-    lines.push(format!("{pad}}}"));
-    true
-}
-
-fn naturalize_truthiness_if_needed(cond: &str) -> String {
-    let t = cond.trim();
-    if t.starts_with('!') {
-        return t.to_string();
-    }
-    naturalize_truthiness(t)
-}
-
-
-
 fn try_emit_skip_noop_branch(
     func: &SsaFunction,
     start: BlockId,
@@ -8921,8 +8721,12 @@ fn try_emit_tcap_op_fallback(
     if prelude.len() < 3 {
         return false;
     }
-    let has_op = prelude.iter().any(|s| s.contains("tgetstr") && s.contains("op"));
-    let has_af = prelude.iter().any(|s| s.contains("g_tcap_af") || s.contains("AF"));
+    let has_op = prelude
+        .iter()
+        .any(|s| s.contains("tgetstr") && s.contains("op"));
+    let has_af = prelude
+        .iter()
+        .any(|s| s.contains("g_tcap_af") || s.contains("AF"));
     if !has_op || !has_af {
         return false;
     }
@@ -8956,7 +8760,10 @@ fn try_emit_tcap_op_fallback(
     if fbr.is_some() {
         return false;
     }
-    if !flines.iter().any(|s| s.contains("tgetstr") && s.contains("oc")) {
+    if !flines
+        .iter()
+        .any(|s| s.contains("tgetstr") && s.contains("oc"))
+    {
         return false;
     }
     let after = fjump.unwrap_or_else(|| {
@@ -9054,24 +8861,26 @@ fn try_emit_sysctl_if(
         body_blocks.push(cur);
         body_lines.extend(blines);
         if let Some((_c2, t2, f2)) = bbr {
-            let fall2 = resolve_jump_target(func, BlockId(cur.0.saturating_add(1)));
             // branch should only skip remaining body to join; both targets join-ish or fallthrough empty
             let targets = [t2, f2];
             if !targets.iter().any(|x| same_cfg_join(func, *x, join)) {
                 return false;
             }
             // continue on non-join side only if empty
-            let cont = if same_cfg_join(func, t2, join) { f2 } else { t2 };
+            let cont = if same_cfg_join(func, t2, join) {
+                f2
+            } else {
+                t2
+            };
             if same_cfg_join(func, cont, join) {
                 break;
             }
             // only allow empty fallthrough
             if let Some((cl, _, cb)) =
                 block_collect_side_effects(func, cont, symbols, local_symbols)
+                && (cb.is_some() || !cl.is_empty())
             {
-                if cb.is_some() || !cl.is_empty() {
-                    break;
-                }
+                break;
             }
             break;
         }
@@ -9125,6 +8934,7 @@ fn try_emit_sysctl_if(
     true
 }
 
+#[allow(clippy::if_same_then_else)]
 fn try_emit_color_optarg(
     func: &SsaFunction,
     start: BlockId,
@@ -9138,12 +8948,11 @@ fn try_emit_color_optarg(
     let mut null_goto: Option<(String, BlockId)> = None;
     if let Some((cond, match_t, cont, _)) =
         block_is_null_check_branch(func, cur, symbols, local_symbols)
+        && cond.contains("optarg")
     {
-        if cond.contains("optarg") {
-            null_goto = Some((cond, match_t));
-            blocks.push(cur);
-            cur = cont;
-        }
+        null_goto = Some((cond, match_t));
+        blocks.push(cur);
+        cur = cont;
     }
 
     let mut chain: Vec<(BlockId, String, BlockId, BlockId, bool)> = Vec::new();
@@ -9218,9 +9027,16 @@ fn try_emit_color_optarg(
                 | SsaOp::Load { .. }
                 | SsaOp::UnaryOp { .. }
                 | SsaOp::BinOp { .. }
-                    if should_suppress_temp_emit(func, inst.id) || is_flag_or_cond_value(func, inst.id) => {}
+                    if should_suppress_temp_emit(func, inst.id)
+                        || is_flag_or_cond_value(func, inst.id) => {}
                 SsaOp::BinOp {
-                    kind: BinOpKind::Eq | BinOpKind::Ne | BinOpKind::Lt | BinOpKind::Le | BinOpKind::Gt | BinOpKind::Ge,
+                    kind:
+                        BinOpKind::Eq
+                        | BinOpKind::Ne
+                        | BinOpKind::Lt
+                        | BinOpKind::Le
+                        | BinOpKind::Gt
+                        | BinOpKind::Ge,
                     ..
                 } => {}
                 _ => side = true,
@@ -9269,29 +9085,27 @@ fn try_emit_color_optarg(
     let mut none_call: Option<String> = None;
     let mut none_ok: Option<BlockId> = None;
     let mut none_err: Option<BlockId> = None;
-    if let Some((call, t, f, eq0)) =
-        block_is_strcmp_zero_branch(func, cur, symbols, local_symbols)
+    if let Some((call, t, f, eq0)) = block_is_strcmp_zero_branch(func, cur, symbols, local_symbols)
+        && (call.contains("none") || call.contains("optarg"))
     {
-        if call.contains("none") || call.contains("optarg") {
-            let fall = resolve_jump_target(func, BlockId(cur.0.saturating_add(1)));
-            let (eq_t, ne_t) = if eq0 {
-                if t != fall && f == fall {
-                    (t, f)
-                } else if f != fall && t == fall {
-                    (f, t)
-                } else {
-                    (t, f)
-                }
-            } else if t != fall && f == fall {
+        let fall = resolve_jump_target(func, BlockId(cur.0.saturating_add(1)));
+        let (eq_t, ne_t) = if eq0 {
+            if t != fall && f == fall {
+                (t, f)
+            } else if f != fall && t == fall {
                 (f, t)
             } else {
-                (f, t)
-            };
-            none_call = Some(call);
-            none_ok = Some(eq_t);
-            none_err = Some(ne_t);
-            blocks.push(cur);
-        }
+                (t, f)
+            }
+        } else if t != fall && f == fall {
+            (f, t)
+        } else {
+            (f, t)
+        };
+        none_call = Some(call);
+        none_ok = Some(eq_t);
+        none_err = Some(ne_t);
+        blocks.push(cur);
     }
 
     let mut groups: Vec<(BlockId, Vec<String>)> = Vec::new();
@@ -9305,11 +9119,11 @@ fn try_emit_color_optarg(
         } else {
             call.clone()
         };
-        if let Some(last) = groups.last_mut() {
-            if last.0 == *match_t {
-                last.1.push(expr);
-                continue;
-            }
+        if let Some(last) = groups.last_mut()
+            && last.0 == *match_t
+        {
+            last.1.push(expr);
+            continue;
         }
         groups.push((*match_t, vec![expr]));
     }
@@ -9320,14 +9134,14 @@ fn try_emit_color_optarg(
             groups.insert(0, (*t, vec![cond.clone()]));
         }
     }
-    if let (Some(ok), parts) = (prefix_ok, &prefix_parts) {
-        if !parts.is_empty() {
-            let expr = parts.join(" && ");
-            if let Some(g) = groups.iter_mut().find(|g| g.0 == ok) {
-                g.1.push(expr);
-            } else {
-                groups.push((ok, vec![expr]));
-            }
+    if let (Some(ok), parts) = (prefix_ok, &prefix_parts)
+        && !parts.is_empty()
+    {
+        let expr = parts.join(" && ");
+        if let Some(g) = groups.iter_mut().find(|g| g.0 == ok) {
+            g.1.push(expr);
+        } else {
+            groups.push((ok, vec![expr]));
         }
     }
     if let (Some(ok), Some(call)) = (none_ok, none_call.as_ref()) {
@@ -9347,7 +9161,8 @@ fn try_emit_color_optarg(
     let mut join: Option<BlockId> = None;
     let mut value_blocks: Vec<BlockId> = Vec::new();
     for (target, exprs) in &groups {
-        let Some((store, j)) = block_simple_global_store_jump(func, *target, symbols, local_symbols)
+        let Some((store, j)) =
+            block_simple_global_store_jump(func, *target, symbols, local_symbols)
         else {
             return false;
         };
@@ -9370,19 +9185,19 @@ fn try_emit_color_optarg(
 
     let mut err_line: Option<String> = None;
     let mut err_block: Option<BlockId> = None;
-    if let Some(eb) = none_err {
-        if let Some(block) = func.cfg.blocks.get(eb.0 as usize) {
-            for &iid in &block.insts {
-                let Some(inst) = func.values.get(iid.0 as usize) else {
-                    continue;
-                };
-                if matches!(inst.op, SsaOp::Call { .. }) {
-                    let call = render_named_value(func, inst.id, symbols, local_symbols);
-                    if call.contains("errx") || call.contains("err") {
-                        err_line = Some(format!("{call};"));
-                        err_block = Some(eb);
-                        break;
-                    }
+    if let Some(eb) = none_err
+        && let Some(block) = func.cfg.blocks.get(eb.0 as usize)
+    {
+        for &iid in &block.insts {
+            let Some(inst) = func.values.get(iid.0 as usize) else {
+                continue;
+            };
+            if matches!(inst.op, SsaOp::Call { .. }) {
+                let call = render_named_value(func, inst.id, symbols, local_symbols);
+                if call.contains("errx") || call.contains("err") {
+                    err_line = Some(format!("{call};"));
+                    err_block = Some(eb);
+                    break;
                 }
             }
         }
@@ -9429,6 +9244,7 @@ fn try_emit_color_optarg(
     true
 }
 
+#[allow(clippy::if_same_then_else, clippy::needless_bool)]
 fn try_emit_exit_epilogue(
     func: &SsaFunction,
     start: BlockId,
@@ -9493,7 +9309,8 @@ fn try_emit_exit_epilogue(
             | SsaOp::BinOp { .. }
             | SsaOp::UnaryOp { .. }
             | SsaOp::Load { .. }
-                if should_suppress_temp_emit(func, inst.id) || is_flag_or_cond_value(func, inst.id) => {}
+                if should_suppress_temp_emit(func, inst.id)
+                    || is_flag_or_cond_value(func, inst.id) => {}
             _ => {}
         }
     }
@@ -9575,7 +9392,8 @@ fn try_emit_exit_epilogue(
                 if let SsaOp::Call { target, .. } = &inst.op {
                     let name = render_call_target(func, target, symbols, local_symbols);
                     if name.trim_start_matches('_') == "exit"
-                        || render_named_value(func, inst.id, symbols, local_symbols).contains("exit")
+                        || render_named_value(func, inst.id, symbols, local_symbols)
+                            .contains("exit")
                     {
                         let c = render_named_value(func, inst.id, symbols, local_symbols);
                         return Some((bid, c));
@@ -9698,7 +9516,10 @@ fn try_emit_exit_epilogue(
         let mut is_io = false;
         for (id, name, text) in &local_calls {
             let bare = name.trim_start_matches('_');
-            if bare == "ferror" || bare == "fflush" || text.contains("ferror") || text.contains("fflush")
+            if bare == "ferror"
+                || bare == "fflush"
+                || text.contains("ferror")
+                || text.contains("fflush")
             {
                 is_io = true;
                 if ssa_value_is_used(func, *id) {
@@ -9728,13 +9549,13 @@ fn try_emit_exit_epilogue(
         used.push(cur);
         if let Some(fb) = func.cfg.blocks.get(fail.0 as usize) {
             for &iid in &fb.insts {
-                if let Some(inst) = func.values.get(iid.0 as usize) {
-                    if matches!(inst.op, SsaOp::Call { .. }) {
-                        let c = render_named_value(func, inst.id, symbols, local_symbols);
-                        if c.contains("err") {
-                            err_call = Some(c);
-                            used.push(fail);
-                        }
+                if let Some(inst) = func.values.get(iid.0 as usize)
+                    && matches!(inst.op, SsaOp::Call { .. })
+                {
+                    let c = render_named_value(func, inst.id, symbols, local_symbols);
+                    if c.contains("err") {
+                        err_call = Some(c);
+                        used.push(fail);
                     }
                 }
             }
@@ -9742,11 +9563,11 @@ fn try_emit_exit_epilogue(
         cur = cont;
     }
 
-    if final_exit.is_none() {
-        if let Some((_, c)) = find_exit(cur) {
-            final_exit = Some(c);
-            used.push(cur);
-        }
+    if final_exit.is_none()
+        && let Some((_, c)) = find_exit(cur)
+    {
+        final_exit = Some(c);
+        used.push(cur);
     }
     if io_checks.is_empty() || final_exit.is_none() {
         return false;
@@ -9785,7 +9606,8 @@ fn try_emit_exit_epilogue(
                 | SsaOp::BinOp { .. }
                 | SsaOp::UnaryOp { .. }
                 | SsaOp::Load { .. }
-                    if should_suppress_temp_emit(func, inst.id) || is_flag_or_cond_value(func, inst.id) => {}
+                    if should_suppress_temp_emit(func, inst.id)
+                        || is_flag_or_cond_value(func, inst.id) => {}
                 SsaOp::Store { .. } if store_is_stack_arg_for_call(func, inst.id) => {}
                 _ => other = true,
             }
@@ -9823,7 +9645,6 @@ fn try_emit_exit_epilogue(
     lines.push(format!("{pad}{};", final_exit.unwrap()));
     true
 }
-
 
 fn try_emit_strcmp_cascade(
     func: &SsaFunction,
@@ -9889,11 +9710,11 @@ fn try_emit_strcmp_cascade(
         } else {
             call.clone()
         };
-        if let Some(last) = groups.last_mut() {
-            if last.0 == *match_t {
-                last.1.push(expr);
-                continue;
-            }
+        if let Some(last) = groups.last_mut()
+            && last.0 == *match_t
+        {
+            last.1.push(expr);
+            continue;
         }
         groups.push((*match_t, vec![expr]));
     }
@@ -9919,6 +9740,7 @@ fn try_emit_strcmp_cascade(
     true
 }
 
+#[allow(clippy::redundant_guards)]
 fn try_emit_and_guard_assign(
     func: &SsaFunction,
     start: BlockId,
@@ -10008,8 +9830,12 @@ fn try_emit_and_guard_assign(
                             | BinOpKind::Gt
                             | BinOpKind::Ge
                     ) => {}
-                SsaOp::Copy { .. } | SsaOp::UnaryOp { .. } | SsaOp::Load { .. } | SsaOp::BinOp { .. }
-                    if should_suppress_temp_emit(func, inst.id) || is_flag_or_cond_value(func, inst.id) => {}
+                SsaOp::Copy { .. }
+                | SsaOp::UnaryOp { .. }
+                | SsaOp::Load { .. }
+                | SsaOp::BinOp { .. }
+                    if should_suppress_temp_emit(func, inst.id)
+                        || is_flag_or_cond_value(func, inst.id) => {}
                 _ => side = true,
             }
         }
@@ -10108,7 +9934,7 @@ fn try_emit_or_skip_join(
     symbols: &HashMap<u64, String>,
     local_symbols: &HashMap<u64, String>,
     emitted: &mut HashSet<BlockId>,
-    lines: &mut Vec<String>,
+    _lines: &mut Vec<String>,
 ) -> bool {
     // if (a) goto JOIN; if (b) goto JOIN; if (c) goto JOIN; JOIN:
     // => if (a || b || c) { /* empty */ }  which is useless
@@ -10151,9 +9977,16 @@ fn try_emit_or_skip_join(
                 | SsaOp::Load { .. }
                 | SsaOp::UnaryOp { .. }
                 | SsaOp::BinOp { .. }
-                    if should_suppress_temp_emit(func, inst.id) || is_flag_or_cond_value(func, inst.id) => {}
+                    if should_suppress_temp_emit(func, inst.id)
+                        || is_flag_or_cond_value(func, inst.id) => {}
                 SsaOp::BinOp {
-                    kind: BinOpKind::Eq | BinOpKind::Ne | BinOpKind::Lt | BinOpKind::Le | BinOpKind::Gt | BinOpKind::Ge,
+                    kind:
+                        BinOpKind::Eq
+                        | BinOpKind::Ne
+                        | BinOpKind::Lt
+                        | BinOpKind::Le
+                        | BinOpKind::Gt
+                        | BinOpKind::Ge,
                     ..
                 } => {}
                 _ => side = true,
@@ -10198,6 +10031,7 @@ fn try_emit_or_skip_join(
     true
 }
 
+#[allow(clippy::if_same_then_else)]
 fn try_emit_getbsize_guard(
     func: &SsaFunction,
     start: BlockId,
@@ -10288,10 +10122,10 @@ fn try_emit_getbsize_guard(
                     }
                 }
                 SsaOp::Store { addr, .. } => {
-                    if let Some(abs) = fold_absolute_addr(func, addr) {
-                        if abs & 0xfff == 0xc8 {
-                            store_bs = true;
-                        }
+                    if let Some(abs) = fold_absolute_addr(func, addr)
+                        && abs & 0xfff == 0xc8
+                    {
+                        store_bs = true;
                     }
                     let r = render_named_value(func, inst.id, symbols, local_symbols);
                     if r.contains("g_blocksize") {
@@ -10410,74 +10244,73 @@ fn try_emit_getbsize_guard(
                     hop = Some(succs[0]);
                 }
             }
-            if let Some(nj) = hop {
-                if nj != skip {
-                    if let Some(nb) = func.cfg.blocks.get(nj.0 as usize) {
-                        let mut has_bs = false;
-                        let mut only_bs = true;
-                        let mut lines_tmp = Vec::new();
-                        for &iid in &nb.insts {
-                            let Some(inst) = func.values.get(iid.0 as usize) else {
+            if let Some(nj) = hop
+                && nj != skip
+                && let Some(nb) = func.cfg.blocks.get(nj.0 as usize)
+            {
+                let mut has_bs = false;
+                let mut only_bs = true;
+                let mut lines_tmp = Vec::new();
+                for &iid in &nb.insts {
+                    let Some(inst) = func.values.get(iid.0 as usize) else {
+                        continue;
+                    };
+                    match &inst.op {
+                        SsaOp::Store { .. } => {
+                            if store_is_stack_arg_for_call(func, inst.id) {
                                 continue;
-                            };
-                            match &inst.op {
-                                SsaOp::Store { .. } => {
-                                    if store_is_stack_arg_for_call(func, inst.id) {
-                                        continue;
-                                    }
-                                    let r = render_named_value(func, inst.id, symbols, local_symbols);
-                                    if is_trivial_stack_prologue_store(&r) {
-                                        continue;
-                                    }
-                                    if r.contains("g_blocksize") {
-                                        has_bs = true;
-                                        lines_tmp.push(format!("{r};"));
-                                    } else {
-                                        only_bs = false;
-                                    }
-                                }
-                                SsaOp::Call { .. } => only_bs = false,
-                                SsaOp::Branch { .. } => only_bs = false,
-                                SsaOp::Jump { .. } | SsaOp::Phi { .. } | SsaOp::Unknown => {}
-                                SsaOp::Copy { .. }
-                                | SsaOp::BinOp { .. }
-                                | SsaOp::UnaryOp { .. }
-                                | SsaOp::Load { .. }
-                                    if should_suppress_temp_emit(func, inst.id)
-                                        || is_flag_or_cond_value(func, inst.id) => {}
-                                _ => {}
+                            }
+                            let r = render_named_value(func, inst.id, symbols, local_symbols);
+                            if is_trivial_stack_prologue_store(&r) {
+                                continue;
+                            }
+                            if r.contains("g_blocksize") {
+                                has_bs = true;
+                                lines_tmp.push(format!("{r};"));
+                            } else {
+                                only_bs = false;
                             }
                         }
-                        if has_bs && only_bs {
-                            body.extend(lines_tmp);
-                            body_blocks.push(nj);
-                        }
+                        SsaOp::Call { .. } => only_bs = false,
+                        SsaOp::Branch { .. } => only_bs = false,
+                        SsaOp::Jump { .. } | SsaOp::Phi { .. } | SsaOp::Unknown => {}
+                        SsaOp::Copy { .. }
+                        | SsaOp::BinOp { .. }
+                        | SsaOp::UnaryOp { .. }
+                        | SsaOp::Load { .. }
+                            if should_suppress_temp_emit(func, inst.id)
+                                || is_flag_or_cond_value(func, inst.id) => {}
+                        _ => {}
                     }
+                }
+                if has_bs && only_bs {
+                    body.extend(lines_tmp);
+                    body_blocks.push(nj);
                 }
             }
             break;
         }
         let succs = func.cfg.successors(db);
-        if succs.len() == 1 && succs[0] != skip {
-            if body.iter().any(|s| s.contains("getbsize"))
-                && !body.iter().any(|s| s.contains("g_blocksize ="))
-            {
-                let nj = succs[0];
-                let preds = func
-                    .cfg
-                    .blocks
-                    .iter()
-                    .filter(|pb| {
-                        func.cfg
-                            .successors(pb.id)
-                            .iter()
-                            .any(|s| *s == nj || resolve_jump_target(func, *s) == nj)
-                    })
-                    .count();
-                if preds <= 1 {
-                    db = nj;
-                    continue;
-                }
+        if succs.len() == 1
+            && succs[0] != skip
+            && body.iter().any(|s| s.contains("getbsize"))
+            && !body.iter().any(|s| s.contains("g_blocksize ="))
+        {
+            let nj = succs[0];
+            let preds = func
+                .cfg
+                .blocks
+                .iter()
+                .filter(|pb| {
+                    func.cfg
+                        .successors(pb.id)
+                        .iter()
+                        .any(|s| *s == nj || resolve_jump_target(func, *s) == nj)
+                })
+                .count();
+            if preds <= 1 {
+                db = nj;
+                continue;
             }
         }
         break;
@@ -10563,9 +10396,16 @@ fn try_emit_char_prefix_chain(
                 | SsaOp::UnaryOp { .. }
                 | SsaOp::Load { .. }
                 | SsaOp::BinOp { .. }
-                    if should_suppress_temp_emit(func, inst.id) || is_flag_or_cond_value(func, inst.id) => {}
+                    if should_suppress_temp_emit(func, inst.id)
+                        || is_flag_or_cond_value(func, inst.id) => {}
                 SsaOp::BinOp {
-                    kind: BinOpKind::Eq | BinOpKind::Ne | BinOpKind::Lt | BinOpKind::Le | BinOpKind::Gt | BinOpKind::Ge,
+                    kind:
+                        BinOpKind::Eq
+                        | BinOpKind::Ne
+                        | BinOpKind::Lt
+                        | BinOpKind::Le
+                        | BinOpKind::Gt
+                        | BinOpKind::Ge,
                     ..
                 } => {}
                 _ => side = true,
@@ -10667,6 +10507,7 @@ fn try_emit_char_prefix_chain(
     true
 }
 
+#[allow(clippy::redundant_guards)]
 fn emit_ssa_block_linear(
     func: &SsaFunction,
     block: &CfgBlock,
@@ -10725,12 +10566,23 @@ fn emit_ssa_block_linear(
     let label_idx = if block.id.0 > 0 {
         if let Some(cases) = func.case_labels.get(&block.id) {
             if !cases.is_empty() {
-                lines.push(format!("{pad}// bb{} @ {:#x}: {}", block.id.0, block.start_addr, cases.join(", ")));
+                lines.push(format!(
+                    "{pad}// bb{} @ {:#x}: {}",
+                    block.id.0,
+                    block.start_addr,
+                    cases.join(", ")
+                ));
             } else {
-                lines.push(format!("{pad}// bb{} @ {:#x}", block.id.0, block.start_addr));
+                lines.push(format!(
+                    "{pad}// bb{} @ {:#x}",
+                    block.id.0, block.start_addr
+                ));
             }
         } else {
-            lines.push(format!("{pad}// bb{} @ {:#x}", block.id.0, block.start_addr));
+            lines.push(format!(
+                "{pad}// bb{} @ {:#x}",
+                block.id.0, block.start_addr
+            ));
         }
         Some(lines.len() - 1)
     } else {
@@ -10776,16 +10628,12 @@ fn emit_ssa_block_linear(
                 cond,
             } => {
                 let mut cond_text = render_condition_text(func, cond, symbols, local_symbols);
-                if let Some((vid, negated)) = peel_zero_test(func, cond) {
-                    if call_is_strcmp(func, vid, symbols, local_symbols) {
-                        let call = render_named_value(func, vid, symbols, local_symbols);
-                        cond_text = if negated {
-                            format!("!{call}")
-                        } else {
-                            call
-                        };
-                        cond_text = simplify_condition_text(cond_text);
-                    }
+                if let Some((vid, negated)) = peel_zero_test(func, cond)
+                    && call_is_strcmp(func, vid, symbols, local_symbols)
+                {
+                    let call = render_named_value(func, vid, symbols, local_symbols);
+                    cond_text = if negated { format!("!{call}") } else { call };
+                    cond_text = simplify_condition_text(cond_text);
                 }
                 let t = resolve_jump_target(func, *true_block);
                 let f = resolve_jump_target(func, *false_block);
@@ -10835,11 +10683,10 @@ fn emit_ssa_block_linear(
                 if let SsaOp::Copy {
                     src: Operand::Symbol(name),
                 } = &inst.op
+                    && name.starts_with("/* switch")
                 {
-                    if name.starts_with("/* switch") {
-                        lines.push(format!("{pad}{name}"));
-                        continue;
-                    }
+                    lines.push(format!("{pad}{name}"));
+                    continue;
                 }
                 if should_suppress_temp_emit(func, inst.id) {
                     continue;
@@ -10853,13 +10700,14 @@ fn emit_ssa_block_linear(
             }
         }
     }
-    if let Some(idx) = label_idx {
-        if lines.len() == lines_before {
-            lines.remove(idx);
-        }
+    if let Some(idx) = label_idx
+        && lines.len() == lines_before
+    {
+        lines.remove(idx);
     }
 }
 
+#[allow(clippy::match_like_matches_macro)]
 fn is_flag_or_cond_value(func: &SsaFunction, id: SsaValueId) -> bool {
     let key = func.values.as_ptr() as usize ^ func.values.len();
     SSA_FLAG_COND.with(|slot| {
@@ -10871,15 +10719,15 @@ fn is_flag_or_cond_value(func: &SsaFunction, id: SsaValueId) -> bool {
         if needs {
             let mut bits = vec![false; func.values.len()];
             for map in func.defs.iter() {
-                if let Some(vid) = map.get("__cmp") {
-                    if let Some(slotb) = bits.get_mut(vid.0 as usize) {
-                        *slotb = true;
-                    }
+                if let Some(vid) = map.get("__cmp")
+                    && let Some(slotb) = bits.get_mut(vid.0 as usize)
+                {
+                    *slotb = true;
                 }
-                if let Some(vid) = map.get("__cond") {
-                    if let Some(slotb) = bits.get_mut(vid.0 as usize) {
-                        *slotb = true;
-                    }
+                if let Some(vid) = map.get("__cond")
+                    && let Some(slotb) = bits.get_mut(vid.0 as usize)
+                {
+                    *slotb = true;
                 }
             }
             *guard = Some((key, bits));
@@ -10958,13 +10806,16 @@ fn collect_used_operands_vec(op: &SsaOp, used: &mut Vec<SsaValueId>) {
     }
 }
 
+#[allow(clippy::match_like_matches_macro)]
 fn ssa_with_use_graph<R>(func: &SsaFunction, f: impl FnOnce(&[u32], &[Vec<u32>]) -> R) -> R {
     let key = func.values.as_ptr() as usize ^ func.values.len();
     SSA_USE_GRAPH.with(|slot| {
         let mut guard = slot.borrow_mut();
         let needs = match guard.as_ref() {
             Some((k, counts, users))
-                if *k == key && counts.len() == func.values.len() && users.len() == func.values.len() =>
+                if *k == key
+                    && counts.len() == func.values.len()
+                    && users.len() == func.values.len() =>
             {
                 false
             }
@@ -10998,8 +10849,11 @@ fn should_suppress_temp_emit(func: &SsaFunction, id: SsaValueId) -> bool {
         return true;
     };
     match &inst.op {
-        SsaOp::Store { .. } | SsaOp::Call { .. } | SsaOp::Return { .. }
-        | SsaOp::Branch { .. } | SsaOp::Jump { .. } => return false,
+        SsaOp::Store { .. }
+        | SsaOp::Call { .. }
+        | SsaOp::Return { .. }
+        | SsaOp::Branch { .. }
+        | SsaOp::Jump { .. } => return false,
         _ => {}
     }
     ssa_with_use_graph(func, |counts, users| {
@@ -11007,7 +10861,10 @@ fn should_suppress_temp_emit(func: &SsaFunction, id: SsaValueId) -> bool {
         if use_count == 0 {
             return true;
         }
-        let user_ids = users.get(id.0 as usize).map(|v| v.as_slice()).unwrap_or(&[]);
+        let user_ids = users
+            .get(id.0 as usize)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[]);
         let mut side_use = false;
         let mut pure_or_cond = 0usize;
         let mut store_value_uses = 0usize;
@@ -11055,7 +10912,8 @@ fn should_suppress_temp_emit(func: &SsaFunction, id: SsaValueId) -> bool {
                     }
                 }
                 SsaOp::Call { target, args } => {
-                    if operand_uses_value(target, id) || args.iter().any(|a| operand_uses_value(a, id))
+                    if operand_uses_value(target, id)
+                        || args.iter().any(|a| operand_uses_value(a, id))
                     {
                         pure_or_cond += 1;
                     }
@@ -11092,10 +10950,10 @@ fn should_suppress_temp_emit(func: &SsaFunction, id: SsaValueId) -> bool {
                 pure_or_cond == use_count
             }
             SsaOp::Copy { src } => {
-                if let Operand::Symbol(name) = src {
-                    if name.starts_with("/* switch") {
-                        return false;
-                    }
+                if let Operand::Symbol(name) = src
+                    && name.starts_with("/* switch")
+                {
+                    return false;
                 }
                 pure_or_cond == use_count
             }
@@ -11105,7 +10963,6 @@ fn should_suppress_temp_emit(func: &SsaFunction, id: SsaValueId) -> bool {
         }
     })
 }
-
 
 fn operand_is_frame_like(func: &SsaFunction, op: &Operand, depth: usize) -> bool {
     if depth > 8 {
@@ -11177,17 +11034,17 @@ fn is_simple_addr_binop(func: &SsaFunction, lhs: &Operand, rhs: &Operand) -> boo
         || (operand_is_callish(func, rhs) && operand_is_small_imm(func, lhs))
 }
 
+#[allow(clippy::collapsible_match)]
 fn collect_used_operands(op: &SsaOp, used: &mut HashSet<SsaValueId>) {
     let mut collect = |operand: &Operand| match operand {
         Operand::Value(id) => {
             used.insert(*id);
         }
-        Operand::Deref { base, .. } => match base.as_ref() {
-            Operand::Value(id) => {
+        Operand::Deref { base, .. } => {
+            if let Operand::Value(id) = base.as_ref() {
                 used.insert(*id);
             }
-            _ => {}
-        },
+        }
         _ => {}
     };
     match op {
@@ -11245,10 +11102,12 @@ fn polish_call_arg_operand(
         if lookup_render_string(abs).is_some() {
             return render_operand_named_depth(func, operand, symbols, local_symbols, depth);
         }
-        if let Some(name) = lookup_global_name(abs) {
-            if name.starts_with("g_") && name != "g_data" && !name.contains('+') {
-                return format!("&{name}");
-            }
+        if let Some(name) = lookup_global_name(abs)
+            && name.starts_with("g_")
+            && name != "g_data"
+            && !name.contains('+')
+        {
+            return format!("&{name}");
         }
         if let Some(name) = lookup_symbol_name(symbols, local_symbols, abs) {
             if name.starts_with("g_") && name != "g_data" && !name.contains('+') {
@@ -11261,10 +11120,10 @@ fn polish_call_arg_operand(
     if text.starts_with('&') {
         return text;
     }
-    if let Some((base, off)) = parse_addr_chain(&text) {
-        if let Some(name) = frame_slot_name_from_parts(&base, off) {
-            return format!("&{name}");
-        }
+    if let Some((base, off)) = parse_addr_chain(&text)
+        && let Some(name) = frame_slot_name_from_parts(&base, off)
+    {
+        return format!("&{name}");
     }
     if let Some(name) = frame_slot_name_from_parts(&text, 0) {
         return format!("&{name}");
@@ -11272,6 +11131,7 @@ fn polish_call_arg_operand(
     text
 }
 
+#[allow(clippy::collapsible_match)]
 fn store_is_stack_arg_for_call(func: &SsaFunction, store_id: SsaValueId) -> bool {
     let Some(store_inst) = func.values.get(store_id.0 as usize) else {
         return false;
@@ -11353,18 +11213,18 @@ fn render_call_target(
             name.clone()
         }
         _ => {
-            if let Some(c) = resolve_const_operand_static(func, target) {
-                if c > 0 {
-                    let addr = c as u64;
-                    if let Some(name) = lookup_code_name(addr) {
-                        return name;
-                    }
-                    if let Some(name) = lookup_symbol_name(symbols, local_symbols, addr) {
-                        return name.to_string();
-                    }
-                    if (0x100000000..0x100008000).contains(&addr) {
-                        return format_sub_addr(addr);
-                    }
+            if let Some(c) = resolve_const_operand_static(func, target)
+                && c > 0
+            {
+                let addr = c as u64;
+                if let Some(name) = lookup_code_name(addr) {
+                    return name;
+                }
+                if let Some(name) = lookup_symbol_name(symbols, local_symbols, addr) {
+                    return name.to_string();
+                }
+                if (0x100000000..0x100008000).contains(&addr) {
+                    return format_sub_addr(addr);
                 }
             }
             render_operand_named(func, target, symbols, local_symbols)
@@ -11398,7 +11258,9 @@ fn jni_vtable_slot_offset(func: &SsaFunction, target: &Operand) -> Option<i64> {
                 }
                 return Some(*offset);
             }
-            SsaOp::Copy { src: Operand::Value(prev) } => cur = *prev,
+            SsaOp::Copy {
+                src: Operand::Value(prev),
+            } => cur = *prev,
             SsaOp::Load {
                 addr: Operand::Deref { base, offset: 0 },
             } => {
@@ -11504,12 +11366,7 @@ fn jni_method_name_for_offset(offset: u64) -> Option<&'static str> {
     }
 }
 
-
-fn refine_jni_method_name(
-    offset: u64,
-    current: &str,
-    args: &[String],
-) -> Option<&'static str> {
+fn refine_jni_method_name(offset: u64, current: &str, args: &[String]) -> Option<&'static str> {
     let has_class_string = args.iter().any(|a| a.contains('/') && a.contains('"'));
     let versionish = args
         .get(2)
@@ -11548,43 +11405,43 @@ fn result_name_for_call(
     symbols: &HashMap<u64, String>,
     local_symbols: &HashMap<u64, String>,
 ) -> String {
-    if let Some(inst) = func.values.get(id.0 as usize) {
-        if let SsaOp::Call { target, .. } = &inst.op {
-            let name = render_call_target(func, target, symbols, local_symbols);
-            let bare = name.trim_start_matches('_');
-            let pretty = match bare {
-                "getopt_long" | "getopt" => "opt",
-                "isatty" => "is_tty",
-                "getenv" => "env",
-                "strtonum" => "num",
-                "ioctl" => "ioctl_rc",
-                "compat_mode" => "compat",
-                "getuid" => "uid",
-                "tgetent" => "tgetent_rc",
-                "tgetstr" => "tcap",
-                "sysctlbyname" => "sysctl_rc",
-                "ferror" => "ferror_rc",
-                "fflush" => "fflush_rc",
-                "FindClass" => "clazz",
-                "GetMethodID" => "mid",
-                "GetFieldID" => "fid",
-                "GetObjectClass" => "clazz",
-                "NewStringUTF" => "jstr",
-                "GetStringUTFChars" => "cstr",
-                "RegisterNatives" => "reg_rc",
-                "GetEnv" | "AttachCurrentThread" => "jni_rc",
-                _ => "",
-            };
-            if !pretty.is_empty() {
-                return pretty.to_string();
-            }
-            if !bare.is_empty()
-                && bare
-                    .chars()
-                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
-            {
-                return format!("r_{bare}");
-            }
+    if let Some(inst) = func.values.get(id.0 as usize)
+        && let SsaOp::Call { target, .. } = &inst.op
+    {
+        let name = render_call_target(func, target, symbols, local_symbols);
+        let bare = name.trim_start_matches('_');
+        let pretty = match bare {
+            "getopt_long" | "getopt" => "opt",
+            "isatty" => "is_tty",
+            "getenv" => "env",
+            "strtonum" => "num",
+            "ioctl" => "ioctl_rc",
+            "compat_mode" => "compat",
+            "getuid" => "uid",
+            "tgetent" => "tgetent_rc",
+            "tgetstr" => "tcap",
+            "sysctlbyname" => "sysctl_rc",
+            "ferror" => "ferror_rc",
+            "fflush" => "fflush_rc",
+            "FindClass" => "clazz",
+            "GetMethodID" => "mid",
+            "GetFieldID" => "fid",
+            "GetObjectClass" => "clazz",
+            "NewStringUTF" => "jstr",
+            "GetStringUTFChars" => "cstr",
+            "RegisterNatives" => "reg_rc",
+            "GetEnv" | "AttachCurrentThread" => "jni_rc",
+            _ => "",
+        };
+        if !pretty.is_empty() {
+            return pretty.to_string();
+        }
+        if !bare.is_empty()
+            && bare
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+        {
+            return format!("r_{bare}");
         }
     }
     format!("v{}", id.0)
@@ -11606,31 +11463,29 @@ fn render_store_rhs(
     local_symbols: &HashMap<u64, String>,
     depth: usize,
 ) -> String {
-    if let Some(c) = resolve_const_operand_static(func, value) {
-        if c > 0 {
-            if let Some(name) = format_code_pointer(c as u64, symbols, local_symbols) {
-                return name;
-            }
-        }
+    if let Some(c) = resolve_const_operand_static(func, value)
+        && c > 0
+        && let Some(name) = format_code_pointer(c as u64, symbols, local_symbols)
+    {
+        return name;
     }
-    if let Operand::Value(id) = value {
-        if let Some(SsaOp::Phi { incoming }) = func.values.get(id.0 as usize).map(|i| &i.op) {
-            if let Some(text) = render_phi_as_store_expr(func, incoming, symbols, local_symbols) {
-                return text;
-            }
-        }
+    if let Operand::Value(id) = value
+        && let Some(SsaOp::Phi { incoming }) = func.values.get(id.0 as usize).map(|i| &i.op)
+        && let Some(text) = render_phi_as_store_expr(func, incoming, symbols, local_symbols)
+    {
+        return text;
     }
     let text = render_operand_named_depth(func, value, symbols, local_symbols, depth);
-    if let Some(hex) = text.strip_prefix("0x") {
-        if let Ok(addr) = u64::from_str_radix(hex, 16) {
-            if let Some(name) = format_code_pointer(addr, symbols, local_symbols) {
-                return name;
-            }
-        }
+    if let Some(hex) = text.strip_prefix("0x")
+        && let Ok(addr) = u64::from_str_radix(hex, 16)
+        && let Some(name) = format_code_pointer(addr, symbols, local_symbols)
+    {
+        return name;
     }
     text
 }
 
+#[allow(clippy::redundant_guards)]
 fn render_phi_as_store_expr(
     func: &SsaFunction,
     incoming: &[(BlockId, SsaValueId)],
@@ -11643,11 +11498,11 @@ fn render_phi_as_store_expr(
     let mut const_arm: Option<i64> = None;
     let mut expr_arm: Option<String> = None;
     for (_, vid) in incoming {
-        if let Some(c) = resolve_const_operand_static(func, &Operand::Value(*vid)) {
-            if c.abs() <= 0x1000 {
-                const_arm = Some(c);
-                continue;
-            }
+        if let Some(c) = resolve_const_operand_static(func, &Operand::Value(*vid))
+            && c.abs() <= 0x1000
+        {
+            const_arm = Some(c);
+            continue;
         }
         let rendered = render_named_value_depth(func, *vid, symbols, local_symbols, 1);
         if rendered.starts_with('v') && rendered.chars().skip(1).all(|ch| ch.is_ascii_digit()) {
@@ -11659,7 +11514,7 @@ fn render_phi_as_store_expr(
         expr_arm = Some(rendered);
     }
     match (const_arm, expr_arm) {
-        (Some(c), Some(e)) if matches!(c, 0 | 1 | 2) => Some(e),
+        (Some(c), Some(e)) if matches!(c, 0..=2) => Some(e),
         (None, Some(e)) => Some(e),
         _ => None,
     }
@@ -11707,9 +11562,9 @@ fn phi_common_render(
                     }
                 } else {
                     // Prefer rendering the incoming value expression when short.
-                    let rendered =
-                        render_named_value_depth(func, *vid, symbols, local_symbols, 1);
-                    if rendered.starts_with('v') && rendered.chars().skip(1).all(|c| c.is_ascii_digit())
+                    let rendered = render_named_value_depth(func, *vid, symbols, local_symbols, 1);
+                    if rendered.starts_with('v')
+                        && rendered.chars().skip(1).all(|c| c.is_ascii_digit())
                     {
                         format!("v{}", vid.0)
                     } else {
@@ -11764,11 +11619,7 @@ fn render_named_value_depth(
     }
     let already = NAMED_RENDER_VISITING.with(|v| {
         let mut s = v.borrow_mut();
-        if !s.insert(id.0) {
-            true
-        } else {
-            false
-        }
+        !s.insert(id.0)
     });
     if already {
         return format!("v{}", id.0);
@@ -11788,6 +11639,7 @@ fn render_named_value_depth(
     out
 }
 
+#[allow(clippy::if_same_then_else)]
 fn render_named_value_depth_inner(
     func: &SsaFunction,
     id: SsaValueId,
@@ -11825,16 +11677,15 @@ fn render_named_value_depth_inner(
                 .iter()
                 .map(|a| polish_call_arg_operand(func, a, symbols, local_symbols, depth + 1))
                 .collect();
-            if let Some(off) = jni_vtable_slot_offset(func, target) {
-                if let Some(refined) =
+            if let Some(off) = jni_vtable_slot_offset(func, target)
+                && let Some(refined) =
                     refine_jni_method_name(off as u64, &target_text, &args_rendered)
+            {
+                target_text = refined.to_string();
+                if let Some(n) = known_call_arg_count(&target_text)
+                    && n < args_rendered.len()
                 {
-                    target_text = refined.to_string();
-                    if let Some(n) = known_call_arg_count(&target_text) {
-                        if n < args_rendered.len() {
-                            args_rendered.truncate(n);
-                        }
-                    }
+                    args_rendered.truncate(n);
                 }
             }
             let bare = target_text.trim_start_matches('_');
@@ -11877,38 +11728,36 @@ fn render_named_value_depth_inner(
                     args_rendered[1] = format!("&{a1}");
                 }
             }
-            if bare == "ioctl" {
-                if args_rendered.len() >= 2 {
-                    if args_rendered[1] == "0x40087468" || args_rendered[1] == "TIOCGWINSZ" {
-                        args_rendered[1] = "TIOCGWINSZ".to_string();
-                        if args_rendered.len() == 2 {
-                            args_rendered.push("&winsize".to_string());
-                        } else if args_rendered.len() >= 3 {
-                            let a2 = args_rendered[2].as_str();
-                            if a2.starts_with('x')
-                                || a2.starts_with('v')
-                                || a2.contains("sp")
-                                || a2.contains("x29")
-                            {
-                                args_rendered[2] = "&winsize".to_string();
-                            }
-                        }
+            if bare == "ioctl"
+                && args_rendered.len() >= 2
+                && (args_rendered[1] == "0x40087468" || args_rendered[1] == "TIOCGWINSZ")
+            {
+                args_rendered[1] = "TIOCGWINSZ".to_string();
+                if args_rendered.len() == 2 {
+                    args_rendered.push("&winsize".to_string());
+                } else if args_rendered.len() >= 3 {
+                    let a2 = args_rendered[2].as_str();
+                    if a2.starts_with('x')
+                        || a2.starts_with('v')
+                        || a2.contains("sp")
+                        || a2.contains("x29")
+                    {
+                        args_rendered[2] = "&winsize".to_string();
                     }
                 }
             }
             if bare == "signal" && args_rendered.len() >= 2 {
                 if let Some(rest) = args_rendered[1].strip_prefix("0x") {
-                    if let Ok(addr) = u64::from_str_radix(rest, 16) {
-                        if let Some(name) = format_code_pointer(addr, symbols, local_symbols) {
-                            args_rendered[1] = name;
-                        }
+                    if let Ok(addr) = u64::from_str_radix(rest, 16)
+                        && let Some(name) = format_code_pointer(addr, symbols, local_symbols)
+                    {
+                        args_rendered[1] = name;
                     }
-                } else if args_rendered[1].starts_with("sub_") {
-                    if let Some(addr) = parse_sub_symbol_addr(&args_rendered[1]) {
-                        if let Some(name) = lookup_code_name(addr) {
-                            args_rendered[1] = name;
-                        }
-                    }
+                } else if args_rendered[1].starts_with("sub_")
+                    && let Some(addr) = parse_sub_symbol_addr(&args_rendered[1])
+                    && let Some(name) = lookup_code_name(addr)
+                {
+                    args_rendered[1] = name;
                 }
                 if args_rendered[0] == "2" {
                     args_rendered[0] = "SIGINT".to_string();
@@ -11975,22 +11824,18 @@ fn render_named_value_depth_inner(
                 if let Some(name) = lookup_symbol_name(symbols, local_symbols, addr) {
                     return name.to_string();
                 }
-                if addr & 0xfff != 0 {
-                    if let Some(s) = lookup_render_string(addr) {
-                        return format!("{:?}", s);
-                    }
+                if addr & 0xfff != 0
+                    && let Some(s) = lookup_render_string(addr)
+                {
+                    return format!("{:?}", s);
                 }
                 return format_data_addr(addr);
             }
             let l = render_operand_named_depth(func, lhs, symbols, local_symbols, depth + 1);
             let r = render_operand_named_depth(func, rhs, symbols, local_symbols, depth + 1);
-            return simplify_addr_expr(&format!("({l} + {r})"));
+            simplify_addr_expr(&format!("({l} + {r})"))
         }
-        SsaOp::BinOp {
-            kind,
-            lhs,
-            rhs,
-        } => {
+        SsaOp::BinOp { kind, lhs, rhs } => {
             let op = match kind {
                 BinOpKind::Add => "+",
                 BinOpKind::Sub => "-",
@@ -12019,9 +11864,7 @@ fn render_named_value_depth_inner(
                 | BinOpKind::Le
                 | BinOpKind::Gt
                 | BinOpKind::Ge => format!("{l} {op} {r}"),
-                BinOpKind::Add | BinOpKind::Sub => {
-                    simplify_addr_expr(&format!("({l} {op} {r})"))
-                }
+                BinOpKind::Add | BinOpKind::Sub => simplify_addr_expr(&format!("({l} {op} {r})")),
                 _ => format!("({l} {op} {r})"),
             }
         }
@@ -12031,13 +11874,8 @@ fn render_named_value_depth_inner(
             }
             match addr {
                 Operand::Deref { base, offset } => {
-                    let base_text = render_operand_named_depth(
-                        func,
-                        base,
-                        symbols,
-                        local_symbols,
-                        depth + 1,
-                    );
+                    let base_text =
+                        render_operand_named_depth(func, base, symbols, local_symbols, depth + 1);
                     format_mem_access(&base_text, *offset)
                 }
                 other => format!(
@@ -12047,13 +11885,13 @@ fn render_named_value_depth_inner(
             }
         }
         SsaOp::Copy { src } => {
-            if let Operand::Value(src_id) = src {
-                if matches!(
+            if let Operand::Value(src_id) = src
+                && matches!(
                     func.values.get(src_id.0 as usize).map(|i| &i.op),
                     Some(SsaOp::Call { .. })
-                ) {
-                    return result_name_for_call(func, *src_id, symbols, local_symbols);
-                }
+                )
+            {
+                return result_name_for_call(func, *src_id, symbols, local_symbols);
             }
             render_operand_named_depth(func, src, symbols, local_symbols, depth + 1)
         }
@@ -12089,15 +11927,16 @@ fn render_operand_named_depth(
                 if let Some(name) = lookup_symbol_name(symbols, local_symbols, addr) {
                     return name.to_string();
                 }
-                if addr & 0xfff != 0 {
-                    if let Some(s) = lookup_render_string(addr) {
-                        return format!("{:?}", s);
-                    }
+                if addr & 0xfff != 0
+                    && let Some(s) = lookup_render_string(addr)
+                {
+                    return format!("{:?}", s);
                 }
-                if let Some(base) = render_data_base() {
-                    if addr >= base && addr.saturating_sub(base) < 0x4000 {
-                        return format_data_addr(addr);
-                    }
+                if let Some(base) = render_data_base()
+                    && addr >= base
+                    && addr.saturating_sub(base) < 0x4000
+                {
+                    return format_data_addr(addr);
                 }
                 if let Some(name) = format_code_pointer(addr, symbols, local_symbols) {
                     return name;
@@ -12136,15 +11975,16 @@ fn render_operand_named_depth(
                     return alias;
                 }
                 if let Some(addr) = lookup_reg_const(&reg) {
-                    if addr & 0xfff != 0 {
-                        if let Some(s) = lookup_render_string(addr) {
-                            return format!("{:?}", s);
-                        }
+                    if addr & 0xfff != 0
+                        && let Some(s) = lookup_render_string(addr)
+                    {
+                        return format!("{:?}", s);
                     }
-                    if let Some(base) = render_data_base() {
-                        if addr >= base && addr.saturating_sub(base) < 0x4000 {
-                            return format_data_addr(addr);
-                        }
+                    if let Some(base) = render_data_base()
+                        && addr >= base
+                        && addr.saturating_sub(base) < 0x4000
+                    {
+                        return format_data_addr(addr);
                     }
                     if addr > 0x1000 {
                         return format!("0x{addr:x}");
@@ -12253,13 +12093,13 @@ fn polish_bare_reg_condition(
             }
         }
     }
-    if resolved.is_none() && matches!(bare, "x8" | "w8") {
-        if lookup_global_name_by_suffix("g_tcap_me").is_some()
+    if resolved.is_none()
+        && matches!(bare, "x8" | "w8")
+        && (lookup_global_name_by_suffix("g_tcap_me").is_some()
             || lookup_global_name_by_suffix("g_tcap_op").is_some()
-            || lookup_global_name_by_suffix("g_tcap_af").is_some()
-        {
-            resolved = Some("g_tcap_me".to_string());
-        }
+            || lookup_global_name_by_suffix("g_tcap_af").is_some())
+    {
+        resolved = Some("g_tcap_me".to_string());
     }
     if let Some(name) = resolved {
         if negated {
@@ -12414,17 +12254,16 @@ fn promote_string_byte_expr(text: &str) -> String {
             if let Some((base, off)) = core.split_once('+') {
                 let base = base.trim();
                 let off = off.trim();
-                if matches!(base, "optarg" | "argv") {
-                    if let Some(n) = parse_hex_or_dec(off) {
-                        return format!("{base}[{n}]");
-                    }
+                if matches!(base, "optarg" | "argv")
+                    && let Some(n) = parse_hex_or_dec(off)
+                {
+                    return format!("{base}[{n}]");
                 }
             }
         }
     }
     t.to_string()
 }
-
 
 fn maybe_char_literal(text: &str) -> Option<String> {
     let v = parse_hex_or_dec(text)?;
@@ -12445,7 +12284,12 @@ fn normalize_expr_spacing(text: &str) -> String {
             if i + 1 < bytes.len() {
                 let n = bytes[i + 1] as char;
                 if (c == '>' || c == '<' || c == '=' || c == '!') && n == '=' {
-                    if out.chars().last().map(|ch| !ch.is_whitespace()).unwrap_or(false) {
+                    if out
+                        .chars()
+                        .last()
+                        .map(|ch| !ch.is_whitespace())
+                        .unwrap_or(false)
+                    {
                         out.push(' ');
                     }
                     out.push(c);
@@ -12455,7 +12299,12 @@ fn normalize_expr_spacing(text: &str) -> String {
                     continue;
                 }
                 if (c == '|' && n == '|') || (c == '&' && n == '&') {
-                    if out.chars().last().map(|ch| !ch.is_whitespace()).unwrap_or(false) {
+                    if out
+                        .chars()
+                        .last()
+                        .map(|ch| !ch.is_whitespace())
+                        .unwrap_or(false)
+                    {
                         out.push(' ');
                     }
                     out.push(c);
@@ -12466,7 +12315,12 @@ fn normalize_expr_spacing(text: &str) -> String {
                 }
                 if c == '>' && n == '>' {
                     // keep shifts compact then space
-                    if out.chars().last().map(|ch| !ch.is_whitespace()).unwrap_or(false) {
+                    if out
+                        .chars()
+                        .last()
+                        .map(|ch| !ch.is_whitespace())
+                        .unwrap_or(false)
+                    {
                         out.push(' ');
                     }
                     out.push_str(">>");
@@ -12494,7 +12348,12 @@ fn normalize_expr_spacing(text: &str) -> String {
                     continue;
                 }
             }
-            if out.chars().last().map(|ch| !ch.is_whitespace()).unwrap_or(false) {
+            if out
+                .chars()
+                .last()
+                .map(|ch| !ch.is_whitespace())
+                .unwrap_or(false)
+            {
                 out.push(' ');
             }
             out.push(c);
@@ -12567,10 +12426,10 @@ fn negate_condition_text(text: &str) -> String {
     if let Some(inner) = t.strip_prefix("!(").and_then(|s| s.strip_suffix(')')) {
         return naturalize_truthiness(inner);
     }
-    if let Some(inner) = t.strip_prefix('!') {
-        if is_simple_ident(inner) {
-            return inner.to_string();
-        }
+    if let Some(inner) = t.strip_prefix('!')
+        && is_simple_ident(inner)
+    {
+        return inner.to_string();
     }
     if is_simple_ident(t) {
         return format!("!{t}");
@@ -12624,20 +12483,12 @@ fn naturalize_char_range_condition(text: &str) -> Option<String> {
     let lo_s = format_c_char_literal(lo);
     match op {
         ">" | ">=" => {
-            let edge = if op == ">=" {
-                hi.saturating_sub(1)
-            } else {
-                hi
-            };
+            let edge = if op == ">=" { hi.saturating_sub(1) } else { hi };
             let edge_s = format_c_char_literal(edge);
             Some(format!("{var} < {lo_s} || {var} > {edge_s}"))
         }
         "<" | "<=" => {
-            let edge = if op == "<=" {
-                hi
-            } else {
-                hi.saturating_sub(1)
-            };
+            let edge = if op == "<=" { hi } else { hi.saturating_sub(1) };
             let edge_s = format_c_char_literal(edge);
             Some(format!("{var} >= {lo_s} && {var} <= {edge_s}"))
         }
@@ -12672,17 +12523,17 @@ fn parse_sub_expr(text: &str) -> Option<(&str, i64)> {
             return Some((var, imm));
         }
     }
-    if let Some(idx) = t.rfind('-') {
-        if idx > 0 {
-            let var = t[..idx].trim();
-            let imm = parse_hex_or_dec(t[idx + 1..].trim())?;
-            if !var.is_empty()
-                && var
-                    .chars()
-                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
-            {
-                return Some((var, imm));
-            }
+    if let Some(idx) = t.rfind('-')
+        && idx > 0
+    {
+        let var = t[..idx].trim();
+        let imm = parse_hex_or_dec(t[idx + 1..].trim())?;
+        if !var.is_empty()
+            && var
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+        {
+            return Some((var, imm));
         }
     }
     None
@@ -12758,7 +12609,9 @@ pub fn ssa_pseudocode_regions(
                 SsaOp::Return { value } => {
                     has_return = true;
                     let rendered = match value {
-                        Some(op) => render_operand_named(func, op, &HashMap::new(), &HashMap::new()),
+                        Some(op) => {
+                            render_operand_named(func, op, &HashMap::new(), &HashMap::new())
+                        }
                         None => "/*void*/".to_string(),
                     };
                     regions.push(PseudocodeRegion {
@@ -12985,7 +12838,10 @@ mod string_call_tests {
             .iter()
             .filter(|v| matches!(v.op, SsaOp::Call { .. }))
             .count();
-        assert!(call_count >= 1, "expected blr to lift as Call, got {call_count}");
+        assert!(
+            call_count >= 1,
+            "expected blr to lift as Call, got {call_count}"
+        );
         let text = render_ssa_pseudocode_named_layered(
             &ssa,
             "JNI_OnLoad",

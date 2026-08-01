@@ -18,6 +18,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
       - name: Install system sqlite
@@ -30,12 +32,18 @@ jobs:
             echo "- Issues close via PR body \`Fixes #N\` / \`Closes #N\` on **merge**, not from this workflow."
             echo "- Do not merge while this workflow is red; do not close the linked Issue early."
           } >> "$GITHUB_STEP_SUMMARY"
-      - name: Check core crates
-        run: cargo check -p revx-core -p revx-analysis -p revx-loader -p revx-daemon -p revx-engine
-      - name: Parity suite
-        run: cargo test -p revx-analysis --test parity_suite --test corpus_smoke --test corpus_golden -- --nocapture
+      - name: Format check
+        run: cargo fmt --all -- --check
+      - name: Clippy (warnings as errors)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Check all targets
+        run: cargo check --workspace --all-targets
+      - name: Test all targets
+        run: cargo test --workspace --all-targets
+      - name: Test container expansion (containers feature)
+        run: cargo test -p revx-loader -p revx-workspace -p revx-daemon --features revx-loader/containers
       - name: Optional corpus smoke
         if: ${{ env.REVX_CORPUS_DIR != '' }}
-        run: cargo test -p revx-analysis --test corpus_smoke -- --nocapture
+        run: cargo test -p revx-analysis --test corpus_smoke --test corpus_golden -- --nocapture
         env:
           REVX_CORPUS_DIR: ${{ vars.REVX_CORPUS_DIR }}
