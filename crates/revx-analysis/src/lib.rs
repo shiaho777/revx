@@ -303,8 +303,6 @@ impl CodeRegion {
     }
 }
 
-fn release_code_region_pages(_code_regions: &[CodeRegion]) {}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct StringRange {
     start: u64,
@@ -634,19 +632,42 @@ pub fn analyze_parallel(images: Vec<BinaryImage>, profile: AnalysisProfile) -> V
         handles.push(thread::spawn(move || {
             chunk
                 .into_iter()
-                .map(|img| analyze(img, profile))
+                .map(|img| std::panic::catch_unwind(|| analyze(img, profile)))
                 .collect::<Vec<_>>()
         }));
     }
 
     let mut results = Vec::new();
+    let mut panics: Vec<String> = Vec::new();
     for handle in handles {
         match handle.join() {
-            Ok(bundles) => results.extend(bundles),
-            Err(_) => {} // Panic in worker thread — skip and continue
+            Ok(outcomes) => {
+                for outcome in outcomes {
+                    match outcome {
+                        Ok(bundle) => results.push(bundle),
+                        Err(payload) => panics.push(panic_message(payload)),
+                    }
+                }
+            }
+            Err(payload) => panics.push(panic_message(payload)),
         }
     }
+    if !panics.is_empty() {
+        eprintln!(
+            "revx: analyze_parallel recovered {} worker panic(s): {:?}",
+            panics.len(),
+            panics
+        );
+    }
     results
+}
+
+fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    payload
+        .downcast_ref::<String>()
+        .map(|s| s.to_string())
+        .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
+        .unwrap_or_else(|| "<non-string panic>".to_string())
 }
 
 pub fn survey(image: BinaryImage, profile: AnalysisProfile) -> Survey {
@@ -1915,7 +1936,6 @@ where
                 )
             });
         }
-        release_code_region_pages(&code_regions);
     }
     revx_trace(|| {
         format!(
@@ -9331,14 +9351,7 @@ fn format_stack_location(start_offset: i64, end_offset: Option<i64>) -> String {
 
 #[inline]
 fn inst_len(inst: &Instruction) -> usize {
-    let n = inst.bytes.len();
-    if n == 8 {
-        4
-    } else if n == 2 {
-        1
-    } else {
-        n / 2
-    }
+    inst.bytes.len() / 2
 }
 
 fn sanitize_symbol(name: &str) -> String {

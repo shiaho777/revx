@@ -1715,6 +1715,7 @@ impl CapabilityService {
 pub async fn serve_ipc(workspace_root: PathBuf) -> Result<()> {
     let _ = revx_analysis::resource::ensure_process_resource_limits();
     let endpoint = socket_path(&workspace_root);
+    write_daemon_pid(&workspace_root);
     #[cfg(unix)]
     {
         if endpoint.exists() {
@@ -1791,6 +1792,71 @@ pub fn socket_path(workspace_root: &Path) -> PathBuf {
     {
         workspace_root.join(".revx").join("daemon.tcp")
     }
+}
+
+pub fn pid_path(workspace_root: &Path) -> PathBuf {
+    workspace_root.join(".revx").join("daemon.pid")
+}
+
+pub fn write_daemon_pid(workspace_root: &Path) {
+    let pid = std::process::id();
+    let _ = std::fs::write(pid_path(workspace_root), pid.to_string());
+}
+
+pub fn stop_daemon(workspace_root: &Path) -> Result<()> {
+    let endpoint = socket_path(workspace_root);
+    let pid_file = pid_path(workspace_root);
+    let pid_text = std::fs::read_to_string(&pid_file).ok();
+    if let Some(raw) = pid_text.as_deref()
+        && let Ok(pid) = raw.trim().parse::<u32>()
+    {
+        #[cfg(unix)]
+        {
+            use std::io;
+            if signal_process(pid, libc_signal_term()) {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                while endpoint.exists() && std::time::Instant::now() < deadline {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                if endpoint.exists() {
+                    let _ = signal_process(pid, libc_signal_kill());
+                }
+            }
+            let _ = io::Result::<()>::Ok(());
+        }
+        #[cfg(windows)]
+        {
+            let _ = std::process::Command::new("taskkill")
+                .args(["/PID", &pid.to_string(), "/F"])
+                .output();
+        }
+        println!("Stopped daemon pid {pid}");
+    }
+    if endpoint.exists() {
+        std::fs::remove_file(&endpoint)
+            .with_context(|| format!("failed to remove {}", endpoint.display()))?;
+        println!("Removed daemon socket {}", endpoint.display());
+    }
+    let _ = std::fs::remove_file(&pid_file);
+    Ok(())
+}
+
+#[cfg(unix)]
+fn signal_process(pid: u32, signal: i32) -> bool {
+    unsafe extern "C" {
+        fn kill(pid: i32, sig: i32) -> i32;
+    }
+    unsafe { kill(pid as i32, signal) == 0 }
+}
+
+#[cfg(unix)]
+fn libc_signal_term() -> i32 {
+    15
+}
+
+#[cfg(unix)]
+fn libc_signal_kill() -> i32 {
+    9
 }
 
 pub fn windows_pipe_name(workspace_root: &Path) -> String {

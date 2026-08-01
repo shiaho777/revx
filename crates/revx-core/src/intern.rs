@@ -102,11 +102,6 @@ pub fn intern_str_local(value: &str) -> Arc<str> {
     })
 }
 
-pub fn arm64_len_marker() -> Arc<str> {
-    static MARKER: OnceLock<Arc<str>> = OnceLock::new();
-    Arc::clone(MARKER.get_or_init(|| Arc::from("........")))
-}
-
 pub fn static_str(value: &'static str) -> Arc<str> {
     thread_local! {
         static CACHE: RefCell<HashMap<&'static str, Arc<str>>> =
