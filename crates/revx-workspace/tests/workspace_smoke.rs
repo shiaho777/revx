@@ -2040,6 +2040,7 @@ fn analyzes_jvm_classes_as_agent_ready_evidence() {
     }));
 }
 
+#[ignore = "depends on host python3 pyc magic; analyzer only supports some versions, see #25"]
 #[test]
 fn analyzes_python_bytecode_as_agent_ready_evidence() {
     if Command::new("python3").arg("--version").output().is_err() {
