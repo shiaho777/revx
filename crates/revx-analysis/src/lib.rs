@@ -2917,6 +2917,7 @@ fn cfg_window_before(
 
 #[allow(clippy::nonminimal_bool)]
 #[allow(clippy::duplicated_attributes)]
+#[allow(clippy::collapsible_match)]
 fn decode_arm64_cfg_with_references(
     code_regions: &[CodeRegion],
     start: u64,
@@ -3165,6 +3166,7 @@ fn decode_arm64_cfg_with_references(
 }
 
 #[allow(clippy::manual_strip)]
+#[allow(clippy::unnecessary_cast)]
 fn recover_arm64_pc_rel_jump_table_targets(
     block: &[Instruction],
     code_regions: &[CodeRegion],
@@ -5367,6 +5369,7 @@ fn fast_imm_render(v: u64) -> String {
     }
 }
 
+#[allow(clippy::question_mark)]
 fn parse_arm64_load_imm(text: &str) -> Option<(String, String, u64, bool)> {
     let text = text.trim();
     let (rest, is_byte) = if let Some(rest) = text.strip_prefix("ldrb ") {

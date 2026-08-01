@@ -201,6 +201,7 @@ impl CapabilityService {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::unnecessary_sort_by)]
     fn apply_continuum_to_brief(
         &self,
         ws: &Workspace,
@@ -4397,6 +4398,7 @@ fn daemon_agent_next_action(
 }
 
 #[allow(clippy::drop_non_drop)]
+#[allow(clippy::unnecessary_sort_by)]
 fn derive_daemon_object_next_actions(
     object: &UniversalObject,
     analyses: &[ObjectAnalysisSummary],
@@ -4854,6 +4856,7 @@ fn derive_investigation_agent_brief(
 }
 
 #[allow(clippy::redundant_locals)]
+#[allow(clippy::unnecessary_sort_by)]
 fn run_analysis_brief(
     ws: &Workspace,
     request: AnalysisBriefRequest,
@@ -5571,6 +5574,7 @@ fn hot_function_confidence(
     conf.clamp(0.1, 0.99)
 }
 
+#[allow(clippy::unnecessary_sort_by)]
 fn derive_analysis_brief_next_actions(
     query: &str,
     string_hits: &[AnalysisStringHit],
@@ -6007,6 +6011,7 @@ fn extract_quoted_literals(text: &str) -> Vec<String> {
     out
 }
 
+#[allow(clippy::unnecessary_sort_by)]
 fn derive_function_profile_agent_brief(
     function: &revx_core::Function,
     callers: &[revx_core::CallEdge],
@@ -6127,6 +6132,7 @@ fn derive_function_profile_agent_brief(
     }
 }
 
+#[allow(clippy::unnecessary_sort_by)]
 fn derive_decompile_agent_brief(
     name: &str,
     address: u64,

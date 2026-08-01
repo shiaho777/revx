@@ -1249,6 +1249,7 @@ fn parse_case_label_char(label: &str) -> Option<u8> {
     None
 }
 
+#[allow(clippy::unnecessary_sort_by)]
 fn infer_global_names(
     func: &SsaFunction,
     data_base: Option<u64>,
@@ -2394,6 +2395,7 @@ impl DominatorTree {
         }
     }
 
+    #[allow(clippy::while_let_loop)]
     pub fn dominance_frontier(&self, cfg: &Cfg) -> Vec<Vec<BlockId>> {
         let n = cfg.blocks.len();
         let mut df = vec![Vec::new(); n];
@@ -6671,6 +6673,7 @@ pub fn render_ssa_pseudocode_linear_with_strings(
     )
 }
 
+#[allow(clippy::iter_kv_map)]
 fn render_ssa_pseudocode_linear_with_strings_arc_inner(
     func: &SsaFunction,
     name: &str,

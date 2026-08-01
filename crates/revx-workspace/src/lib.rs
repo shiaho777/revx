@@ -2237,7 +2237,6 @@ impl Workspace {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
     fn expand_zip_high_value_members(
         &self,
         object: &UniversalObject,
@@ -15229,6 +15228,7 @@ fn jvm_cp_entry_json(
     }
 }
 
+#[allow(clippy::collapsible_match)]
 fn jvm_string_constants(pool: &[Option<JvmConstantPoolEntry>]) -> Vec<serde_json::Value> {
     let mut values = Vec::new();
     for (index, entry) in pool.iter().enumerate().skip(1) {
@@ -22187,6 +22187,7 @@ fn extract_macho_fat_summary(
     })
 }
 
+#[allow(clippy::collapsible_match)]
 fn extract_macho_thin_summary(
     object: &UniversalObject,
     bytes: &[u8],

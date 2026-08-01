@@ -5232,6 +5232,7 @@ fn extract_strings(file: &object::File<'_>) -> Vec<StringLiteral> {
     dedupe_strings(out)
 }
 
+#[allow(clippy::collapsible_match)]
 fn extract_ascii_strings(base_address: u64, bytes: &[u8]) -> Vec<StringLiteral> {
     let mut out = Vec::new();
     let mut start = None;

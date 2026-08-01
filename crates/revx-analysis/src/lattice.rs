@@ -2266,6 +2266,7 @@ pub fn continuum_ledger_on_visit(
     continuum_ledger_on_visit_with_observation(ledger, namespace, tool, address, name, fresh, None)
 }
 
+#[allow(clippy::unnecessary_sort_by)]
 pub fn continuum_ledger_on_visit_with_observation(
     ledger: &mut IbcContinuumLedger,
     namespace: &str,
@@ -4876,6 +4877,7 @@ fn compile_fbg_investigation_program(
     (ops, ibc)
 }
 
+#[allow(clippy::useless_conversion)]
 fn recover_case_lexicon(
     switch_hits: &[(String, String)],
     optstrings: &[(String, String)],
@@ -5296,6 +5298,7 @@ fn collect_signal_lines(text: &str, regions: &[PseudocodeRegion]) -> Vec<String>
     out
 }
 
+#[allow(clippy::question_mark)]
 fn extract_if_condition(line: &str) -> Option<String> {
     let t = line.trim();
     let rest = if let Some(r) = t.strip_prefix("if (") {
