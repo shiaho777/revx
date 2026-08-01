@@ -2042,6 +2042,10 @@ fn analyzes_jvm_classes_as_agent_ready_evidence() {
 
 #[test]
 fn analyzes_python_bytecode_as_agent_ready_evidence() {
+    if Command::new("python3").arg("--version").output().is_err() {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
     let dir = tempdir().unwrap();
     let ws = Workspace::init(dir.path(), "test", None).unwrap();
     let source_path = dir.path().join("agent.py");
