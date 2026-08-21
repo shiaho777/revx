@@ -481,8 +481,8 @@ fn collect_fat(
             warnings.push(format!("FAT sector {sector} exceeds file size"));
             continue;
         };
-        for chunk in sector_bytes.chunks_exact(4) {
-            fat.push(u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+        for &chunk in sector_bytes.as_chunks::<4>().0 {
+            fat.push(u32::from_le_bytes(chunk));
         }
     }
     Ok(fat)
@@ -503,8 +503,10 @@ fn collect_mini_fat(
         warnings,
     )?;
     Ok(mini_fat_bytes
-        .chunks_exact(4)
-        .map(|chunk| u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|chunk| u32::from_le_bytes(*chunk))
         .collect())
 }
 
@@ -568,7 +570,9 @@ fn parse_directory_entries(
 ) -> Vec<CompoundDirectoryEntry> {
     let mut entries = Vec::new();
     for (index, entry) in directory_bytes
-        .chunks_exact(DIRECTORY_ENTRY_SIZE)
+        .as_chunks::<DIRECTORY_ENTRY_SIZE>()
+        .0
+        .iter()
         .enumerate()
     {
         let object_type = entry[66];
@@ -684,8 +688,8 @@ fn decode_directory_name(entry: &[u8]) -> Option<String> {
     }
     let raw = entry.get(..name_len.saturating_sub(2))?;
     let mut units = Vec::new();
-    for chunk in raw.chunks_exact(2) {
-        units.push(u16::from_le_bytes([chunk[0], chunk[1]]));
+    for &chunk in raw.as_chunks::<2>().0 {
+        units.push(u16::from_le_bytes(chunk));
     }
     String::from_utf16(&units).ok()
 }
