@@ -28,162 +28,17 @@ use std::io::{BufReader, Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+
+mod artifacts;
+mod pool;
+mod schema;
+
+use artifacts::*;
+use pool::*;
+use schema::*;
 use uuid::Uuid;
 
 type PeExpandCandidate = (u8, usize, usize, String, String, Option<Vec<u8>>);
-
-fn sqlite_heap_limits() -> (i64, i64, i64) {
-    if revx_core::micro_mode() {
-        (64 * 1024, 256 * 1024, -8)
-    } else if revx_core::lean_mode() {
-        (4 * 1024 * 1024, 64 * 1024 * 1024, -64)
-    } else {
-        (1024 * 1024, 8 * 1024 * 1024, -64)
-    }
-}
-
-fn apply_performance_pragmas(conn: &Connection) -> Result<()> {
-    let (soft, hard, cache) = sqlite_heap_limits();
-    conn.execute_batch(&format!(
-        "PRAGMA journal_mode=WAL;
-         PRAGMA synchronous=NORMAL;
-         PRAGMA cache_size={cache};
-         PRAGMA mmap_size=0;
-         PRAGMA busy_timeout=2000;
-         PRAGMA foreign_keys=ON;
-         PRAGMA temp_store=FILE;
-         PRAGMA wal_autocheckpoint=32;
-         PRAGMA journal_size_limit=32768;
-         PRAGMA page_size=4096;
-         PRAGMA soft_heap_limit={soft};
-         PRAGMA hard_heap_limit={hard};"
-    ))?;
-    Ok(())
-}
-
-fn apply_analysis_ingest_pragmas(conn: &Connection) -> Result<()> {
-    let (soft, hard, cache) = sqlite_heap_limits();
-    conn.execute_batch(&format!(
-        "PRAGMA synchronous=OFF;
-         PRAGMA temp_store=FILE;
-         PRAGMA cache_size={cache};
-         PRAGMA mmap_size=0;
-         PRAGMA journal_size_limit=32768;
-         PRAGMA soft_heap_limit={soft};
-         PRAGMA hard_heap_limit={hard};"
-    ))?;
-    Ok(())
-}
-
-fn restore_after_analysis_ingest_pragmas(conn: &Connection) -> Result<()> {
-    let (soft, hard, cache) = sqlite_heap_limits();
-    conn.execute_batch(&format!(
-        "PRAGMA synchronous=NORMAL;
-         PRAGMA cache_size={cache};
-         PRAGMA mmap_size=0;
-         PRAGMA soft_heap_limit={soft};
-         PRAGMA hard_heap_limit={hard};"
-    ))?;
-    Ok(())
-}
-
-/// Per-database-path schema initialization (once per path per process).
-static SCHEMA_READY: OnceLock<std::sync::Mutex<BTreeSet<PathBuf>>> = OnceLock::new();
-/// Process-wide free-list of SQLite connections keyed by absolute DB path.
-static CONNECTION_POOL: OnceLock<std::sync::Mutex<BTreeMap<PathBuf, Vec<Connection>>>> =
-    OnceLock::new();
-
-fn ensure_pragmas(conn: &Connection, _db_path: &Path) -> Result<()> {
-    apply_performance_pragmas(conn)
-}
-
-fn ensure_schema(conn: &Connection, db_path: &Path) -> Result<()> {
-    let set = SCHEMA_READY.get_or_init(|| std::sync::Mutex::new(BTreeSet::new()));
-    let mut ready = set.lock().unwrap_or_else(|p| p.into_inner());
-    if ready.contains(db_path) {
-        return Ok(());
-    }
-    init_schema(conn)?;
-    ready.insert(db_path.to_path_buf());
-    Ok(())
-}
-
-fn canonicalize_db_path(db_path: &Path) -> PathBuf {
-    if db_path.is_absolute() {
-        db_path.to_path_buf()
-    } else {
-        std::env::current_dir()
-            .unwrap_or_else(|_| PathBuf::from("."))
-            .join(db_path)
-    }
-}
-
-fn connection_pool() -> &'static std::sync::Mutex<BTreeMap<PathBuf, Vec<Connection>>> {
-    CONNECTION_POOL.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
-}
-
-fn open_connection_fresh(db_path: &Path) -> Result<Connection> {
-    let conn = Connection::open(db_path)?;
-    ensure_pragmas(&conn, db_path)?;
-    ensure_schema(&conn, db_path)?;
-    Ok(conn)
-}
-
-/// Dedicated connection for long-running transactions (analysis ingest).
-fn open_connection(db_path: &Path) -> Result<Connection> {
-    open_connection_fresh(db_path)
-}
-
-/// Pooled connection returned to the free-list on drop.
-pub struct PooledConnection {
-    key: PathBuf,
-    conn: Option<Connection>,
-}
-
-impl PooledConnection {
-    fn checkout(db_path: &Path) -> Result<Self> {
-        let key = canonicalize_db_path(db_path);
-        let mut pool = connection_pool().lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(slot) = pool.get_mut(&key)
-            && let Some(conn) = slot.pop()
-        {
-            return Ok(Self {
-                key,
-                conn: Some(conn),
-            });
-        }
-        drop(pool);
-        Ok(Self {
-            key,
-            conn: Some(open_connection_fresh(db_path)?),
-        })
-    }
-}
-
-impl Drop for PooledConnection {
-    fn drop(&mut self) {
-        if let Some(conn) = self.conn.take() {
-            let mut pool = connection_pool().lock().unwrap_or_else(|p| p.into_inner());
-            let slot = pool.entry(self.key.clone()).or_default();
-            if slot.len() < 2 {
-                slot.push(conn);
-            }
-        }
-    }
-}
-
-impl std::ops::Deref for PooledConnection {
-    type Target = Connection;
-    fn deref(&self) -> &Connection {
-        self.conn.as_ref().expect("pooled connection")
-    }
-}
-
-impl std::ops::DerefMut for PooledConnection {
-    fn deref_mut(&mut self) -> &mut Connection {
-        self.conn.as_mut().expect("pooled connection")
-    }
-}
 
 #[derive(Debug, Clone)]
 pub struct EvidenceIdExport {
@@ -4614,41 +4469,6 @@ impl Workspace {
         })
     }
 
-    pub fn read_artifact_preview(
-        &self,
-        relative_path: Option<&str>,
-        hash_blake3: Option<&str>,
-        offset: u64,
-        max_bytes: usize,
-    ) -> Result<ArtifactReadResponse> {
-        let relative_path = resolve_artifact_relative_path(relative_path, hash_blake3)?;
-        validate_artifact_relative_path(&relative_path)?;
-        let path = self.root.join(&relative_path);
-        let bytes = fs::read(&path)
-            .with_context(|| format!("failed to read artifact {}", relative_path))?;
-        let total_size = bytes.len() as u64;
-        let start = (offset as usize).min(bytes.len());
-        let capped = max_bytes.clamp(1, 1_048_576);
-        let end = start.saturating_add(capped).min(bytes.len());
-        let preview = &bytes[start..end];
-        let hash = blake3::hash(&bytes).to_hex().to_string();
-        let artifact = ArtifactHandle {
-            hash_blake3: hash,
-            relative_path,
-            size: total_size,
-            content_type: artifact_content_type(preview),
-        };
-        Ok(ArtifactReadResponse {
-            artifact,
-            offset,
-            total_size,
-            returned_size: preview.len(),
-            truncated: end < bytes.len(),
-            preview_hex: hex::encode(preview),
-            preview_text: text_preview(preview),
-        })
-    }
-
     pub fn list_artifacts(
         &self,
         query: Option<&str>,
@@ -5004,29 +4824,6 @@ impl Workspace {
             );
         }
         Ok(())
-    }
-
-    fn write_artifact_bytes(&self, content_type: &str, bytes: &[u8]) -> Result<ArtifactHandle> {
-        let hash = blake3::hash(bytes).to_hex().to_string();
-        let relative_path = format!("artifacts/{hash}");
-        let path = self.root.join(&relative_path);
-        match fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-        {
-            Ok(mut file) => {
-                file.write_all(bytes)?;
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(err) => return Err(err.into()),
-        }
-        Ok(ArtifactHandle {
-            hash_blake3: hash,
-            relative_path,
-            size: bytes.len() as u64,
-            content_type: content_type.to_string(),
-        })
     }
 
     fn read_json_artifact<T: serde::de::DeserializeOwned>(&self, relative_path: &str) -> Result<T> {
@@ -7492,235 +7289,6 @@ fn artifact_content_type_placeholder(role: &str) -> &'static str {
     }
 }
 
-fn init_schema(conn: &Connection) -> Result<()> {
-    let user_version: i32 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    if user_version >= 6 {
-        return Ok(());
-    }
-    if user_version < 5 {
-        conn.execute_batch(
-        r#"
-        CREATE TABLE IF NOT EXISTS binaries(
-            id TEXT PRIMARY KEY,
-            path TEXT NOT NULL,
-            format TEXT NOT NULL,
-            architecture TEXT NOT NULL,
-            entry_addr INTEGER,
-            image_base INTEGER,
-            hash_blake3 TEXT NOT NULL,
-            last_analysis_at TEXT,
-            function_count INTEGER NOT NULL DEFAULT 0,
-            import_count INTEGER NOT NULL DEFAULT 0,
-            export_count INTEGER NOT NULL DEFAULT 0,
-            string_count INTEGER NOT NULL DEFAULT 0,
-            typed_function_count INTEGER NOT NULL DEFAULT 0,
-            structured_pseudocode_count INTEGER NOT NULL DEFAULT 0,
-            survey_artifact_hash TEXT,
-            survey_artifact_path TEXT,
-            survey_artifact_size INTEGER
-        );
-        CREATE TABLE IF NOT EXISTS analysis_runs(
-            id TEXT PRIMARY KEY,
-            binary_id TEXT NOT NULL,
-            profile TEXT NOT NULL,
-            status TEXT NOT NULL,
-            created_at TEXT NOT NULL,
-            completed_at TEXT,
-            summary_json TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS functions(
-            binary_id TEXT NOT NULL,
-            address INTEGER NOT NULL,
-            name TEXT NOT NULL,
-            size INTEGER NOT NULL,
-            function_snapshot_hash TEXT NOT NULL,
-            function_snapshot_path TEXT NOT NULL,
-            function_snapshot_size INTEGER NOT NULL,
-            pseudocode_artifact_hash TEXT,
-            pseudocode_artifact_path TEXT,
-            pseudocode_artifact_size INTEGER,
-            stack_summary_json TEXT NOT NULL,
-            evidence_ids_json TEXT NOT NULL,
-            warnings_json TEXT NOT NULL DEFAULT '[]',
-            PRIMARY KEY(binary_id, address)
-        );
-        CREATE TABLE IF NOT EXISTS basic_blocks(
-            binary_id TEXT NOT NULL,
-            function_address INTEGER NOT NULL,
-            address INTEGER NOT NULL,
-            size INTEGER NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS instructions(
-            binary_id TEXT NOT NULL,
-            function_address INTEGER NOT NULL,
-            block_address INTEGER NOT NULL,
-            address INTEGER NOT NULL,
-            bytes TEXT NOT NULL,
-            text TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS code_references(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            binary_id TEXT NOT NULL,
-            from_addr INTEGER NOT NULL,
-            to_addr INTEGER NOT NULL,
-            kind TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS strings(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            binary_id TEXT NOT NULL,
-            address INTEGER,
-            value TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS debug_imports(
-            binary_id TEXT PRIMARY KEY,
-            status_json TEXT NOT NULL,
-            source_kind TEXT,
-            artifact_hash TEXT,
-            artifact_path TEXT,
-            artifact_size INTEGER,
-            imported_type_count INTEGER NOT NULL DEFAULT 0,
-            imported_function_hint_count INTEGER NOT NULL DEFAULT 0,
-            imported_variable_hint_count INTEGER NOT NULL DEFAULT 0,
-            notes_json TEXT NOT NULL,
-            evidence_ids_json TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS types(
-            id TEXT PRIMARY KEY,
-            binary_id TEXT NOT NULL,
-            name TEXT NOT NULL,
-            kind TEXT NOT NULL,
-            source_json TEXT NOT NULL,
-            size INTEGER,
-            evidence_ids_json TEXT NOT NULL,
-            artifact_hash TEXT NOT NULL,
-            artifact_path TEXT NOT NULL,
-            artifact_size INTEGER NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS binary_types(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            binary_id TEXT NOT NULL,
-            type_id TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS evidence(
-            id TEXT PRIMARY KEY,
-            subject TEXT NOT NULL,
-            kind TEXT NOT NULL,
-            summary TEXT NOT NULL,
-            details_json TEXT NOT NULL,
-            provenance_json TEXT NOT NULL,
-            evidence_artifact_hash TEXT,
-            evidence_artifact_path TEXT,
-            evidence_artifact_size INTEGER
-        );
-        CREATE TABLE IF NOT EXISTS hypotheses(
-            id TEXT PRIMARY KEY,
-            title TEXT NOT NULL,
-            notes TEXT NOT NULL,
-            evidence_ids_json TEXT NOT NULL,
-            updated_at TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS trace_events(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            ts TEXT NOT NULL,
-            process TEXT NOT NULL,
-            thread TEXT NOT NULL,
-            kind TEXT NOT NULL,
-            location INTEGER,
-            payload_json TEXT NOT NULL,
-            trace_artifact_hash TEXT,
-            trace_artifact_path TEXT,
-            trace_artifact_size INTEGER
-        );
-        CREATE TABLE IF NOT EXISTS reports(
-            id TEXT PRIMARY KEY,
-            topic TEXT NOT NULL,
-            evidence_ids_json TEXT NOT NULL,
-            artifact_hash TEXT NOT NULL,
-            artifact_path TEXT NOT NULL,
-            artifact_size INTEGER NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS objects(
-            id TEXT PRIMARY KEY,
-            path TEXT,
-            display_name TEXT NOT NULL,
-            kind_json TEXT NOT NULL,
-            format TEXT,
-            size INTEGER NOT NULL,
-            hash_blake3 TEXT,
-            media_type TEXT,
-            entropy REAL,
-            depth INTEGER NOT NULL,
-            flags_json TEXT NOT NULL,
-            metadata_json TEXT NOT NULL,
-            analyses_json TEXT NOT NULL DEFAULT '[]',
-            evidence_ids_json TEXT NOT NULL,
-            graph_artifact_hash TEXT NOT NULL,
-            graph_artifact_path TEXT NOT NULL,
-            graph_artifact_size INTEGER NOT NULL,
-            last_seen_at TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS object_edges(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            graph_root_id TEXT NOT NULL,
-            from_id TEXT NOT NULL,
-            to_id TEXT NOT NULL,
-            kind_json TEXT NOT NULL,
-            metadata_json TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS operation_log(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            ts TEXT NOT NULL,
-            kind TEXT NOT NULL,
-            details_json TEXT NOT NULL
-        );
-        CREATE INDEX IF NOT EXISTS idx_functions_name ON functions(name);
-        CREATE INDEX IF NOT EXISTS idx_functions_binary_addr ON functions(binary_id, address);
-        CREATE INDEX IF NOT EXISTS idx_functions_addr_range ON functions(address, size);
-        CREATE INDEX IF NOT EXISTS idx_code_references_from ON code_references(binary_id, from_addr);
-        CREATE INDEX IF NOT EXISTS idx_code_references_to ON code_references(binary_id, to_addr);
-        CREATE INDEX IF NOT EXISTS idx_code_references_to_only ON code_references(to_addr);
-        CREATE INDEX IF NOT EXISTS idx_strings_binary ON strings(binary_id, address);
-        CREATE INDEX IF NOT EXISTS idx_strings_value ON strings(value);
-        CREATE INDEX IF NOT EXISTS idx_evidence_subject ON evidence(subject);
-        CREATE INDEX IF NOT EXISTS idx_evidence_kind ON evidence(kind);
-        CREATE INDEX IF NOT EXISTS idx_types_binary ON types(binary_id);
-        CREATE INDEX IF NOT EXISTS idx_binary_types_binary ON binary_types(binary_id);
-        CREATE INDEX IF NOT EXISTS idx_analysis_runs_binary ON analysis_runs(binary_id, created_at);
-        CREATE INDEX IF NOT EXISTS idx_objects_path ON objects(path);
-        CREATE INDEX IF NOT EXISTS idx_objects_hash ON objects(hash_blake3);
-        CREATE INDEX IF NOT EXISTS idx_objects_display ON objects(display_name);
-        CREATE INDEX IF NOT EXISTS idx_object_edges_from ON object_edges(from_id);
-        CREATE INDEX IF NOT EXISTS idx_object_edges_to ON object_edges(to_id);
-        CREATE INDEX IF NOT EXISTS idx_object_edges_root ON object_edges(graph_root_id);
-        CREATE INDEX IF NOT EXISTS idx_trace_events_kind ON trace_events(kind);
-        "#,
-    )
-    .context("failed to initialize schema")?;
-        let _ = conn.execute(
-            "ALTER TABLE functions ADD COLUMN warnings_json TEXT NOT NULL DEFAULT '[]'",
-            [],
-        );
-        let _ = conn.execute(
-            "ALTER TABLE objects ADD COLUMN analyses_json TEXT NOT NULL DEFAULT '[]'",
-            [],
-        );
-    }
-    conn.execute_batch(
-        r#"
-        CREATE TABLE IF NOT EXISTS binary_imports(
-            binary_id TEXT NOT NULL,
-            name TEXT NOT NULL,
-            address INTEGER,
-            library TEXT
-        );
-        CREATE INDEX IF NOT EXISTS idx_binary_imports_addr ON binary_imports(address);
-        CREATE INDEX IF NOT EXISTS idx_binary_imports_binary ON binary_imports(binary_id, address);
-        "#,
-    )?;
-    conn.execute_batch("PRAGMA user_version = 6")?;
-    Ok(())
-}
-
 fn upsert_binary_record(
     conn: &Connection,
     survey: &Survey,
@@ -7862,71 +7430,6 @@ fn insert_evidence_records_batch(conn: &Connection, items: &[Evidence]) -> Resul
         conn.execute(&sql, param_refs.as_slice())?;
     }
     Ok(())
-}
-
-fn resolve_artifact_relative_path(
-    relative_path: Option<&str>,
-    hash_blake3: Option<&str>,
-) -> Result<String> {
-    match (relative_path, hash_blake3) {
-        (Some(path), _) if !path.trim().is_empty() => Ok(path.trim().to_string()),
-        (_, Some(hash)) if !hash.trim().is_empty() => {
-            let hash = hash.trim();
-            if hash.len() != 64 || !hash.chars().all(|ch| ch.is_ascii_hexdigit()) {
-                anyhow::bail!("invalid blake3 artifact hash: {hash}");
-            }
-            Ok(format!("artifacts/{hash}"))
-        }
-        _ => anyhow::bail!("artifact read requires relative_path or hash_blake3"),
-    }
-}
-
-fn validate_artifact_relative_path(relative_path: &str) -> Result<()> {
-    let path = Path::new(relative_path);
-    if path.is_absolute() {
-        anyhow::bail!("artifact relative_path must be relative");
-    }
-    let mut components = path.components();
-    match components.next() {
-        Some(std::path::Component::Normal(prefix)) if prefix == "artifacts" => {}
-        _ => anyhow::bail!("artifact relative_path must start with artifacts/"),
-    }
-    for component in components {
-        match component {
-            std::path::Component::Normal(_) => {}
-            _ => anyhow::bail!("artifact relative_path contains invalid component"),
-        }
-    }
-    Ok(())
-}
-
-fn artifact_handle_from_db(
-    hash_blake3: String,
-    relative_path: String,
-    size: i64,
-    content_type: &str,
-) -> ArtifactHandle {
-    ArtifactHandle {
-        hash_blake3,
-        relative_path,
-        size: size.max(0) as u64,
-        content_type: content_type.to_string(),
-    }
-}
-
-fn optional_artifact_handle_from_db(
-    hash_blake3: Option<String>,
-    relative_path: Option<String>,
-    size: Option<i64>,
-    content_type: &str,
-) -> Option<ArtifactHandle> {
-    let hash_blake3 = hash_blake3?;
-    Some(ArtifactHandle {
-        hash_blake3,
-        relative_path: relative_path.unwrap_or_default(),
-        size: size.unwrap_or_default().max(0) as u64,
-        content_type: content_type.to_string(),
-    })
 }
 
 fn normalize_optional_filter(value: Option<&str>) -> Option<String> {
@@ -10053,7 +9556,7 @@ fn is_tar_bytes(bytes: &[u8]) -> bool {
     }
     let text = std::str::from_utf8(checksum_field)
         .unwrap_or("")
-        .trim_matches(|c: char| c == ' ' || c.is_whitespace());
+        .trim_matches(|c: char| c == '\0' || c.is_whitespace());
     let Ok(declared) = u32::from_str_radix(text, 8) else {
         return false;
     };
@@ -30801,14 +30304,14 @@ fn estimate_gif_length(bytes: &[u8], offset: usize) -> Option<u64> {
 }
 
 fn estimate_wasm_length(bytes: &[u8], offset: usize) -> Option<u64> {
-    if bytes.get(offset..offset + 4) != Some(b" asm") {
+    if bytes.get(offset..offset + 4) != Some(b"\0asm") {
         return None;
     }
     estimate_bounded_tail_length(bytes, offset, 8 * 1024 * 1024)
 }
 
 fn estimate_sqlite_length(bytes: &[u8], offset: usize) -> Option<u64> {
-    if bytes.get(offset..offset + 16) != Some(b"SQLite format 3 ") {
+    if bytes.get(offset..offset + 16) != Some(b"SQLite format 3\0") {
         return None;
     }
     let page_size = read_be_u16(bytes, offset + 16)? as usize;
