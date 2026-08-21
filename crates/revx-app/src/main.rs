@@ -278,17 +278,9 @@ fn resolve_engine() -> Result<PathBuf, String> {
 
 fn workspace_from_cwd() -> Result<QueryWorkspace, String> {
     let cwd = env::current_dir().map_err(|e| e.to_string())?;
-    let mut dir = cwd.as_path();
-    loop {
-        if dir.join(".revx").exists() {
-            return QueryWorkspace::open(dir).map_err(|e| e.to_string());
-        }
-        match dir.parent() {
-            Some(parent) if parent != dir => dir = parent,
-            _ => break,
-        }
-    }
-    Err(format!("no revx workspace in {} or parents", cwd.display()))
+    let root = revx_core::find_workspace_root(&cwd)
+        .ok_or_else(|| format!("no revx workspace in {} or parents", cwd.display()))?;
+    QueryWorkspace::open(&root).map_err(|e| e.to_string())
 }
 
 fn parse_usize_flag(args: &[String], flag: &str, default: usize) -> usize {

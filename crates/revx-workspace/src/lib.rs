@@ -17,7 +17,7 @@ use revx_core::{
     ObjectSignatureScanResponse, PROJECT_SCHEMA_VERSION, ProjectConfig, PseudocodeUnit, Reference,
     Report, SearchBytesResponse, StringLiteral, Survey, SymbolicConstraint, SymbolicSolveResponse,
     SymbolicSolveStatus, SymbolicVariable, TraceEvent, TypeDef, TypeSource, UniversalObject,
-    Variable, is_compound_file,
+    Variable, is_compound_file, parse_address, parse_project_config,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use ruzstd::decoding::StreamingDecoder as ZstdDecoder;
@@ -333,8 +333,8 @@ impl Workspace {
         let path = self.root.join("project.toml");
         let raw = fs::read_to_string(&path)
             .with_context(|| format!("failed to read {}", path.display()))?;
-        let cfg: ProjectConfig =
-            toml::from_str(&raw).with_context(|| format!("failed to parse {}", path.display()))?;
+        let cfg = parse_project_config(&raw)
+            .map_err(|error| anyhow::anyhow!("failed to parse {}: {error}", path.display()))?;
         if cfg.schema_version != PROJECT_SCHEMA_VERSION {
             anyhow::bail!(
                 "unsupported workspace schema_version={} at {}; expected {}. Re-run `revx init` and re-analyze in a fresh workspace.",
@@ -30090,18 +30090,6 @@ fn ratio(count: usize, total: usize) -> f64 {
         0.0
     } else {
         count as f64 / total as f64
-    }
-}
-
-fn parse_address(value: &str) -> Option<u64> {
-    let trimmed = value.trim();
-    if let Some(hex) = trimmed
-        .strip_prefix("0x")
-        .or_else(|| trimmed.strip_prefix("0X"))
-    {
-        u64::from_str_radix(hex, 16).ok()
-    } else {
-        trimmed.parse().ok()
     }
 }
 
