@@ -5307,8 +5307,10 @@ fn extract_utf16le_strings(base_address: u64, bytes: &[u8]) -> Vec<StringLiteral
                 let char_count = (idx - s) / 2;
                 if char_count >= 4 {
                     let utf16: Vec<u16> = bytes[s..idx]
-                        .chunks_exact(2)
-                        .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
+                        .map(|chunk| u16::from_le_bytes(*chunk))
                         .collect();
                     if let Ok(value) = String::from_utf16(&utf16) {
                         out.push(StringLiteral {
@@ -5327,8 +5329,10 @@ fn extract_utf16le_strings(base_address: u64, bytes: &[u8]) -> Vec<StringLiteral
         let char_count = (bytes.len() - s) / 2;
         if char_count >= 4 {
             let utf16: Vec<u16> = bytes[s..]
-                .chunks_exact(2)
-                .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|chunk| u16::from_le_bytes(*chunk))
                 .collect();
             if let Ok(value) = String::from_utf16(&utf16) {
                 out.push(StringLiteral {

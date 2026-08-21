@@ -16643,8 +16643,10 @@ fn shell_link_utf16_at(
 
 fn decode_utf16le_lossy(bytes: &[u8]) -> String {
     let units = bytes
-        .chunks_exact(2)
-        .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|chunk| u16::from_le_bytes(*chunk))
         .collect::<Vec<_>>();
     String::from_utf16_lossy(&units)
 }
@@ -18820,8 +18822,10 @@ fn dotnet_extract_user_strings(
         };
         if utf16_bytes.len() >= 2 && utf16_bytes.len() % 2 == 0 {
             let units = utf16_bytes
-                .chunks_exact(2)
-                .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|chunk| u16::from_le_bytes(*chunk))
                 .collect::<Vec<_>>();
             let raw = String::from_utf16_lossy(&units);
             if !raw.is_empty() {
@@ -28381,8 +28385,10 @@ fn decode_vba_record_string(data: &[u8]) -> Option<String> {
     }
     if data.len().is_multiple_of(2) && data.iter().skip(1).step_by(2).any(|byte| *byte == 0) {
         let units = data
-            .chunks_exact(2)
-            .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|chunk| u16::from_le_bytes(*chunk))
             .take_while(|unit| *unit != 0)
             .collect::<Vec<_>>();
         return String::from_utf16(&units)

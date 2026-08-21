@@ -4,7 +4,6 @@ use std::time::{Duration, Instant};
 const DEFAULT_JOBS: usize = 1;
 const ABSOLUTE_MAX_JOBS: usize = 2;
 const DEFAULT_WALL_SEC: u64 = 180;
-const DEFAULT_RSS_KB: u64 = 8 * 1024;
 const DEFAULT_CPU_SEC: u64 = 180;
 const DEFAULT_NICE: i32 = 5;
 const ABSOLUTE_MAX_RSS_BYTES: u64 = 8 * 1024 * 1024;
@@ -18,40 +17,53 @@ pub struct ProcessResourceLimits {
     pub nice: i32,
 }
 
+fn resolve_jobs(
+    requested: Option<usize>,
+    relaxed: bool,
+    lean: bool,
+    micro: bool,
+    available: usize,
+    job_cap: usize,
+) -> usize {
+    let chosen = match requested {
+        Some(requested) => requested.min(job_cap),
+        None => {
+            if lean || micro || !relaxed {
+                DEFAULT_JOBS
+            } else {
+                job_cap
+            }
+        }
+    };
+    chosen.min(available)
+}
+
 impl ProcessResourceLimits {
     pub fn from_env() -> Self {
-        let job_cap = if std::env::var_os("REVX_FULL_MEM").is_some() {
-            4
-        } else {
-            ABSOLUTE_MAX_JOBS
-        };
-        let jobs = std::env::var("REVX_JOBS")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|v| *v >= 1)
-            .unwrap_or(DEFAULT_JOBS)
-            .min(job_cap);
+        let relaxed = std::env::var_os("REVX_FULL_MEM").is_some() || revx_core::rss_limit_relaxed();
+        let job_cap = if relaxed { 4 } else { ABSOLUTE_MAX_JOBS };
         let available = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(1)
             .max(1);
-        let jobs = jobs.min(available);
+        let requested = std::env::var("REVX_JOBS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|v| *v >= 1);
+        let jobs = resolve_jobs(
+            requested,
+            relaxed,
+            revx_core::lean_mode(),
+            revx_core::micro_mode(),
+            available,
+            job_cap,
+        );
         let wall_sec = std::env::var("REVX_WALL_SEC")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
             .filter(|v| *v >= 1)
             .unwrap_or(DEFAULT_WALL_SEC);
-        let rss_kb = std::env::var("REVX_RSS_KB")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .or_else(|| {
-                std::env::var("REVX_RSS_MB")
-                    .ok()
-                    .and_then(|v| v.parse::<u64>().ok())
-                    .map(|mb| mb.saturating_mul(1024))
-            })
-            .filter(|v| *v >= 64)
-            .unwrap_or(DEFAULT_RSS_KB);
+        let rss_kb = revx_core::env_rss_kb();
         let cpu_sec = std::env::var("REVX_CPU_SEC")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
@@ -330,4 +342,41 @@ impl AnalysisBudget {
 
 pub fn analysis_worker_count() -> usize {
     ensure_process_resource_limits().jobs
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn jobs_default_stays_one_in_lean_and_unrelaxed() {
+        for (lean, micro, relaxed) in [
+            (true, false, true),
+            (false, true, true),
+            (false, false, false),
+        ] {
+            assert_eq!(resolve_jobs(None, relaxed, lean, micro, 8, 4), 1);
+        }
+    }
+
+    #[test]
+    fn jobs_relaxed_defaults_to_cap_capped_by_available() {
+        assert_eq!(resolve_jobs(None, true, false, false, 8, 4), 4);
+        assert_eq!(resolve_jobs(None, true, false, false, 2, 4), 2);
+        assert_eq!(resolve_jobs(None, true, false, false, 1, 4), 1);
+        assert_eq!(
+            resolve_jobs(None, true, false, false, 8, ABSOLUTE_MAX_JOBS),
+            2
+        );
+    }
+
+    #[test]
+    fn jobs_explicit_env_wins_and_still_capped() {
+        assert_eq!(resolve_jobs(Some(8), true, false, false, 8, 4), 4);
+        assert_eq!(
+            resolve_jobs(Some(8), false, false, false, 8, ABSOLUTE_MAX_JOBS),
+            2
+        );
+        assert_eq!(resolve_jobs(Some(1), true, false, false, 8, 4), 1);
+    }
 }

@@ -42,6 +42,12 @@ Place `revx`, `revx-engine`, and `revx-micro` side by side on `PATH` (or set `RE
 
 Default analysis targets single-digit MB process growth (`REVX_RSS_MB=8`, 1 job, lean Fast snapshots). Raise only when needed via `REVX_FULL_MEM=1` / `REVX_RSS_MB=512`. Ultra-low: `REVX_MICRO=1`.
 
+When memory headroom is raised (`REVX_FULL_MEM=1` or `REVX_RSS_MB`/`REVX_RSS_KB` above the 8 MB default), analysis jobs default to `min(4, available cores)`; lean/micro stay at 1. Set `REVX_JOBS` to override explicitly.
+
+Analysis depth caps are tunable per run without recompiling: `REVX_MAX_GLOBAL_REFERENCES` (512), `REVX_MAX_CFG_BLOCKS` (48), `REVX_MAX_CFG_INSTRUCTIONS` (192), `REVX_MAX_SHARED_STRING_MAP` (64), `REVX_MAX_DATA_REF_SCAN_INSTS` (256). An explicit value wins over the lean-mode clamp.
+
+Benchmarks: `scripts/bench.sh` runs the criterion suite (`cargo bench -p revx-analysis --bench analyze`) in lean and full-memory passes and writes a CSV baseline to `target/bench-results/<stamp>/summary.csv`.
+
 ## Commands
 
 The public command surface is constrained to the v1 plan:
