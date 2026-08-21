@@ -832,6 +832,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 name = "revx"
 version = "0.1.0"
 dependencies = [
+ "revx-core",
  "revx-query",
  "serde_json",
 ]
@@ -878,6 +879,7 @@ dependencies = [
  "chrono",
  "serde",
  "serde_json",
+ "toml",
  "uuid",
 ]
 
@@ -955,6 +957,7 @@ version = "0.1.0"
 name = "revx-query"
 version = "0.1.0"
 dependencies = [
+ "revx-core",
  "rusqlite",
  "serde",
  "serde_json",

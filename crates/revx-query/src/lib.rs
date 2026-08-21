@@ -1,3 +1,4 @@
+use revx_core::{PROJECT_SCHEMA_VERSION, ProjectConfig, parse_address, parse_project_config};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -5,8 +6,6 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
-
-const PROJECT_SCHEMA_VERSION: u32 = 4;
 
 type FunctionLookupRow = (
     String,
@@ -22,14 +21,6 @@ type FunctionLookupRow = (
 #[derive(Clone)]
 pub struct QueryWorkspace {
     root: PathBuf,
-}
-
-#[derive(Debug, Serialize)]
-pub struct ProjectConfig {
-    pub schema_version: u32,
-    pub name: String,
-    pub created_at: String,
-    pub primary_binary: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -159,7 +150,7 @@ impl QueryWorkspace {
     pub fn project_config(&self) -> Result<ProjectConfig> {
         let path = self.root.join("project.toml");
         let raw = fs::read_to_string(&path)?;
-        let cfg = parse_project_toml(&raw)?;
+        let cfg = parse_project_config(&raw).map_err(QueryError)?;
         if cfg.schema_version != PROJECT_SCHEMA_VERSION {
             return Err(QueryError(format!(
                 "unsupported workspace schema_version={} at {}; expected {}",
@@ -573,17 +564,6 @@ fn map_reference(row: &rusqlite::Row<'_>) -> rusqlite::Result<ReferenceHit> {
     })
 }
 
-fn parse_address(query: &str) -> Option<u64> {
-    let q = query.trim();
-    if let Some(hex) = q.strip_prefix("0x").or_else(|| q.strip_prefix("0X")) {
-        return u64::from_str_radix(hex, 16).ok();
-    }
-    if q.chars().all(|c| c.is_ascii_hexdigit()) && q.chars().any(|c| c.is_ascii_alphabetic()) {
-        return u64::from_str_radix(q, 16).ok();
-    }
-    q.parse::<u64>().ok()
-}
-
 fn read_json_file<T: serde::de::DeserializeOwned>(
     root: &Path,
     relative: Option<&str>,
@@ -612,55 +592,6 @@ fn rank_name(query: &str, value: &str) -> i32 {
     } else {
         0
     }
-}
-
-fn parse_project_toml(raw: &str) -> Result<ProjectConfig> {
-    let mut schema_version = None;
-    let mut name = None;
-    let mut created_at = None;
-    let mut primary_binary = None;
-    for line in raw.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let Some((key, value)) = line.split_once('=') else {
-            continue;
-        };
-        let key = key.trim();
-        let value = value.trim();
-        match key {
-            "schema_version" => {
-                schema_version = value.parse::<u32>().ok();
-            }
-            "name" => name = Some(unquote(value)),
-            "created_at" => created_at = Some(unquote(value)),
-            "primary_binary" => {
-                if value == "null" {
-                    primary_binary = None;
-                } else {
-                    primary_binary = Some(unquote(value));
-                }
-            }
-            _ => {}
-        }
-    }
-    Ok(ProjectConfig {
-        schema_version: schema_version
-            .ok_or_else(|| QueryError("missing schema_version".into()))?,
-        name: name.ok_or_else(|| QueryError("missing name".into()))?,
-        created_at: created_at.ok_or_else(|| QueryError("missing created_at".into()))?,
-        primary_binary,
-    })
-}
-
-fn unquote(value: &str) -> String {
-    let v = value.trim();
-    if v.len() >= 2 && v.starts_with('"') && v.ends_with('"') {
-        let inner = &v[1..v.len() - 1];
-        return inner.replace("\\\"", "\"").replace("\\\\", "\\");
-    }
-    v.to_string()
 }
 
 fn toml_string(value: &str) -> String {

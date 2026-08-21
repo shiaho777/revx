@@ -1570,17 +1570,9 @@ fn render_mcp_host_config(host: McpHost, engine: &Path, workspace: &Path) -> Str
 
 fn workspace_from_cwd() -> Result<Workspace> {
     let cwd = std::env::current_dir()?;
-    let mut dir = cwd.as_path();
-    loop {
-        if dir.join(".revx").exists() {
-            return Workspace::open(dir);
-        }
-        match dir.parent() {
-            Some(parent) if parent != dir => dir = parent,
-            _ => break,
-        }
-    }
-    anyhow::bail!("no revx workspace in {} or parents", cwd.display())
+    let root = revx_core::find_workspace_root(&cwd)
+        .ok_or_else(|| anyhow::anyhow!("no revx workspace in {} or parents", cwd.display()))?;
+    Workspace::open(&root)
 }
 
 fn workspace_parent_from_cwd() -> Result<PathBuf> {
