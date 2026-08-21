@@ -118,6 +118,30 @@ const MAX_DATA_REF_SCAN_INSTS: usize = 256;
 const MAX_GLOBAL_REFERENCES: usize = 512;
 const MAX_SHARED_STRING_MAP: usize = 64;
 
+fn data_ref_scan_limit() -> usize {
+    revx_core::analysis_caps()
+        .data_ref_scan_insts
+        .unwrap_or(MAX_DATA_REF_SCAN_INSTS)
+}
+
+fn shared_string_map_limit() -> usize {
+    revx_core::analysis_caps()
+        .shared_string_map
+        .unwrap_or(MAX_SHARED_STRING_MAP)
+}
+
+fn global_reference_limit() -> usize {
+    revx_core::analysis_caps()
+        .global_references
+        .unwrap_or_else(|| {
+            if resource::lean_mode() {
+                MAX_GLOBAL_REFERENCES.min(64)
+            } else {
+                MAX_GLOBAL_REFERENCES.min(1024)
+            }
+        })
+}
+
 #[inline]
 fn format_sub_addr(addr: u64) -> String {
     let mut s = String::with_capacity(20);
@@ -936,11 +960,7 @@ where
     string_ranges.sort_unstable_by_key(|range| range.start);
     let relocation_refs = collect_relocation_references(image, &string_ranges, &executable);
 
-    let ref_cap = if resource::lean_mode() {
-        MAX_GLOBAL_REFERENCES.min(64)
-    } else {
-        MAX_GLOBAL_REFERENCES.min(1024)
-    };
+    let ref_cap = global_reference_limit();
     let mut all_references = HashSet::<Reference>::with_capacity(ref_cap);
     for reference in &relocation_refs {
         all_references.insert(*reference);
@@ -1086,7 +1106,7 @@ where
                             &string_ranges,
                             &executable,
                         );
-                        if instructions.len() <= MAX_DATA_REF_SCAN_INSTS {
+                        if instructions.len() <= data_ref_scan_limit() {
                             combined_references.extend(extract_data_references(
                                 architecture,
                                 &instructions,
@@ -1316,7 +1336,7 @@ where
             .strings
             .iter()
             .filter_map(|s| s.address.map(|a| (a, s.value.as_str())))
-            .take(MAX_SHARED_STRING_MAP)
+            .take(shared_string_map_limit())
             .map(|(a, v)| (a, v.to_string()))
             .collect::<HashMap<_, _>>(),
     );
@@ -1403,7 +1423,7 @@ where
         };
         if profile == AnalysisProfile::Full {
             promote_data_reference_kinds(&mut combined_references, &string_ranges, &executable);
-            if instructions.len() <= MAX_DATA_REF_SCAN_INSTS {
+            if instructions.len() <= data_ref_scan_limit() {
                 combined_references.extend(extract_data_references(
                     architecture,
                     &instructions,
@@ -2086,19 +2106,23 @@ fn is_resolved_code_target(addr: u64) -> bool {
 }
 
 fn cfg_block_limit() -> usize {
-    if resource::lean_mode() {
-        8
-    } else {
-        MAX_CFG_BLOCKS
-    }
+    revx_core::analysis_caps()
+        .cfg_blocks
+        .unwrap_or(if resource::lean_mode() {
+            8
+        } else {
+            MAX_CFG_BLOCKS
+        })
 }
 
 fn cfg_inst_limit() -> usize {
-    if resource::lean_mode() {
-        32
-    } else {
-        MAX_CFG_INSTRUCTIONS
-    }
+    revx_core::analysis_caps()
+        .cfg_instructions
+        .unwrap_or(if resource::lean_mode() {
+            32
+        } else {
+            MAX_CFG_INSTRUCTIONS
+        })
 }
 
 fn default_max_function_bytes(architecture: Architecture, profile: AnalysisProfile) -> usize {
@@ -2945,11 +2969,13 @@ fn decode_arm64_cfg_with_references(
     executable: &[(u64, u64)],
 ) -> (Vec<Instruction>, Vec<Reference>) {
     let mut queue = VecDeque::from([start]);
-    let estimated_blocks =
-        ((max_end.saturating_sub(start) / 16) as usize).clamp(4, cfg_block_limit());
+    let estimated_blocks = ((max_end.saturating_sub(start) / 16) as usize)
+        .max(4)
+        .min(cfg_block_limit());
     let mut visited_blocks = HashSet::with_capacity(estimated_blocks);
-    let estimated_insts =
-        ((max_end.saturating_sub(start) / 4) as usize).clamp(16, cfg_inst_limit());
+    let estimated_insts = ((max_end.saturating_sub(start) / 4) as usize)
+        .max(16)
+        .min(cfg_inst_limit());
     let mut instruction_map: HashMap<u64, Instruction> = HashMap::with_capacity(estimated_insts);
     let mut all_refs = Vec::with_capacity(estimated_blocks);
     let mut saw_br = false;
@@ -3579,8 +3605,9 @@ fn decode_x64_cfg_with_references(
     executable: &[(u64, u64)],
 ) -> (Vec<Instruction>, Vec<Reference>) {
     let mut queue = VecDeque::from([start]);
-    let estimated_blocks =
-        ((max_end.saturating_sub(start) / 12) as usize).clamp(4, cfg_block_limit());
+    let estimated_blocks = ((max_end.saturating_sub(start) / 12) as usize)
+        .max(4)
+        .min(cfg_block_limit());
     let mut visited_blocks = HashSet::with_capacity(estimated_blocks);
     let mut instruction_map: BTreeMap<u64, Instruction> = BTreeMap::new();
     let mut all_refs = Vec::with_capacity(estimated_blocks);

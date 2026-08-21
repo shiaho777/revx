@@ -20,6 +20,11 @@ revx-arch-x64 = { path = "../revx-arch-x64", optional = true }
 revx-core = { path = "../revx-core" }
 
 [dev-dependencies]
+criterion.workspace = true
 object = { workspace = true, features = ["write"] }
 revx-loader = { path = "../revx-loader" }
 revx-testkit = { path = "../revx-testkit" }
+
+[[bench]]
+name = "analyze"
+harness = false
