@@ -64,11 +64,13 @@ pub fn resolve_function_budget(
     if micro {
         return 48;
     }
+    let by_rss = ((rss_kb as usize) / 8).max(8);
     let rss_mb = (rss_kb / 1024).max(1) as usize;
-    let per_mb = if lean { 6 } else { 24 };
+    let per_mb = if lean { 128 } else { 256 };
     let scaled = rss_mb.saturating_mul(per_mb);
     let base = if profile_fast { 256 } else { 1024 };
-    base.max(scaled)
+    let cap = base.max(scaled);
+    by_rss.min(cap)
 }
 
 pub fn env_function_budget() -> Option<&'static str> {
@@ -218,7 +220,7 @@ mod tests {
         );
         assert_eq!(
             resolve_function_budget(true, true, false, 8 * 1024, Some("zz")),
-            256
+            1024
         );
     }
 
@@ -226,11 +228,11 @@ mod tests {
     fn function_budget_scales_with_rss_and_keeps_small_defaults() {
         assert_eq!(
             resolve_function_budget(true, true, false, 8 * 1024, None),
-            256
+            1024
         );
         assert_eq!(
             resolve_function_budget(true, false, false, 8 * 1024, None),
-            256
+            1024
         );
         assert_eq!(
             resolve_function_budget(false, true, false, 8 * 1024, None),
@@ -238,15 +240,15 @@ mod tests {
         );
         assert_eq!(
             resolve_function_budget(true, true, false, 512 * 1024, None),
-            3072
+            65536
         );
         assert_eq!(
             resolve_function_budget(false, false, false, 512 * 1024, None),
-            12288
+            65536
         );
         assert_eq!(
             resolve_function_budget(true, false, false, 4 * 1024, None),
-            256
+            512
         );
     }
 

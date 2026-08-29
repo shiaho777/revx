@@ -148,3 +148,27 @@ fn tiny_budget_on_wide_binary_shows_low_coverage_and_warns() {
     );
     let _ = fs::remove_file(&path);
 }
+
+#[test]
+fn budget_resolver_tiers_are_monotonic() {
+    assert_eq!(
+        revx_core::resolve_function_budget(true, true, false, 8 * 1024, None),
+        1024
+    );
+    assert_eq!(
+        revx_core::resolve_function_budget(true, true, false, 16 * 1024, None),
+        2048
+    );
+    assert_eq!(
+        revx_core::resolve_function_budget(true, true, false, 32 * 1024, None),
+        4096
+    );
+    assert_eq!(
+        revx_core::resolve_function_budget(true, true, false, 64 * 1024, None),
+        8192
+    );
+    assert_eq!(
+        revx_core::resolve_function_budget(true, true, true, 512 * 1024, None),
+        48
+    );
+}
