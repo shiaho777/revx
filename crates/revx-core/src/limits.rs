@@ -47,6 +47,35 @@ pub const ENV_MAX_CFG_BLOCKS: &str = "REVX_MAX_CFG_BLOCKS";
 pub const ENV_MAX_CFG_INSTRUCTIONS: &str = "REVX_MAX_CFG_INSTRUCTIONS";
 pub const ENV_MAX_SHARED_STRING_MAP: &str = "REVX_MAX_SHARED_STRING_MAP";
 pub const ENV_MAX_DATA_REF_SCAN_INSTS: &str = "REVX_MAX_DATA_REF_SCAN_INSTS";
+pub const ENV_MAX_FUNCTION_BUDGET: &str = "REVX_MAX_FUNCTION_BUDGET";
+
+pub const FUNCTION_BUDGET_PER_MB: usize = 512;
+
+pub fn resolve_function_budget(
+    profile_fast: bool,
+    lean: bool,
+    micro: bool,
+    rss_kb: u64,
+    explicit: Option<&str>,
+) -> usize {
+    if let Some(v) = explicit.and_then(|v| v.parse::<usize>().ok()) {
+        return v.max(8);
+    }
+    if micro {
+        return 48;
+    }
+    let rss_mb = (rss_kb / 1024).max(1) as usize;
+    let per_mb = if lean { 6 } else { 24 };
+    let scaled = rss_mb.saturating_mul(per_mb);
+    let base = if profile_fast { 256 } else { 1024 };
+    base.max(scaled)
+}
+
+pub fn env_function_budget() -> Option<&'static str> {
+    static RAW: OnceLock<Option<String>> = OnceLock::new();
+    RAW.get_or_init(|| std::env::var(ENV_MAX_FUNCTION_BUDGET).ok())
+        .as_deref()
+}
 
 pub fn resolve_analysis_caps(
     global_references: Option<&str>,
@@ -103,9 +132,21 @@ pub fn lean_symbol_cap() -> usize {
     if micro_mode() {
         0
     } else if lean_mode() {
-        256
+        symbol_cap_for_rss(env_rss_kb())
     } else {
         usize::MAX
+    }
+}
+
+pub fn symbol_cap_for_rss(rss_kb: u64) -> usize {
+    const BASE: u64 = 8 * 1024;
+    const BASE_CAP: usize = 256;
+    const PER_MB: usize = 256;
+    if rss_kb <= BASE {
+        BASE_CAP
+    } else {
+        let extra_mb = ((rss_kb - BASE) / 1024) as usize;
+        BASE_CAP.saturating_add(extra_mb.saturating_mul(PER_MB))
     }
 }
 
@@ -113,7 +154,7 @@ pub fn lean_import_export_cap() -> usize {
     if micro_mode() {
         0
     } else if lean_mode() {
-        256
+        symbol_cap_for_rss(env_rss_kb())
     } else {
         usize::MAX
     }
@@ -162,6 +203,62 @@ mod tests {
         assert_eq!(
             resolve_analysis_caps(None, None, None, None, None),
             AnalysisCaps::default()
+        );
+    }
+
+    #[test]
+    fn function_budget_explicit_wins_and_clamps_to_min() {
+        assert_eq!(
+            resolve_function_budget(true, true, false, 8 * 1024, Some("4096")),
+            4096
+        );
+        assert_eq!(
+            resolve_function_budget(true, true, false, 8 * 1024, Some("2")),
+            8
+        );
+        assert_eq!(
+            resolve_function_budget(true, true, false, 8 * 1024, Some("zz")),
+            256
+        );
+    }
+
+    #[test]
+    fn function_budget_scales_with_rss_and_keeps_small_defaults() {
+        assert_eq!(
+            resolve_function_budget(true, true, false, 8 * 1024, None),
+            256
+        );
+        assert_eq!(
+            resolve_function_budget(true, false, false, 8 * 1024, None),
+            256
+        );
+        assert_eq!(
+            resolve_function_budget(false, true, false, 8 * 1024, None),
+            1024
+        );
+        assert_eq!(
+            resolve_function_budget(true, true, false, 512 * 1024, None),
+            3072
+        );
+        assert_eq!(
+            resolve_function_budget(false, false, false, 512 * 1024, None),
+            12288
+        );
+        assert_eq!(
+            resolve_function_budget(true, false, false, 4 * 1024, None),
+            256
+        );
+    }
+
+    #[test]
+    fn function_budget_micro_stays_fixed() {
+        assert_eq!(
+            resolve_function_budget(true, true, true, 8 * 1024, None),
+            48
+        );
+        assert_eq!(
+            resolve_function_budget(false, false, true, 512 * 1024, None),
+            48
         );
     }
 }

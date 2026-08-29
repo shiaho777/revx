@@ -6,7 +6,6 @@ const ABSOLUTE_MAX_JOBS: usize = 2;
 const DEFAULT_WALL_SEC: u64 = 180;
 const DEFAULT_CPU_SEC: u64 = 180;
 const DEFAULT_NICE: i32 = 5;
-const ABSOLUTE_MAX_RSS_BYTES: u64 = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy)]
 pub struct ProcessResourceLimits {
@@ -88,7 +87,7 @@ impl ProcessResourceLimits {
     }
 
     pub fn rss_limit_bytes(&self) -> u64 {
-        self.rss_kb.saturating_mul(1024).min(ABSOLUTE_MAX_RSS_BYTES)
+        self.rss_kb.saturating_mul(1024)
     }
 }
 
@@ -275,7 +274,7 @@ impl AnalysisBudget {
     pub fn from_process_limits() -> Self {
         let limits = ensure_process_resource_limits();
         let baseline = current_rss_bytes().unwrap_or(0);
-        let growth = limits.rss_limit_bytes().min(ABSOLUTE_MAX_RSS_BYTES);
+        let growth = limits.rss_limit_bytes();
         Self {
             started: Instant::now(),
             wall_limit: limits.wall_limit(),

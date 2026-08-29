@@ -221,6 +221,10 @@ impl Workspace {
                 },
                 typed_function_count: 0,
                 structured_pseudocode_count: 0,
+                lean_stub_pseudocode_count: 0,
+                total_executable_bytes: 0,
+                claimed_executable_bytes: 0,
+                coverage: 0.0,
                 warnings: Vec::new(),
             },
         };
@@ -6422,6 +6426,10 @@ fn initial_analysis_summary(image: &revx_core::BinaryImage) -> AnalysisSummary {
         },
         typed_function_count: 0,
         structured_pseudocode_count: 0,
+        lean_stub_pseudocode_count: 0,
+        total_executable_bytes: 0,
+        claimed_executable_bytes: 0,
+        coverage: 0.0,
         warnings: Vec::new(),
     }
 }
@@ -6439,6 +6447,10 @@ fn initial_analysis_summary_from_summary(binary: &revx_core::BinarySummary) -> A
         debug_import_coverage: revx_core::DebugCoverageSummary::default(),
         typed_function_count: 0,
         structured_pseudocode_count: 0,
+        lean_stub_pseudocode_count: 0,
+        total_executable_bytes: 0,
+        claimed_executable_bytes: 0,
+        coverage: 0.0,
         warnings: Vec::new(),
     }
 }
@@ -30637,6 +30649,10 @@ fn map_analysis_status_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Analysis
             debug_import_coverage: revx_core::DebugCoverageSummary::default(),
             typed_function_count: 0,
             structured_pseudocode_count: 0,
+            lean_stub_pseudocode_count: 0,
+            total_executable_bytes: 0,
+            claimed_executable_bytes: 0,
+            coverage: 0.0,
             warnings: Vec::new(),
         }),
     })
@@ -30660,6 +30676,10 @@ fn map_survey_preview_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SurveyPre
             debug_import_coverage: revx_core::DebugCoverageSummary::default(),
             typed_function_count: row.get::<_, i64>(8)? as usize,
             structured_pseudocode_count: row.get::<_, i64>(9)? as usize,
+            lean_stub_pseudocode_count: 0,
+            total_executable_bytes: 0,
+            claimed_executable_bytes: 0,
+            coverage: 0.0,
             warnings: Vec::new(),
         },
         artifact: ArtifactHandle {

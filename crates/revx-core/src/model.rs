@@ -586,6 +586,14 @@ pub struct AnalysisSummary {
     pub typed_function_count: usize,
     pub structured_pseudocode_count: usize,
     #[serde(default)]
+    pub lean_stub_pseudocode_count: usize,
+    #[serde(default)]
+    pub total_executable_bytes: u64,
+    #[serde(default)]
+    pub claimed_executable_bytes: u64,
+    #[serde(default)]
+    pub coverage: f64,
+    #[serde(default)]
     pub warnings: Vec<String>,
 }
 
