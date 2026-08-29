@@ -134,10 +134,11 @@ fn global_reference_limit() -> usize {
     revx_core::analysis_caps()
         .global_references
         .unwrap_or_else(|| {
-            if resource::lean_mode() {
-                MAX_GLOBAL_REFERENCES.min(64)
-            } else if resource::micro_mode() {
+            if resource::micro_mode() {
                 MAX_GLOBAL_REFERENCES.min(128)
+            } else if resource::lean_mode() {
+                let rss_mb = (resource::process_resource_limits().rss_kb / 1024).max(1) as usize;
+                MAX_GLOBAL_REFERENCES.min(64).max(rss_mb.saturating_mul(16))
             } else {
                 MAX_GLOBAL_REFERENCES.clamp(1024, 8192)
             }
@@ -1122,17 +1123,23 @@ where
             batch.push((address, name, max_end, range.1, is_heuristic_seed));
         }
         if batch.is_empty() {
-            if function_count < function_budget
-                && profile == AnalysisProfile::Full
-                && sweep_undiscovered_ranges(
-                    &executable,
-                    &mut claimed_ranges,
-                    &mut priority_queue,
-                    &mut visited,
-                    arm64_sweep,
-                    function_budget - function_count,
+            let want = function_budget - function_count;
+            let swept = sweep_undiscovered_ranges(
+                &executable,
+                &mut claimed_ranges,
+                &mut priority_queue,
+                &mut visited,
+                arm64_sweep,
+                want,
+            );
+            revx_trace(|| {
+                format!(
+                    "phase1 sweep-empty fc={fc}/{budget} want={want} swept={swept}",
+                    fc = function_count,
+                    budget = function_budget,
                 )
-            {
+            });
+            if function_count < function_budget && swept {
                 continue;
             }
             break;
@@ -2172,11 +2179,23 @@ fn is_resolved_code_target(addr: u64) -> bool {
     addr > 31
 }
 
+fn lean_cfg_block_limit() -> usize {
+    let rss_mb = (resource::process_resource_limits().rss_kb / 1024).max(1) as usize;
+    let scaled = rss_mb.saturating_mul(6).max(8);
+    scaled.min(MAX_CFG_BLOCKS)
+}
+
+fn lean_cfg_inst_limit() -> usize {
+    let rss_mb = (resource::process_resource_limits().rss_kb / 1024).max(1) as usize;
+    let scaled = rss_mb.saturating_mul(24).max(32);
+    scaled.min(MAX_CFG_INSTRUCTIONS)
+}
+
 fn cfg_block_limit() -> usize {
     revx_core::analysis_caps()
         .cfg_blocks
         .unwrap_or(if resource::lean_mode() {
-            8
+            lean_cfg_block_limit()
         } else {
             MAX_CFG_BLOCKS
         })
@@ -2186,7 +2205,7 @@ fn cfg_inst_limit() -> usize {
     revx_core::analysis_caps()
         .cfg_instructions
         .unwrap_or(if resource::lean_mode() {
-            32
+            lean_cfg_inst_limit()
         } else {
             MAX_CFG_INSTRUCTIONS
         })
@@ -2232,7 +2251,6 @@ fn summarize_analysis_warnings_from_counters(
 
 fn memory_function_cap(profile: AnalysisProfile) -> usize {
     let rss_kb = resource::process_resource_limits().rss_kb.max(64) as usize;
-    let by_rss = (rss_kb / 64).max(MIN_FUNCTION_BUDGET);
     let env_budget = revx_core::env_function_budget()
         .and_then(|v| v.parse::<usize>().ok())
         .map(|v| v.max(MIN_FUNCTION_BUDGET));
@@ -2240,11 +2258,12 @@ fn memory_function_cap(profile: AnalysisProfile) -> usize {
         return explicit;
     }
     if resource::micro_mode() {
-        return by_rss.min(48);
+        return 48;
     }
+    let by_rss = (rss_kb / 8).max(MIN_FUNCTION_BUDGET);
     let rss_mb = (rss_kb / 1024).max(1);
-    let lean_scaled = rss_mb.saturating_mul(6);
-    let full_scaled = rss_mb.saturating_mul(24);
+    let lean_scaled = rss_mb.saturating_mul(128);
+    let full_scaled = rss_mb.saturating_mul(256);
     let profile_cap = match profile {
         AnalysisProfile::Fast => {
             if resource::lean_mode() {
@@ -2296,7 +2315,7 @@ fn sweep_undiscovered_ranges(
     }
     let claimed = claimed_ranges.clone();
     let mut added = 0usize;
-    let stride = if arm64 { 4 } else { 1 };
+    let mut fresh = 0usize;
     for (range_start, range_end) in executable {
         let range_end = *range_end;
         let mut cursor = *range_start;
@@ -2321,16 +2340,16 @@ fn sweep_undiscovered_ranges(
             }
             let end = gap_end.min(cursor.saturating_add(SWEEP_RANGE_BYTES));
             if end > cursor {
-                claimed_ranges.insert(cursor, end);
                 let target = if arm64 && (cursor % 4 != 0) {
                     cursor + (4 - cursor % 4)
                 } else {
                     cursor
                 };
-                if target < end && visited.insert(target) {
+                if target < end && !visited.contains(&target) {
                     priority_queue.push_back((target, format_sub_addr(target)));
-                    added += 1;
+                    fresh += 1;
                 }
+                added += 1;
                 cursor = end;
             } else {
                 break;
@@ -2340,8 +2359,7 @@ fn sweep_undiscovered_ranges(
             break;
         }
     }
-    let _ = stride;
-    added > 0
+    fresh > 0
 }
 
 fn function_recovery_budget(image: &BinaryImage, profile: AnalysisProfile) -> usize {
@@ -10057,15 +10075,15 @@ fn is_string_address(string_ranges: &[StringRange], target: u64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        CodeRegion, MAX_FUNCTION_BUDGET_FAST, MAX_FUNCTION_BUDGET_FULL, MIN_FUNCTION_BUDGET,
-        StringRange, arm64_block_has_implicit_fallthrough, arm64_track_semantic_state,
-        attach_relocation_references, build_arm64_semantic_local_refs, build_arm64_semantic_state,
-        build_regions, collect_arm64_heuristic_seeds, decode_arm64_cfg_with_references,
-        decode_x64_cfg_with_references, extract_x64_data_references, find_executable_range,
-        function_recovery_budget, infer_arm64_argument_type, infer_arm64_return_statement,
-        infer_arm64_stack_arg_bytes, infer_arm64_stack_slot_type, infer_return_type,
-        is_string_address, memory_function_cap, next_hard_boundary, promote_data_reference_kinds,
-        reclassify_string_references, recover_arm64_locals, split_basic_blocks,
+        CodeRegion, MIN_FUNCTION_BUDGET, StringRange, arm64_block_has_implicit_fallthrough,
+        arm64_track_semantic_state, attach_relocation_references, build_arm64_semantic_local_refs,
+        build_arm64_semantic_state, build_regions, collect_arm64_heuristic_seeds,
+        decode_arm64_cfg_with_references, decode_x64_cfg_with_references,
+        extract_x64_data_references, find_executable_range, function_recovery_budget,
+        infer_arm64_argument_type, infer_arm64_return_statement, infer_arm64_stack_arg_bytes,
+        infer_arm64_stack_slot_type, infer_return_type, is_string_address, memory_function_cap,
+        next_hard_boundary, promote_data_reference_kinds, reclassify_string_references,
+        recover_arm64_locals, split_basic_blocks,
     };
     use revx_core::{
         AnalysisProfile, Architecture, BasicBlock, BinaryFormat, BinaryImage, DebugImportSummary,
@@ -10792,8 +10810,8 @@ mod tests {
         let full = function_recovery_budget(&image, AnalysisProfile::Full);
         assert!(fast >= MIN_FUNCTION_BUDGET);
         assert!(full >= MIN_FUNCTION_BUDGET);
-        assert!(fast <= MAX_FUNCTION_BUDGET_FAST);
-        assert!(full <= MAX_FUNCTION_BUDGET_FULL);
+        assert_eq!(fast, full);
+        assert_eq!(fast, memory_function_cap(AnalysisProfile::Fast));
         assert!(full >= fast);
     }
 
@@ -11072,8 +11090,6 @@ mod tests {
             full,
             size_budget.min(memory_function_cap(AnalysisProfile::Full))
         );
-        assert!(fast <= MAX_FUNCTION_BUDGET_FAST);
-        assert!(full <= MAX_FUNCTION_BUDGET_FULL);
         assert!(full >= fast);
     }
 
