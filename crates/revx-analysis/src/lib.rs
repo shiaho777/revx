@@ -136,8 +136,10 @@ fn global_reference_limit() -> usize {
         .unwrap_or_else(|| {
             if resource::lean_mode() {
                 MAX_GLOBAL_REFERENCES.min(64)
+            } else if resource::micro_mode() {
+                MAX_GLOBAL_REFERENCES.min(128)
             } else {
-                MAX_GLOBAL_REFERENCES.min(1024)
+                MAX_GLOBAL_REFERENCES.clamp(1024, 8192)
             }
         })
 }
@@ -230,6 +232,7 @@ pub struct StreamedAnalysis {
 }
 
 const MAX_CODE_WINDOW: usize = 0x1000;
+const HEURISTIC_SCAN_WINDOW: usize = 0x1000;
 
 enum ByteSource {
     #[allow(dead_code)]
@@ -610,9 +613,17 @@ pub fn resolve_decompile_strategy(
 }
 
 pub fn analyze(image: BinaryImage, profile: AnalysisProfile) -> AnalysisBundle {
+    analyze_with_budget(image, profile, None)
+}
+
+pub fn analyze_with_budget(
+    image: BinaryImage,
+    profile: AnalysisProfile,
+    budget_override: Option<usize>,
+) -> AnalysisBundle {
     let imports = image.imports.clone();
     let mut functions = Vec::new();
-    let streamed = analyze_streaming(image, profile, |function| {
+    let streamed = analyze_streaming_with_budget(image, profile, budget_override, |function| {
         functions.push(function);
         Ok::<(), std::convert::Infallible>(())
     })
@@ -701,23 +712,40 @@ pub fn survey(image: BinaryImage, profile: AnalysisProfile) -> Survey {
 }
 
 pub fn analyze_streaming<F, E>(
+    image: BinaryImage,
+    profile: AnalysisProfile,
+    on_function: F,
+) -> std::result::Result<StreamedAnalysis, E>
+where
+    F: FnMut(Function) -> std::result::Result<(), E>,
+{
+    analyze_streaming_with_budget(image, profile, None, on_function)
+}
+
+pub fn analyze_streaming_with_budget<F, E>(
     mut image: BinaryImage,
     profile: AnalysisProfile,
+    budget_override: Option<usize>,
     mut on_function: F,
 ) -> std::result::Result<StreamedAnalysis, E>
 where
     F: FnMut(Function) -> std::result::Result<(), E>,
 {
-    let function_budget = function_recovery_budget(&image, profile);
+    let function_budget = budget_override
+        .unwrap_or_else(|| function_recovery_budget(&image, profile))
+        .max(MIN_FUNCTION_BUDGET);
     let mut function_count = 0usize;
     let mut typed_function_count = 0usize;
     let mut structured_pseudocode_count = 0usize;
+    let mut lean_stub_pseudocode_count = 0usize;
     let mut function_evidence_count = 0usize;
     let mut observed_truncated_functions = 0usize;
+    let mut claimed_executable_bytes = 0u64;
 
     let (references, mut types, truncated_functions) =
         walk_functions(&image, profile, function_budget, |function| {
             function_count += 1;
+            claimed_executable_bytes += function.size;
             if function
                 .arguments
                 .iter()
@@ -732,7 +760,20 @@ where
                 .map(|unit| !unit.regions.is_empty() || !unit.text.is_empty())
                 .unwrap_or(false)
             {
-                structured_pseudocode_count += 1;
+                if function.blocks.is_empty()
+                    && function
+                        .pseudocode
+                        .as_ref()
+                        .is_some_and(|unit| unit.regions.is_empty())
+                    && function
+                        .pseudocode
+                        .as_ref()
+                        .is_some_and(|unit| unit.text.contains("/* lean size="))
+                {
+                    lean_stub_pseudocode_count += 1;
+                } else {
+                    structured_pseudocode_count += 1;
+                }
             }
             function_evidence_count += 1
                 + usize::from(function.stack_summary.is_some())
@@ -744,6 +785,14 @@ where
             on_function(function)
         })?;
     let _ = observed_truncated_functions;
+    let total_executable_bytes = total_executable_size(&image);
+    let coverage = if total_executable_bytes > 0 {
+        (claimed_executable_bytes.min(total_executable_bytes) as f64
+            / total_executable_bytes as f64)
+            .clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
 
     types.extend(image.debug_import.type_defs.clone());
     dedupe_types(&mut types);
@@ -772,6 +821,10 @@ where
             },
             typed_function_count,
             structured_pseudocode_count,
+            lean_stub_pseudocode_count,
+            total_executable_bytes,
+            claimed_executable_bytes,
+            coverage,
             warnings: summarize_analysis_warnings_from_counters(
                 function_count,
                 truncated_functions,
@@ -1006,6 +1059,7 @@ where
         default_max_function_bytes(image.architecture, profile) as u64
     };
     let architecture = image.architecture;
+    let arm64_sweep = architecture == Architecture::Arm64;
     let phase1_started = std::time::Instant::now();
     let mut phase1_batches = 0usize;
     let mut budget = resource::AnalysisBudget::from_process_limits();
@@ -1068,6 +1122,19 @@ where
             batch.push((address, name, max_end, range.1, is_heuristic_seed));
         }
         if batch.is_empty() {
+            if function_count < function_budget
+                && profile == AnalysisProfile::Full
+                && sweep_undiscovered_ranges(
+                    &executable,
+                    &mut claimed_ranges,
+                    &mut priority_queue,
+                    &mut visited,
+                    arm64_sweep,
+                    function_budget - function_count,
+                )
+            {
+                continue;
+            }
             break;
         }
 
@@ -1207,7 +1274,7 @@ where
                 || (if resource::lean_mode() {
                     function_count < (function_budget / 4).max(16)
                 } else {
-                    pending_functions.len() < (function_budget / 4).max(32)
+                    phase1_batches < (function_budget / 4).max(32)
                 });
             if expand_calls {
                 for reference in combined_references
@@ -2166,26 +2233,124 @@ fn summarize_analysis_warnings_from_counters(
 fn memory_function_cap(profile: AnalysisProfile) -> usize {
     let rss_kb = resource::process_resource_limits().rss_kb.max(64) as usize;
     let by_rss = (rss_kb / 64).max(MIN_FUNCTION_BUDGET);
+    let env_budget = revx_core::env_function_budget()
+        .and_then(|v| v.parse::<usize>().ok())
+        .map(|v| v.max(MIN_FUNCTION_BUDGET));
+    if let Some(explicit) = env_budget {
+        return explicit;
+    }
+    if resource::micro_mode() {
+        return by_rss.min(48);
+    }
+    let rss_mb = (rss_kb / 1024).max(1);
+    let lean_scaled = rss_mb.saturating_mul(6);
+    let full_scaled = rss_mb.saturating_mul(24);
     let profile_cap = match profile {
         AnalysisProfile::Fast => {
             if resource::lean_mode() {
-                MAX_FUNCTION_BUDGET_FAST.min(48)
+                MAX_FUNCTION_BUDGET_FAST.max(lean_scaled)
             } else {
-                MAX_FUNCTION_BUDGET_FAST
+                MAX_FUNCTION_BUDGET_FAST.max(full_scaled)
             }
         }
         AnalysisProfile::Full => {
             if resource::lean_mode() {
-                MAX_FUNCTION_BUDGET_FULL.min(96)
+                MAX_FUNCTION_BUDGET_FULL.max(lean_scaled)
             } else {
-                MAX_FUNCTION_BUDGET_FULL
+                MAX_FUNCTION_BUDGET_FULL.max(full_scaled)
             }
         }
     };
     by_rss.min(profile_cap)
 }
 
+fn total_executable_size(image: &BinaryImage) -> u64 {
+    image
+        .sections
+        .iter()
+        .filter(|section| section.kind.contains("Text"))
+        .map(|section| section.size)
+        .sum::<u64>()
+        .max(
+            image
+                .segments
+                .iter()
+                .map(|segment| segment.size)
+                .max()
+                .unwrap_or(0),
+        )
+}
+
+const SWEEP_RANGE_BYTES: u64 = 0x1000;
+
+fn sweep_undiscovered_ranges(
+    executable: &[(u64, u64)],
+    claimed_ranges: &mut BTreeMap<u64, u64>,
+    priority_queue: &mut VecDeque<(u64, String)>,
+    visited: &mut HashSet<u64>,
+    arm64: bool,
+    want: usize,
+) -> bool {
+    if want == 0 {
+        return false;
+    }
+    let claimed = claimed_ranges.clone();
+    let mut added = 0usize;
+    let stride = if arm64 { 4 } else { 1 };
+    for (range_start, range_end) in executable {
+        let range_end = *range_end;
+        let mut cursor = *range_start;
+        while cursor < range_end && added < want {
+            let next = claimed
+                .range(..=cursor)
+                .next_back()
+                .filter(|(_, end)| cursor < **end)
+                .map(|(_, &end)| end)
+                .unwrap_or(cursor);
+            if next > cursor {
+                cursor = next;
+                continue;
+            }
+            let gap_end = claimed
+                .range(cursor..)
+                .next()
+                .map(|(&start, _)| start)
+                .unwrap_or(range_end);
+            if gap_end <= cursor {
+                break;
+            }
+            let end = gap_end.min(cursor.saturating_add(SWEEP_RANGE_BYTES));
+            if end > cursor {
+                claimed_ranges.insert(cursor, end);
+                let target = if arm64 && (cursor % 4 != 0) {
+                    cursor + (4 - cursor % 4)
+                } else {
+                    cursor
+                };
+                if target < end && visited.insert(target) {
+                    priority_queue.push_back((target, format_sub_addr(target)));
+                    added += 1;
+                }
+                cursor = end;
+            } else {
+                break;
+            }
+        }
+        if added >= want {
+            break;
+        }
+    }
+    let _ = stride;
+    added > 0
+}
+
 fn function_recovery_budget(image: &BinaryImage, profile: AnalysisProfile) -> usize {
+    if let Some(explicit) = revx_core::env_function_budget()
+        .and_then(|v| v.parse::<usize>().ok())
+        .map(|v| v.max(MIN_FUNCTION_BUDGET))
+    {
+        return explicit;
+    }
     let executable_bytes = image
         .sections
         .iter()
@@ -2217,30 +2382,52 @@ fn collect_arm64_heuristic_seeds(code_regions: &[CodeRegion]) -> Vec<u64> {
     let mut seen = BTreeSet::new();
 
     for region in code_regions {
-        let data = region.data_prefix(4096);
-        let mut offset = 0usize;
-        while offset + 4 <= data.len() {
-            let word = u32::from_le_bytes([
-                data[offset],
-                data[offset + 1],
-                data[offset + 2],
-                data[offset + 3],
-            ]);
-            if is_arm64_prologue_word(word) && !is_arm64_thunk_boundary(region, offset) {
-                let Some(seed_offset) = arm64_seed_offset(region, offset) else {
-                    offset += 4;
-                    continue;
-                };
-                let address = region.start + seed_offset as u64;
-                if seen.insert(address) {
-                    out.push(address);
-                }
+        let mut window_start = region.start;
+        while window_start < region.end {
+            let window_end = window_start.saturating_add(HEURISTIC_SCAN_WINDOW as u64);
+            let data = region
+                .read_range(window_start, window_end)
+                .unwrap_or_default();
+            if data.is_empty() {
+                break;
             }
-            offset += 4;
+            collect_arm64_seeds_in_data(region, &data, &mut seen, &mut out);
+            if window_end >= region.end {
+                break;
+            }
+            window_start = window_end.saturating_sub(8);
         }
     }
 
     out
+}
+
+fn collect_arm64_seeds_in_data(
+    region: &CodeRegion,
+    data: &[u8],
+    seen: &mut BTreeSet<u64>,
+    out: &mut Vec<u64>,
+) {
+    let mut offset = 0usize;
+    while offset + 4 <= data.len() {
+        let word = u32::from_le_bytes([
+            data[offset],
+            data[offset + 1],
+            data[offset + 2],
+            data[offset + 3],
+        ]);
+        if is_arm64_prologue_word(word) && !is_arm64_thunk_boundary(region, offset) {
+            let Some(seed_offset) = arm64_seed_offset(region, offset) else {
+                offset += 4;
+                continue;
+            };
+            let address = region.start + seed_offset as u64;
+            if seen.insert(address) {
+                out.push(address);
+            }
+        }
+        offset += 4;
+    }
 }
 
 fn collect_arm64_nearby_seeds(
@@ -2261,7 +2448,7 @@ fn collect_arm64_nearby_seeds(
         }
         let start = scan_start.max(region.start);
         let end = scan_end.min(region.end);
-        let Some(data) = region.read_range(start, end.min(start.saturating_add(4096))) else {
+        let Some(data) = region.read_range(start, end) else {
             continue;
         };
         let mut offset = 0usize;
@@ -2296,7 +2483,7 @@ fn collect_arm64_nearby_seeds(
 }
 
 fn arm64_seed_offset(region: &CodeRegion, offset: usize) -> Option<usize> {
-    let data = region.data_prefix(4096);
+    let data = region.data_prefix(HEURISTIC_SCAN_WINDOW);
     if offset >= 4 {
         let prev_offset = offset - 4;
         let prev_text = decode_arm64_instruction_text(
@@ -2318,7 +2505,7 @@ fn arm64_seed_offset(region: &CodeRegion, offset: usize) -> Option<usize> {
 }
 
 fn is_arm64_thunk_boundary(region: &CodeRegion, offset: usize) -> bool {
-    let data = region.data_prefix(4096);
+    let data = region.data_prefix(HEURISTIC_SCAN_WINDOW);
     let Some(current) =
         decode_arm64_instruction_text(&data[offset..offset + 4], region.start + offset as u64)
     else {
@@ -2345,7 +2532,7 @@ fn is_arm64_thunk_boundary(region: &CodeRegion, offset: usize) -> bool {
 }
 
 fn is_likely_arm64_function_boundary(region: &CodeRegion, offset: usize) -> bool {
-    let data = region.data_prefix(4096);
+    let data = region.data_prefix(HEURISTIC_SCAN_WINDOW);
     if offset == 0 {
         return true;
     }
@@ -9481,6 +9668,8 @@ fn inferred_type_size(name: &str) -> Option<u64> {
 fn dedupe_types(types: &mut Vec<TypeDef>) {
     let mut seen = BTreeSet::new();
     types.retain(|item| seen.insert((item.name.clone(), item.kind.clone(), item.source)));
+    let mut seen_ids = BTreeSet::new();
+    types.retain(|item| seen_ids.insert(item.id.clone()));
 }
 
 fn extract_arm64_data_references(
