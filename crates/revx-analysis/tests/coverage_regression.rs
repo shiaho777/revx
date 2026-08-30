@@ -3,6 +3,9 @@ use revx_core::{AnalysisProfile, Architecture, BinaryFormat};
 use revx_loader::load_binary;
 use revx_testkit::{Case, elf64, write_temp};
 use std::fs;
+use std::sync::Mutex;
+
+static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 fn disable_lean_mode_for_seed_discovery() {
     static ON: std::sync::Once = std::sync::Once::new();
@@ -10,6 +13,12 @@ fn disable_lean_mode_for_seed_discovery() {
         // SAFETY: test bootstrap runs before analysis threads spawn.
         unsafe { std::env::set_var("REVX_FULL_MEM", "1") };
     });
+}
+
+fn with_env_lock<T>(f: impl FnOnce() -> T) -> T {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    disable_lean_mode_for_seed_discovery();
+    f()
 }
 
 fn arm64_prologue_block(ret: bool) -> Vec<u8> {
@@ -40,113 +49,117 @@ fn synthetic_wide_arm64_case(id: &'static str, functions: usize) -> Case {
 
 #[test]
 fn lean_stub_pseudocode_is_reported_separately() {
-    disable_lean_mode_for_seed_discovery();
-    let case = synthetic_wide_arm64_case("coverage_lean_stub", 16);
-    let path = write_temp(&case);
-    let image = load_binary(&path).expect("load");
-    let bundle = analyze(image, AnalysisProfile::Fast);
-    let summary = &bundle.survey.summary;
-    assert!(
-        summary.function_count > 0,
-        "expected functions, got {}",
-        summary.function_count
-    );
-    assert_eq!(
-        summary.lean_stub_pseudocode_count, 0,
-        "non-lean path must not report lean stubs"
-    );
-    assert!(
-        summary.total_executable_bytes > 0,
-        "total_executable_bytes must be populated"
-    );
-    assert!(
-        summary.claimed_executable_bytes > 0,
-        "claimed_executable_bytes must be populated"
-    );
-    assert!(
-        summary.coverage > 0.0 && summary.coverage <= 1.0,
-        "coverage must be in (0, 1], got {}",
-        summary.coverage
-    );
-    let _ = fs::remove_file(&path);
+    with_env_lock(|| {
+        let case = synthetic_wide_arm64_case("coverage_lean_stub", 16);
+        let path = write_temp(&case);
+        let image = load_binary(&path).expect("load");
+        let bundle = analyze(image, AnalysisProfile::Fast);
+        let summary = &bundle.survey.summary;
+        assert!(
+            summary.function_count > 0,
+            "expected functions, got {}",
+            summary.function_count
+        );
+        assert_eq!(
+            summary.lean_stub_pseudocode_count, 0,
+            "non-lean path must not report lean stubs"
+        );
+        assert!(
+            summary.total_executable_bytes > 0,
+            "total_executable_bytes must be populated"
+        );
+        assert!(
+            summary.claimed_executable_bytes > 0,
+            "claimed_executable_bytes must be populated"
+        );
+        assert!(
+            summary.coverage > 0.0 && summary.coverage <= 1.0,
+            "coverage must be in (0, 1], got {}",
+            summary.coverage
+        );
+        let _ = fs::remove_file(&path);
+    })
 }
 
 #[test]
 fn full_profile_recovers_at_least_as_many_bytes_as_fast() {
-    disable_lean_mode_for_seed_discovery();
-    let case = synthetic_wide_arm64_case("coverage_monotonic", 64);
-    let path = write_temp(&case);
-    let fast = analyze(
-        load_binary(&path).expect("load fast"),
-        AnalysisProfile::Fast,
-    );
-    let full = analyze(
-        load_binary(&path).expect("load full"),
-        AnalysisProfile::Full,
-    );
-    let fast_claimed = fast.survey.summary.claimed_executable_bytes;
-    let full_claimed = full.survey.summary.claimed_executable_bytes;
-    let fast_cov = fast.survey.summary.coverage;
-    let full_cov = full.survey.summary.coverage;
-    assert!(
-        full_claimed >= fast_claimed,
-        "full profile should recover at least as many bytes: fast={fast_claimed} full={full_claimed}"
-    );
-    assert!(
-        full_cov >= fast_cov,
-        "coverage must not decrease from fast to full: fast={fast_cov} full={full_cov}"
-    );
-    let _ = fs::remove_file(&path);
+    with_env_lock(|| {
+        let case = synthetic_wide_arm64_case("coverage_monotonic", 64);
+        let path = write_temp(&case);
+        let fast = analyze(
+            load_binary(&path).expect("load fast"),
+            AnalysisProfile::Fast,
+        );
+        let full = analyze(
+            load_binary(&path).expect("load full"),
+            AnalysisProfile::Full,
+        );
+        let fast_claimed = fast.survey.summary.claimed_executable_bytes;
+        let full_claimed = full.survey.summary.claimed_executable_bytes;
+        let fast_cov = fast.survey.summary.coverage;
+        let full_cov = full.survey.summary.coverage;
+        assert!(
+            full_claimed >= fast_claimed,
+            "full profile should recover at least as many bytes: fast={fast_claimed} full={full_claimed}"
+        );
+        assert!(
+            full_cov >= fast_cov,
+            "coverage must not decrease from fast to full: fast={fast_cov} full={full_cov}"
+        );
+        let _ = fs::remove_file(&path);
+    })
 }
 
 #[test]
 fn explicit_function_budget_caps_recovery() {
-    disable_lean_mode_for_seed_discovery();
-    let case = synthetic_wide_arm64_case("coverage_budget_cap", 48);
-    let path = write_temp(&case);
-    let bundle = analyze_with_budget(
-        load_binary(&path).expect("load"),
-        AnalysisProfile::Fast,
-        Some(12),
-    );
-    let summary = bundle.survey.summary;
-    assert_eq!(
-        summary.function_count, 12,
-        "explicit budget must cap recovery, got {}",
-        summary.function_count
-    );
-    let _ = fs::remove_file(&path);
+    with_env_lock(|| {
+        let case = synthetic_wide_arm64_case("coverage_budget_cap", 48);
+        let path = write_temp(&case);
+        let bundle = analyze_with_budget(
+            load_binary(&path).expect("load"),
+            AnalysisProfile::Fast,
+            Some(12),
+        );
+        let summary = bundle.survey.summary;
+        assert_eq!(
+            summary.function_count, 12,
+            "explicit budget must cap recovery, got {}",
+            summary.function_count
+        );
+        let _ = fs::remove_file(&path);
+    })
 }
 
 #[test]
 fn tiny_budget_on_wide_binary_shows_low_coverage_and_warns() {
-    disable_lean_mode_for_seed_discovery();
-    let case = synthetic_wide_arm64_case("coverage_truncated", 200);
-    let path = write_temp(&case);
-    let bundle = analyze_with_budget(
-        load_binary(&path).expect("load"),
-        AnalysisProfile::Fast,
-        Some(4),
-    );
-    let summary = bundle.survey.summary;
-    assert_eq!(
-        summary.function_count, 8,
-        "MIN_FUNCTION_BUDGET floors tiny explicit budgets"
-    );
-    assert!(
-        summary.coverage < 0.5,
-        "tiny budget on 200-function binary must show low coverage, got {}",
-        summary.coverage
-    );
-    assert!(
-        summary
-            .warnings
-            .iter()
-            .any(|w| w.contains("limit") || w.contains("truncated")),
-        "expected truncation warning, got {:?}",
-        summary.warnings
-    );
-    let _ = fs::remove_file(&path);
+    with_env_lock(|| {
+        let case = synthetic_wide_arm64_case("coverage_truncated", 200);
+        let path = write_temp(&case);
+        let bundle = analyze_with_budget(
+            load_binary(&path).expect("load"),
+            AnalysisProfile::Fast,
+            Some(4),
+        );
+        let summary = bundle.survey.summary;
+        assert_eq!(
+            summary.function_count, 8,
+            "MIN_FUNCTION_BUDGET floors tiny explicit budgets"
+        );
+        assert!(
+            summary.coverage < 0.5,
+            "tiny budget on 200-function binary must show low coverage, got {}",
+            summary.coverage
+        );
+        assert!(
+            summary
+                .warnings
+                .iter()
+                .any(|w| w.contains("limit") || w.contains("truncated")),
+            "expected truncation warning, got {:?}",
+            summary.warnings
+        );
+        let _ = fs::remove_file(&path);
+    })
 }
 
 #[test]
@@ -175,21 +188,23 @@ fn budget_resolver_tiers_are_monotonic() {
 
 #[test]
 fn depth_quota_produces_deep_functions_in_default_profile() {
-    let case = synthetic_wide_arm64_case("depth_quota", 96);
-    let path = write_temp(&case);
-    let image = load_binary(&path).expect("load");
-    let bundle = analyze(image, AnalysisProfile::Fast);
-    let summary = &bundle.survey.summary;
-    assert!(
-        summary.deep_function_count > 0,
-        "default profile should fill depth quota, got {}",
-        summary.deep_function_count
-    );
-    assert!(
-        summary.structured_pseudocode_count >= summary.deep_function_count,
-        "structured pseudo must cover deep functions: struct={} deep={}",
-        summary.structured_pseudocode_count,
-        summary.deep_function_count
-    );
-    let _ = fs::remove_file(&path);
+    with_env_lock(|| {
+        let case = synthetic_wide_arm64_case("depth_quota", 96);
+        let path = write_temp(&case);
+        let image = load_binary(&path).expect("load");
+        let bundle = analyze(image, AnalysisProfile::Fast);
+        let summary = &bundle.survey.summary;
+        assert!(
+            summary.deep_function_count > 0,
+            "default profile should fill depth quota, got {}",
+            summary.deep_function_count
+        );
+        assert!(
+            summary.structured_pseudocode_count >= summary.deep_function_count,
+            "structured pseudo must cover deep functions: struct={} deep={}",
+            summary.structured_pseudocode_count,
+            summary.deep_function_count
+        );
+        let _ = fs::remove_file(&path);
+    })
 }
