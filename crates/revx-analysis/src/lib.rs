@@ -38,8 +38,8 @@ const MAX_FUNCTION_BUDGET_FAST: usize = 256;
 const MAX_FUNCTION_BUDGET_FULL: usize = 1024;
 const DEFAULT_MAX_FUNCTION_BYTES_X64: usize = 0x800;
 const DEFAULT_MAX_FUNCTION_BYTES_ARM64: usize = 0x800;
-const FULL_MAX_FUNCTION_BYTES_X64: usize = 0x2000;
-const FULL_MAX_FUNCTION_BYTES_ARM64: usize = 0x2000;
+const FULL_MAX_FUNCTION_BYTES_X64: usize = 0x8000;
+const FULL_MAX_FUNCTION_BYTES_ARM64: usize = 0x8000;
 const ARM64_NEARBY_SEED_WINDOW: u64 = 0x80;
 const ARM64_STACK_SPAN_GAP: i64 = 0x10;
 const ARM64_LARGE_WORKSPACE_MIN_OFFSETS: usize = 96;
@@ -234,7 +234,15 @@ pub struct StreamedAnalysis {
 
 const MAX_CODE_WINDOW: usize = 0x1000;
 
-type DecodedFunction = (u64, String, u64, bool, Vec<Instruction>, Vec<Reference>);
+type DecodedFunction = (
+    u64,
+    String,
+    u64,
+    bool,
+    Vec<Instruction>,
+    Vec<Reference>,
+    u64,
+);
 const HEURISTIC_SCAN_WINDOW: usize = 0x1000;
 
 enum ByteSource {
@@ -745,9 +753,10 @@ where
     let mut function_evidence_count = 0usize;
     let mut observed_truncated_functions = 0usize;
     let mut claimed_executable_bytes = 0u64;
+    let type_scope = image.id.chars().take(16).collect::<String>();
 
-    let (references, mut types, truncated_functions) =
-        walk_functions(&image, profile, function_budget, |function| {
+    let (references, mut types, truncated_functions, probed_executable_bytes) =
+        walk_functions(&image, profile, function_budget, &type_scope, |function| {
             function_count += 1;
             claimed_executable_bytes += function.size;
             if function
@@ -797,7 +806,9 @@ where
     let _ = observed_truncated_functions;
     let total_executable_bytes = total_executable_size(&image);
     let coverage = if total_executable_bytes > 0 {
-        (claimed_executable_bytes.min(total_executable_bytes) as f64
+        (claimed_executable_bytes
+            .saturating_add(probed_executable_bytes)
+            .min(total_executable_bytes) as f64
             / total_executable_bytes as f64)
             .clamp(0.0, 1.0)
     } else {
@@ -835,6 +846,7 @@ where
             deep_function_count,
             total_executable_bytes,
             claimed_executable_bytes,
+            probed_executable_bytes,
             coverage,
             warnings: summarize_analysis_warnings_from_counters(
                 function_count,
@@ -859,8 +871,9 @@ fn walk_functions<F, E>(
     image: &BinaryImage,
     profile: AnalysisProfile,
     function_budget: usize,
-    mut on_function: F,
-) -> std::result::Result<(Vec<Reference>, Vec<TypeDef>, usize), E>
+    type_scope: &str,
+    on_function: F,
+) -> std::result::Result<(Vec<Reference>, Vec<TypeDef>, usize, u64), E>
 where
     F: FnMut(Function) -> std::result::Result<(), E>,
 {
@@ -874,9 +887,14 @@ where
     } else {
         Vec::new()
     };
-    walk_functions_inner(image, profile, function_budget, &import_types, |function| {
-        on_function(function)
-    })
+    walk_functions_inner(
+        image,
+        profile,
+        function_budget,
+        &import_types,
+        type_scope,
+        on_function,
+    )
 }
 
 fn lean_keep_pseudocode(name: &str, index: usize) -> bool {
@@ -952,8 +970,9 @@ fn walk_functions_inner<F, E>(
     profile: AnalysisProfile,
     function_budget: usize,
     import_types: &[String],
+    type_scope: &str,
     mut on_function: F,
-) -> std::result::Result<(Vec<Reference>, Vec<TypeDef>, usize), E>
+) -> std::result::Result<(Vec<Reference>, Vec<TypeDef>, usize, u64), E>
 where
     F: FnMut(Function) -> std::result::Result<(), E>,
 {
@@ -1010,7 +1029,7 @@ where
     hard_seed_addrs.retain(|address| !import_stub_addrs.contains(address));
 
     if seeds.is_empty() {
-        return Ok((Vec::new(), Vec::new(), 0));
+        return Ok((Vec::new(), Vec::new(), 0, 0));
     }
 
     let executable = executable_ranges(image);
@@ -1079,6 +1098,7 @@ where
     #[allow(clippy::redundant_locals)]
     #[allow(clippy::type_complexity)]
     let mut pending_functions: Vec<PendingFunction> = Vec::with_capacity(function_budget.min(1024));
+    let mut probed_total = 0u64;
 
     // ── Phase 1: Batched parallel discovery ────────────────────────────────
     // Decode is expensive and independent per candidate. Claim/seed expansion
@@ -1124,7 +1144,8 @@ where
             });
             break;
         }
-        let mut batch: Vec<(u64, String, u64, u64, bool)> = Vec::with_capacity(phase1_batch_size);
+        let mut batch: Vec<(u64, String, u64, u64, bool, u64)> =
+            Vec::with_capacity(phase1_batch_size);
         while batch.len() < phase1_batch_size && function_count + batch.len() < function_budget {
             let Some((address, name)) = priority_queue
                 .pop_front()
@@ -1154,7 +1175,7 @@ where
             {
                 continue;
             }
-            batch.push((address, name, max_end, range.1, is_heuristic_seed));
+            batch.push((address, name, max_end, range.1, is_heuristic_seed, max_end));
         }
         if batch.is_empty() {
             let want = function_budget - function_count;
@@ -1184,7 +1205,7 @@ where
         let batch_len = batch.len();
         let decoded: Vec<DecodedFunction> = map_in_analysis_pool(
             batch,
-            |(address, name, max_end, range_end, is_heuristic_seed)| {
+            |(address, name, max_end, range_end, is_heuristic_seed, probe_end)| {
                 let (instructions, code_refs) = decode_function_with_references(
                     architecture,
                     &code_regions,
@@ -1200,6 +1221,7 @@ where
                         is_heuristic_seed,
                         Vec::new(),
                         Vec::new(),
+                        probe_end,
                     );
                 }
                 let mut combined_references = if profile == AnalysisProfile::Full {
@@ -1240,6 +1262,7 @@ where
                     is_heuristic_seed,
                     instructions,
                     combined_references,
+                    probe_end,
                 )
             },
         );
@@ -1253,13 +1276,21 @@ where
             )
         });
 
-        for (address, name, range_end, is_heuristic_seed, instructions, combined_references) in
-            decoded
+        for (
+            address,
+            name,
+            range_end,
+            is_heuristic_seed,
+            instructions,
+            combined_references,
+            probe_end,
+        ) in decoded
         {
             if function_count >= function_budget {
                 break;
             }
             if instructions.is_empty() {
+                probed_total += probe_end.saturating_sub(address);
                 continue;
             }
             let size = instructions
@@ -2096,7 +2127,7 @@ where
                     && seen_type_names.insert(ty.clone())
                 {
                     recovered_types.push(TypeDef {
-                        id: format!("ty:inferred:{}", ty),
+                        id: format!("ty:inferred:{}:{}", type_scope, ty),
                         name: ty.clone(),
                         kind: "inferred".to_string(),
                         source: TypeSource::Inferred,
@@ -2148,7 +2179,12 @@ where
             budget_truncated
         )
     });
-    Ok((reference_list, recovered_types, truncated_functions))
+    Ok((
+        reference_list,
+        recovered_types,
+        truncated_functions,
+        probed_total,
+    ))
 }
 
 fn executable_ranges(image: &BinaryImage) -> Vec<(u64, u64)> {
