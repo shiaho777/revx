@@ -872,7 +872,7 @@ fn walk_functions<F, E>(
     profile: AnalysisProfile,
     function_budget: usize,
     type_scope: &str,
-    mut on_function: F,
+    on_function: F,
 ) -> std::result::Result<(Vec<Reference>, Vec<TypeDef>, usize, u64), E>
 where
     F: FnMut(Function) -> std::result::Result<(), E>,
@@ -893,7 +893,7 @@ where
         function_budget,
         &import_types,
         type_scope,
-        |function| on_function(function),
+        on_function,
     )
 }
 
