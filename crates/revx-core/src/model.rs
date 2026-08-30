@@ -588,6 +588,8 @@ pub struct AnalysisSummary {
     #[serde(default)]
     pub lean_stub_pseudocode_count: usize,
     #[serde(default)]
+    pub deep_function_count: usize,
+    #[serde(default)]
     pub total_executable_bytes: u64,
     #[serde(default)]
     pub claimed_executable_bytes: u64,
