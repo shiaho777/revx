@@ -233,6 +233,8 @@ pub struct StreamedAnalysis {
 }
 
 const MAX_CODE_WINDOW: usize = 0x1000;
+
+type DecodedFunction = (u64, String, u64, bool, Vec<Instruction>, Vec<Reference>);
 const HEURISTIC_SCAN_WINDOW: usize = 0x1000;
 
 enum ByteSource {
@@ -739,6 +741,7 @@ where
     let mut typed_function_count = 0usize;
     let mut structured_pseudocode_count = 0usize;
     let mut lean_stub_pseudocode_count = 0usize;
+    let mut deep_function_count = 0usize;
     let mut function_evidence_count = 0usize;
     let mut observed_truncated_functions = 0usize;
     let mut claimed_executable_bytes = 0u64;
@@ -774,6 +777,12 @@ where
                     lean_stub_pseudocode_count += 1;
                 } else {
                     structured_pseudocode_count += 1;
+                    if !function.blocks.is_empty()
+                        || (!function.arguments.is_empty()
+                            && function.arguments.iter().any(|var| var.type_name.is_some()))
+                    {
+                        deep_function_count += 1;
+                    }
                 }
             }
             function_evidence_count += 1
@@ -823,6 +832,7 @@ where
             typed_function_count,
             structured_pseudocode_count,
             lean_stub_pseudocode_count,
+            deep_function_count,
             total_executable_bytes,
             claimed_executable_bytes,
             coverage,
@@ -928,6 +938,15 @@ fn lean_function_from_decode(
 
 #[allow(clippy::redundant_locals)]
 #[allow(clippy::type_complexity)]
+struct PendingFunction {
+    address: u64,
+    name: String,
+    size: u64,
+    decode_end: u64,
+    debug_hint: Option<DebugFunctionHint>,
+    deep: bool,
+}
+
 fn walk_functions_inner<F, E>(
     image: &BinaryImage,
     profile: AnalysisProfile,
@@ -1033,17 +1052,32 @@ where
     }
     let mut visited = HashSet::with_capacity(function_budget.min(8192));
     let mut claimed_ranges: BTreeMap<u64, u64> = BTreeMap::new();
+    let deep_quota = revx_core::resolve_depth_quota(
+        function_budget,
+        resource::micro_mode(),
+        revx_core::env_depth_quota(),
+    );
+    let mut export_ranked: Vec<(usize, std::cmp::Reverse<u64>, u64)> = image
+        .exports
+        .iter()
+        .filter_map(|export| {
+            let address = export.address?;
+            if address == 0 {
+                return None;
+            }
+            let named = usize::from(!export.name.starts_with("sub_"));
+            Some((named * 4, std::cmp::Reverse(address), address))
+        })
+        .collect();
+    export_ranked.sort_unstable();
+    let deep_addresses: HashSet<u64> = export_ranked
+        .into_iter()
+        .take(deep_quota)
+        .map(|(_, _, address)| address)
+        .collect();
 
     #[allow(clippy::redundant_locals)]
     #[allow(clippy::type_complexity)]
-    struct PendingFunction {
-        address: u64,
-        name: String,
-        size: u64,
-        decode_end: u64,
-        debug_hint: Option<DebugFunctionHint>,
-    }
-
     let mut pending_functions: Vec<PendingFunction> = Vec::with_capacity(function_budget.min(1024));
 
     // ── Phase 1: Batched parallel discovery ────────────────────────────────
@@ -1148,68 +1182,67 @@ where
         phase1_batches += 1;
         let batch_started = std::time::Instant::now();
         let batch_len = batch.len();
-        let decoded: Vec<(u64, String, u64, bool, Vec<Instruction>, Vec<Reference>)> =
-            map_in_analysis_pool(
-                batch,
-                |(address, name, max_end, range_end, is_heuristic_seed)| {
-                    let (instructions, code_refs) = decode_function_with_references(
-                        architecture,
-                        &code_regions,
-                        address,
-                        max_end,
-                        &executable,
-                    );
-                    if instructions.is_empty() {
-                        return (
-                            address,
-                            name,
-                            range_end,
-                            is_heuristic_seed,
-                            Vec::new(),
-                            Vec::new(),
-                        );
-                    }
-                    let mut combined_references = if profile == AnalysisProfile::Full {
-                        normalize_references(architecture, &code_regions, code_refs)
-                    } else {
-                        code_refs
-                    };
-                    if profile == AnalysisProfile::Full {
-                        promote_data_reference_kinds(
-                            &mut combined_references,
-                            &string_ranges,
-                            &executable,
-                        );
-                        if instructions.len() <= data_ref_scan_limit() {
-                            combined_references.extend(extract_data_references(
-                                architecture,
-                                &instructions,
-                                &string_ranges,
-                                &executable,
-                            ));
-                        }
-                        attach_relocation_references(
-                            &mut combined_references,
-                            &instructions,
-                            &relocation_refs,
-                        );
-                        if combined_references.len() <= 4096 {
-                            reclassify_string_references(&mut combined_references, &string_ranges);
-                        }
-                        dedupe_references_in_place(&mut combined_references);
-                    } else if combined_references.len() > 1 {
-                        dedupe_references_in_place(&mut combined_references);
-                    }
-                    (
+        let decoded: Vec<DecodedFunction> = map_in_analysis_pool(
+            batch,
+            |(address, name, max_end, range_end, is_heuristic_seed)| {
+                let (instructions, code_refs) = decode_function_with_references(
+                    architecture,
+                    &code_regions,
+                    address,
+                    max_end,
+                    &executable,
+                );
+                if instructions.is_empty() {
+                    return (
                         address,
                         name,
                         range_end,
                         is_heuristic_seed,
-                        instructions,
-                        combined_references,
-                    )
-                },
-            );
+                        Vec::new(),
+                        Vec::new(),
+                    );
+                }
+                let mut combined_references = if profile == AnalysisProfile::Full {
+                    normalize_references(architecture, &code_regions, code_refs)
+                } else {
+                    code_refs
+                };
+                if profile == AnalysisProfile::Full {
+                    promote_data_reference_kinds(
+                        &mut combined_references,
+                        &string_ranges,
+                        &executable,
+                    );
+                    if instructions.len() <= data_ref_scan_limit() {
+                        combined_references.extend(extract_data_references(
+                            architecture,
+                            &instructions,
+                            &string_ranges,
+                            &executable,
+                        ));
+                    }
+                    attach_relocation_references(
+                        &mut combined_references,
+                        &instructions,
+                        &relocation_refs,
+                    );
+                    if combined_references.len() <= 4096 {
+                        reclassify_string_references(&mut combined_references, &string_ranges);
+                    }
+                    dedupe_references_in_place(&mut combined_references);
+                } else if combined_references.len() > 1 {
+                    dedupe_references_in_place(&mut combined_references);
+                }
+                (
+                    address,
+                    name,
+                    range_end,
+                    is_heuristic_seed,
+                    instructions,
+                    combined_references,
+                )
+            },
+        );
         revx_trace(|| {
             format!(
                 "phase1 batch={} size={} decoded={} elapsed_ms={}",
@@ -1307,15 +1340,63 @@ where
                 .cloned();
 
             if resource::lean_mode() {
-                let keep_pseudo = lean_keep_pseudocode(&name, function_count);
-                let function = lean_function_from_decode(
-                    &image.id,
-                    address,
-                    name,
-                    size,
-                    &instructions,
-                    keep_pseudo,
-                );
+                let deep = deep_addresses.contains(&address);
+                let keep_pseudo = deep || lean_keep_pseudocode(&name, function_count);
+                let function = if deep {
+                    let blocks = vec![finalize_basic_block(address, instructions.clone())];
+                    let mut stack = recover_stack_summary_fast(
+                        architecture,
+                        image.format,
+                        &instructions,
+                        debug_hint.as_ref(),
+                    );
+                    if stack.return_type.is_none() {
+                        stack.return_type = infer_return_type(&instructions, &HashMap::new());
+                    }
+                    let (mut arguments, locals) = recover_variables(
+                        image,
+                        address,
+                        &instructions,
+                        debug_hint.as_ref(),
+                        profile,
+                    );
+                    polish_argument_names(&name, &mut arguments);
+                    let stack = Some(stack);
+                    let _ = &locals;
+                    let pseudocode = render_fast_pseudocode(
+                        &name,
+                        address,
+                        &blocks,
+                        &arguments,
+                        &image.imports,
+                        &image.strings,
+                        &HashMap::new(),
+                        &HashMap::new(),
+                        None,
+                        &combined_references,
+                    );
+                    Function {
+                        name,
+                        address,
+                        size,
+                        blocks,
+                        stack_summary: stack,
+                        arguments,
+                        locals,
+                        pseudocode: Some(pseudocode),
+                        evidence_ids: vec![format!("fn:{}:{:x}", image.id, address)],
+                        warnings: Vec::new(),
+                    }
+                } else {
+                    lean_function_from_decode(
+                        &image.id,
+                        address,
+                        name,
+                        size,
+                        &instructions,
+                        keep_pseudo,
+                    )
+                };
                 drop(instructions);
                 drop(combined_references);
                 let _ = debug_hint;
@@ -1329,6 +1410,7 @@ where
                     size,
                     decode_end: function_end.max(address.saturating_add(4)),
                     debug_hint,
+                    deep: false,
                 });
                 drop(instructions);
                 drop(combined_references);
@@ -1368,6 +1450,13 @@ where
     });
 
     budget.rebaseline();
+
+    assign_deep_flags(
+        &mut pending_functions,
+        &all_references,
+        profile,
+        function_budget,
+    );
 
     // ── Phase 2: Parallel function analysis (rayon) ─────────────────────────
     let image_id = &image.id;
@@ -1524,7 +1613,8 @@ where
         });
         let debug_hint = pf.debug_hint.as_ref();
         let large_fn = instructions.len() > LIGHT_VAR_RECOVERY_INSTS;
-        let (stack_summary, mut arguments, locals) = if profile == AnalysisProfile::Fast {
+        let deep = pf.deep || profile == AnalysisProfile::Full;
+        let (stack_summary, mut arguments, locals) = if profile == AnalysisProfile::Fast && !deep {
             (
                 Some(recover_stack_summary_fast(
                     image_arch,
@@ -1565,7 +1655,6 @@ where
             (stack_summary, arguments, locals)
         };
         polish_argument_names(&pf.name, &mut arguments);
-        let mut combined_references = combined_references;
         let fast_return_type = if profile == AnalysisProfile::Fast {
             stack_summary
                 .as_ref()
@@ -1574,7 +1663,7 @@ where
         } else {
             None
         };
-        let blocks = if profile == AnalysisProfile::Fast {
+        let blocks = if profile == AnalysisProfile::Fast && !deep {
             vec![finalize_basic_block(pf.address, instructions)]
         } else {
             split_basic_blocks(pf.address, instructions, &combined_references)
@@ -1674,7 +1763,7 @@ where
         });
         let pseudocode = if resource::micro_mode() {
             None
-        } else if profile == AnalysisProfile::Fast {
+        } else if profile == AnalysisProfile::Fast && !deep {
             if !resource::lean_mode() && inst_count > 0 && inst_count <= MAX_FAST_SSA_INSTS {
                 let mut combined = combined_references.clone();
                 for (from, to) in &call_target_overrides {
@@ -2147,6 +2236,55 @@ fn collect_function_seeds(image: &BinaryImage) -> BTreeMap<u64, String> {
     }
 
     seeds
+}
+
+fn assign_deep_flags(
+    pending: &mut [PendingFunction],
+    references: &HashSet<Reference>,
+    profile: AnalysisProfile,
+    function_budget: usize,
+) -> HashSet<u64> {
+    if pending.is_empty() || profile != AnalysisProfile::Fast {
+        return HashSet::new();
+    }
+    let quota = revx_core::resolve_depth_quota(
+        function_budget,
+        resource::micro_mode(),
+        revx_core::env_depth_quota(),
+    );
+    if quota == 0 {
+        return HashSet::new();
+    }
+    let mut in_degree: HashMap<u64, usize> = HashMap::new();
+    for reference in references {
+        if reference.kind == ReferenceKind::Call {
+            *in_degree.entry(reference.to).or_insert(0) += 1;
+        }
+    }
+    let mut ranked: Vec<(usize, std::cmp::Reverse<u64>, usize)> = pending
+        .iter()
+        .enumerate()
+        .map(|(idx, pf)| {
+            let export_named = usize::from(
+                pf.name.starts_with("Java_")
+                    || pf.name.contains("JNI_OnLoad")
+                    || (!pf.name.starts_with("sub_") && !pf.name.starts_with("loc_")),
+            );
+            let hinted = usize::from(pf.debug_hint.is_some());
+            let value = in_degree.get(&pf.address).copied().unwrap_or(0) * 8
+                + export_named * 4
+                + hinted * 2;
+            (value, std::cmp::Reverse(pf.address), idx)
+        })
+        .collect();
+    ranked.sort_unstable();
+    let take = quota.min(pending.len());
+    let mut deep = HashSet::with_capacity(take);
+    for (_, _, idx) in ranked.into_iter().take(take) {
+        pending[idx].deep = true;
+        deep.insert(pending[idx].address);
+    }
+    deep
 }
 
 fn collect_seed_priority(image: &BinaryImage) -> HashMap<u64, usize> {

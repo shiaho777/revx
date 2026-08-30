@@ -106,6 +106,7 @@ fn sample_bundle(binary_id: &str, path: &str) -> AnalysisBundle {
                 typed_function_count: 1,
                 structured_pseudocode_count: 1,
                 lean_stub_pseudocode_count: 0,
+                deep_function_count: 0,
                 total_executable_bytes: 1,
                 claimed_executable_bytes: 1,
                 coverage: 1.0,

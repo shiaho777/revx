@@ -172,3 +172,24 @@ fn budget_resolver_tiers_are_monotonic() {
         48
     );
 }
+
+#[test]
+fn depth_quota_produces_deep_functions_in_default_profile() {
+    let case = synthetic_wide_arm64_case("depth_quota", 96);
+    let path = write_temp(&case);
+    let image = load_binary(&path).expect("load");
+    let bundle = analyze(image, AnalysisProfile::Fast);
+    let summary = &bundle.survey.summary;
+    assert!(
+        summary.deep_function_count > 0,
+        "default profile should fill depth quota, got {}",
+        summary.deep_function_count
+    );
+    assert!(
+        summary.structured_pseudocode_count >= summary.deep_function_count,
+        "structured pseudo must cover deep functions: struct={} deep={}",
+        summary.structured_pseudocode_count,
+        summary.deep_function_count
+    );
+    let _ = fs::remove_file(&path);
+}

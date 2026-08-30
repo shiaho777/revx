@@ -48,8 +48,25 @@ pub const ENV_MAX_CFG_INSTRUCTIONS: &str = "REVX_MAX_CFG_INSTRUCTIONS";
 pub const ENV_MAX_SHARED_STRING_MAP: &str = "REVX_MAX_SHARED_STRING_MAP";
 pub const ENV_MAX_DATA_REF_SCAN_INSTS: &str = "REVX_MAX_DATA_REF_SCAN_INSTS";
 pub const ENV_MAX_FUNCTION_BUDGET: &str = "REVX_MAX_FUNCTION_BUDGET";
+pub const ENV_DEPTH_QUOTA: &str = "REVX_DEPTH_QUOTA";
 
 pub const FUNCTION_BUDGET_PER_MB: usize = 512;
+
+pub fn resolve_depth_quota(function_budget: usize, micro: bool, explicit: Option<&str>) -> usize {
+    if let Some(v) = explicit.and_then(|v| v.parse::<usize>().ok()) {
+        return v.min(function_budget);
+    }
+    if micro {
+        return 0;
+    }
+    function_budget / 4
+}
+
+pub fn env_depth_quota() -> Option<&'static str> {
+    static RAW: OnceLock<Option<String>> = OnceLock::new();
+    RAW.get_or_init(|| std::env::var(ENV_DEPTH_QUOTA).ok())
+        .as_deref()
+}
 
 pub fn resolve_function_budget(
     profile_fast: bool,
