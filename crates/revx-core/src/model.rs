@@ -594,6 +594,8 @@ pub struct AnalysisSummary {
     #[serde(default)]
     pub claimed_executable_bytes: u64,
     #[serde(default)]
+    pub probed_executable_bytes: u64,
+    #[serde(default)]
     pub coverage: f64,
     #[serde(default)]
     pub warnings: Vec<String>,

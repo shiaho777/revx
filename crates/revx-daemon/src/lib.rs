@@ -8105,6 +8105,7 @@ print(json.dumps({
                     deep_function_count: 0,
                     total_executable_bytes: 1,
                     claimed_executable_bytes: 1,
+                    probed_executable_bytes: 0,
                     coverage: 1.0,
                     warnings: Vec::new(),
                 },
