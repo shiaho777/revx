@@ -147,6 +147,8 @@ pub struct Relocation {
     pub target: Option<u64>,
     pub symbol: Option<String>,
     pub kind: String,
+    #[serde(default)]
+    pub addend: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
