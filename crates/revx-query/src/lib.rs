@@ -73,6 +73,15 @@ pub struct FunctionDetail {
     pub warnings: Vec<String>,
 }
 
+/// One class (or class field) for `revx export-offsets`, straight from the
+/// workspace `types` table.
+#[derive(Debug, Serialize)]
+pub struct OffsetTypeRow {
+    pub id: String,
+    pub name: String,
+    pub kind: String,
+}
+
 #[derive(Debug, Serialize)]
 pub struct SurveyPreview {
     pub binary_id: String,
@@ -402,6 +411,30 @@ impl QueryWorkspace {
             evidence_ids: serde_json::from_str(&evidence_json).unwrap_or_default(),
             warnings: serde_json::from_str(&warnings_json).unwrap_or_default(),
         }))
+    }
+
+    /// Il2cpp class/field rows recorded for a binary, for `export-offsets`.
+    /// Classes have kind `il2cpp_class`, fields `il2cpp_field` with
+    /// `Class.Field` names; other kinds are ignored.
+    pub fn offset_type_rows(&self, binary_id: &str) -> Result<Vec<OffsetTypeRow>> {
+        let Some(conn) = open_db_if_present(&self.root.join("state.sqlite"))? else {
+            return Ok(Vec::new());
+        };
+        if !table_exists(&conn, "types")? {
+            return Ok(Vec::new());
+        }
+        let mut stmt = conn.prepare(
+            "SELECT id, name, kind FROM types WHERE binary_id = ?1 AND kind IN ('il2cpp_class', 'il2cpp_field') ORDER BY id ASC",
+        )?;
+        let rows = stmt.query_map([binary_id], |row| {
+            Ok(OffsetTypeRow {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                kind: row.get(2)?,
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
     }
 
     fn lookup_function_range(&self, conn: &Connection, query: &str) -> Result<Option<(u64, u64)>> {
