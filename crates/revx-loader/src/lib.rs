@@ -4967,6 +4967,20 @@ fn file_exports(file: &object::File<'_>, cap: usize) -> Vec<Export> {
 
 fn file_relocations(file: &object::File<'_>) -> Vec<Relocation> {
     let mut relocations = Vec::new();
+    if let Some(dynamic) = file.dynamic_relocations() {
+        for (offset, relocation) in dynamic {
+            relocations.push(Relocation {
+                address: offset,
+                target: None,
+                symbol: None,
+                kind: format!("{:?}", relocation.kind()),
+                addend: relocation.addend(),
+            });
+        }
+        if !relocations.is_empty() {
+            return relocations;
+        }
+    }
     for section in file.sections() {
         for (offset, relocation) in section.relocations() {
             relocations.push(Relocation {
@@ -4993,6 +5007,7 @@ fn file_relocations(file: &object::File<'_>) -> Vec<Relocation> {
                     _ => None,
                 },
                 kind: format!("{:?}", relocation.kind()),
+                addend: relocation.addend(),
             });
         }
     }

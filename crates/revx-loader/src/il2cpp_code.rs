@@ -343,3 +343,108 @@ mod scan_tests {
         );
     }
 }
+
+/// Relocation-aware pass: rebuilds the runtime view of data sections from RELATIVE
+/// relocations (addend = target address in file state) and enumerates method-pointer
+/// tables as maximal runs of relocated slots pointing into executable memory.
+pub struct RelocTables {
+    pub tables: Vec<(u64, usize)>,
+    pub entries: Vec<(u64, u64)>,
+}
+
+pub fn scan_reloc_tables(image: &BinaryImage) -> Option<RelocTables> {
+    if image.architecture != Architecture::Arm64 || image.relocations.is_empty() {
+        return None;
+    }
+    let mut relmap: Vec<(u64, i64)> = image
+        .relocations
+        .iter()
+        .filter(|r| r.addend != 0)
+        .map(|r| (r.address, r.addend))
+        .collect();
+    if relmap.is_empty() {
+        return None;
+    }
+    relmap.sort_unstable();
+    relmap.dedup_by_key(|(address, _)| *address);
+    let is_exec = |v: u64| -> bool { is_executable(image, v) };
+    let mut tables = Vec::new();
+    let mut entries: Vec<(u64, u64)> = Vec::new();
+    let mut run_start: Option<u64> = None;
+    let mut run_prev: Option<u64> = None;
+    for &(address, addend) in &relmap {
+        let value = addend as u64;
+        if is_exec(value) {
+            match (run_start, run_prev) {
+                (Some(_start), Some(prev)) if address == prev.saturating_add(8) => {
+                    run_prev = Some(address);
+                }
+                _ => {
+                    if let (Some(start), Some(prev)) = (run_start, run_prev) {
+                        let count = ((prev - start) / 8 + 1) as usize;
+                        if count >= 100 {
+                            tables.push((start, count));
+                        }
+                    }
+                    run_start = Some(address);
+                    run_prev = Some(address);
+                }
+            }
+            entries.push((address, value));
+        } else {
+            if let (Some(start), Some(prev)) = (run_start, run_prev) {
+                let count = ((prev - start) / 8 + 1) as usize;
+                if count >= 100 {
+                    tables.push((start, count));
+                }
+            }
+            run_start = None;
+            run_prev = None;
+        }
+    }
+    if let (Some(start), Some(prev)) = (run_start, run_prev) {
+        let count = ((prev - start) / 8 + 1) as usize;
+        if count >= 100 {
+            tables.push((start, count));
+        }
+    }
+    if tables.is_empty() {
+        return None;
+    }
+    Some(RelocTables { tables, entries })
+}
+
+#[cfg(test)]
+mod reloc_tests {
+    use super::*;
+
+    #[test]
+    fn real_corpus_scan_finds_module_tables_when_present() {
+        let corpus = std::env::var("REVX_IL2CPP_CORPUS").ok();
+        let Some(path) = corpus else {
+            eprintln!("skipping: REVX_IL2CPP_CORPUS not set");
+            return;
+        };
+        let image = match crate::load_binary(std::path::Path::new(&path)) {
+            Ok(image) => image,
+            Err(e) => {
+                eprintln!("skipping: load failed: {e}");
+                return;
+            }
+        };
+        eprintln!("relocations captured: {}", image.relocations.len());
+        if image.relocations.is_empty() {
+            eprintln!("skipping: no relocations captured (lean build?)");
+            return;
+        }
+        let tables = scan_reloc_tables(&image).expect("reloc scan should find tables");
+        eprintln!(
+            "tables={} entries={}",
+            tables.tables.len(),
+            tables.entries.len()
+        );
+        assert!(!tables.tables.is_empty());
+        let total_entries: usize = tables.tables.iter().map(|(_, c)| c).sum();
+        assert!(total_entries >= 100_000, "expected large method surface");
+    }
+}
