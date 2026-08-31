@@ -1,4 +1,5 @@
 pub mod il2cpp;
+pub mod il2cpp_code;
 
 use anyhow::{Context, Result};
 #[cfg(feature = "containers")]
