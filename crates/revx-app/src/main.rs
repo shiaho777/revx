@@ -1,5 +1,6 @@
 use revx_query::QueryWorkspace;
 use serde_json::json;
+use std::collections::BTreeMap;
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -79,6 +80,15 @@ fn run() -> Result<(), String> {
                 .ok_or_else(|| "usage: revx il2cpp-scan <path>".to_string())?;
             cmd_il2cpp_scan(Path::new(&path))
         }
+        "export-offsets" => {
+            let binary = parse_opt_flag(&args[1..], "--binary")
+                .or_else(|| free_args(&args[1..]).into_iter().next())
+                .ok_or_else(|| {
+                    "usage: revx export-offsets --binary <path-or-id> [--out FILE]".to_string()
+                })?;
+            let out = parse_opt_flag(&args[1..], "--out").map(PathBuf::from);
+            cmd_export_offsets(&binary, out.as_deref())
+        }
         "analyze" => {
             if args.iter().any(|a| a == "--micro") {
                 let path = free_args(&args[1..])
@@ -122,6 +132,7 @@ LIGHT:
   disasm <query>
   analyze --micro <path>
   il2cpp-scan <path>
+  export-offsets --binary <path-or-id> [--out FILE]
 
 ENGINE (spawns revx-engine):
   analyze, add, object, ...
@@ -236,6 +247,157 @@ fn cmd_il2cpp_scan(path: &Path) -> Result<(), String> {
             .map(|p| p.display().to_string())
             .collect::<Vec<_>>(),
     }))
+}
+
+/// Resolve --binary (path or workspace binary id) to a workspace record.
+fn resolve_binary_record(
+    ws: &QueryWorkspace,
+    binary: &str,
+) -> Result<(String, String, Option<String>), String> {
+    let records = ws.binary_record_list().map_err(|e| e.to_string())?;
+    let matches: Vec<_> = records
+        .iter()
+        .filter(|r| r.id == binary || r.path == binary)
+        .collect();
+    if let Some(record) = matches.first() {
+        return Ok((
+            record.id.clone(),
+            record.path.clone(),
+            record.last_analysis_at.clone(),
+        ));
+    }
+    let suffix_match = records
+        .iter()
+        .filter(|r| r.path.ends_with(binary))
+        .collect::<Vec<_>>();
+    if let Some(record) = suffix_match.first() {
+        return Ok((
+            record.id.clone(),
+            record.path.clone(),
+            record.last_analysis_at.clone(),
+        ));
+    }
+    Err(format!(
+        "binary not found in workspace: {binary} (run `revx analyze` first)"
+    ))
+}
+
+/// `revx export-offsets`: emit the esp-offsets (format=esp-offsets, version=1)
+/// table consumed by esp-overlay's OffsetTable. Classes/fields come from the
+/// workspace types table (il2cpp metadata enrichment); method addresses come
+/// from the reloc-scan of the target image; globals are not yet derivable and
+/// stay empty until a real global-metadata ground truth lands.
+fn cmd_export_offsets(binary: &str, out: Option<&std::path::Path>) -> Result<(), String> {
+    let ws = workspace_from_cwd()?;
+    let (binary_id, binary_path, last_analysis_at) = resolve_binary_record(&ws, binary)?;
+
+    // Classes + fields from persisted il2cpp types. Field names are stored as
+    // "Type.field"; class statics offsets are not yet in the DB, so tables
+    // carry fields only.
+    let mut classes: BTreeMap<String, Vec<(String, u64, Option<String>)>> = BTreeMap::new();
+    let mut warning: Option<String> = None;
+    let rows = ws.offset_type_rows(&binary_id).map_err(|e| e.to_string())?;
+    if rows.is_empty() {
+        warning = Some(
+            "no il2cpp types in workspace for this binary (analysis ran lean/micro or global-metadata.dat missing); classes empty".to_string(),
+        );
+    }
+    for row in rows {
+        match row.kind.as_str() {
+            "il2cpp_class" => {
+                classes.entry(row.name).or_default();
+            }
+            "il2cpp_field" => {
+                if let Some((class, field)) = row.name.split_once('.') {
+                    classes.entry(class.to_string()).or_default().push((
+                        field.to_string(),
+                        0,
+                        None,
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Method addresses from the reloc scan of the image itself (still valid
+    // offline; the scan does not need the workspace).
+    let image = revx_loader::load_binary(Path::new(&binary_path)).map_err(|e| e.to_string())?;
+    let mut methods: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+    if let Some(scan) = revx_loader::il2cpp_code::scan_reloc_tables(&image)
+        && let Some((table, count)) = scan.tables.iter().max_by_key(|(_, c)| *c).copied()
+    {
+        for (index, address) in
+            revx_loader::il2cpp_code::method_addresses(&image, table, count.min(64))
+                .into_iter()
+                .enumerate()
+        {
+            if address != 0 {
+                methods.insert(
+                    format!("methodPointerTable[{index}]"),
+                    serde_json::json!({ "address": address }),
+                );
+            }
+        }
+    }
+
+    let class_json = classes
+        .into_iter()
+        .map(|(class, fields)| {
+            (
+                class,
+                serde_json::json!({
+                    "fields": fields
+                        .into_iter()
+                        .map(|(name, offset, ty)| {
+                            let mut entry = serde_json::Map::new();
+                            entry.insert("offset".to_string(), serde_json::json!(offset));
+                            if let Some(ty) = ty {
+                                entry.insert("type".to_string(), serde_json::json!(ty));
+                            }
+                            (name, serde_json::Value::Object(entry))
+                        })
+                        .collect::<serde_json::Map<_, _>>(),
+                }),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>();
+
+    let payload = serde_json::json!({
+        "format": "esp-offsets",
+        "version": 1,
+        "binary": Path::new(&binary_path)
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| binary_path.clone()),
+        "hash_blake3": image.hash_blake3,
+        "generated": last_analysis_at,
+        "generator": format!("revx {}", env!("CARGO_PKG_VERSION")),
+        "binary_format": format!("{:?}", image.format),
+        "binary_architecture": format!("{:?}", image.architecture),
+        "warnings": warning.into_iter().collect::<Vec<_>>(),
+        "classes": class_json,
+        "globals": {},
+        "methods": methods,
+    });
+
+    let rendered = serde_json::to_string_pretty(&payload).map_err(|e| e.to_string())?;
+    match out {
+        Some(path) => {
+            std::fs::write(path, rendered + "\n").map_err(|e| e.to_string())?;
+            println!(
+                "{}",
+                serde_json::json!({
+                    "written": path.display().to_string(),
+                    "binary_id": binary_id,
+                    "classes": class_json.len(),
+                    "methods": methods.len(),
+                })
+            );
+        }
+        None => println!("{rendered}"),
+    }
+    Ok(())
 }
 
 fn cmd_func(query: &str) -> Result<(), String> {
