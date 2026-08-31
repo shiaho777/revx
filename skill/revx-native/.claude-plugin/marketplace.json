@@ -1,0 +1,27 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "revx-native",
+  "description": "Claude Code plugin for native Android library reverse engineering with revx",
+  "owner": {
+    "name": "shiaho777"
+  },
+  "metadata": {
+    "description": "Native (.so/il2cpp) reverse engineering skill: method tables, metadata, offset export",
+    "version": "0.1.0"
+  },
+  "plugins": [
+    {
+      "name": "revx-native",
+      "source": "./",
+      "description": "Analyze native Android libraries with revx: il2cpp method-pointer tables, metadata recovery, esp-offsets export, ARM64 decompilation.",
+      "version": "0.1.0",
+      "author": {
+        "name": "shiaho777"
+      },
+      "repository": "https://github.com/shiaho777/revx",
+      "license": "MIT",
+      "keywords": ["android", "reverse-engineering", "il2cpp", "native", "arm64", "offsets", "unity"],
+      "category": "security"
+    }
+  ]
+}

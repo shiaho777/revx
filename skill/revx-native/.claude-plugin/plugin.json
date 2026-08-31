@@ -1,0 +1,13 @@
+{
+  "name": "revx-native",
+  "version": "0.1.0",
+  "description": "Analyze native Android libraries with revx: il2cpp method-pointer tables, metadata recovery, esp-offsets export, ARM64 decompilation.",
+  "author": {
+    "name": "shiaho777"
+  },
+  "repository": "https://github.com/shiaho777/revx",
+  "license": "MIT",
+  "keywords": ["android", "reverse-engineering", "il2cpp", "native", "arm64", "offsets", "unity"],
+  "skills": "./skills/",
+  "commands": "./commands/"
+}
