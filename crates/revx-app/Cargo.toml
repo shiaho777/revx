@@ -7,5 +7,6 @@ authors.workspace = true
 
 [dependencies]
 revx-core = { path = "../revx-core" }
+revx-loader = { path = "../revx-loader" }
 serde_json = { workspace = true }
 revx-query = { path = "../revx-query" }

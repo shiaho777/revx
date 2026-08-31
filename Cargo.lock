@@ -833,6 +833,7 @@ name = "revx"
 version = "0.1.0"
 dependencies = [
  "revx-core",
+ "revx-loader",
  "revx-query",
  "serde_json",
 ]
