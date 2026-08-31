@@ -72,6 +72,13 @@ fn run() -> Result<(), String> {
                 .ok_or_else(|| "usage: revx disasm <query>".to_string())?;
             cmd_disasm(&query)
         }
+        "il2cpp-scan" => {
+            let path = free_args(&args[1..])
+                .into_iter()
+                .next()
+                .ok_or_else(|| "usage: revx il2cpp-scan <path>".to_string())?;
+            cmd_il2cpp_scan(Path::new(&path))
+        }
         "analyze" => {
             if args.iter().any(|a| a == "--micro") {
                 let path = free_args(&args[1..])
@@ -114,6 +121,7 @@ LIGHT:
   decompile <query>
   disasm <query>
   analyze --micro <path>
+  il2cpp-scan <path>
 
 ENGINE (spawns revx-engine):
   analyze, add, object, ...
@@ -191,6 +199,43 @@ fn cmd_xrefs(target: &str) -> Result<(), String> {
     let ws = workspace_from_cwd()?;
     let refs = ws.find_references(target).map_err(|e| e.to_string())?;
     print_json(&json!({ "references": refs }))
+}
+
+fn cmd_il2cpp_scan(path: &Path) -> Result<(), String> {
+    let image = revx_loader::load_binary(path).map_err(|e| e.to_string())?;
+    let api_exports = revx_loader::il2cpp_code::il2cpp_api_exports(&image).len();
+    let scan = revx_loader::il2cpp_code::scan_reloc_tables(&image);
+    let mut tables_total = 0usize;
+    let mut entries_total = 0usize;
+    let mut sample: Vec<u64> = Vec::new();
+    let mut entries_by_table: Vec<u64> = Vec::new();
+    if let Some(scan) = scan.as_ref() {
+        tables_total = scan.tables.len();
+        entries_total = scan.entries.len();
+        entries_by_table = scan.tables.iter().map(|(_, c)| *c as u64).collect();
+        entries_by_table.sort_unstable();
+        entries_by_table.reverse();
+        sample = scan
+            .entries
+            .iter()
+            .take(4)
+            .map(|(_, target)| *target)
+            .collect();
+    }
+    print_json(&json!({
+        "binary": image.path,
+        "architecture": format!("{:?}", image.architecture),
+        "relocations": image.relocations.len(),
+        "il2cpp_api_exports": api_exports,
+        "method_pointer_tables": tables_total,
+        "method_entries": entries_total,
+        "largest_tables": entries_by_table.into_iter().take(8).collect::<Vec<_>>(),
+        "sample_entry_addresses": sample,
+        "metadata_candidates": revx_loader::il2cpp::metadata_candidates(path)
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>(),
+    }))
 }
 
 fn cmd_func(query: &str) -> Result<(), String> {
