@@ -1,3 +1,5 @@
+pub mod il2cpp;
+
 use anyhow::{Context, Result};
 #[cfg(feature = "containers")]
 use bzip2::read::BzDecoder;
@@ -250,6 +252,7 @@ fn load_binary_from_bytes(path: &Path, bytes: &[u8]) -> Result<BinaryImage> {
     };
     if !micro && !lean {
         enrich_debug_function_hints_from_macho(bytes, &file, format, &mut debug_import);
+        il2cpp::enrich(path, &mut debug_import);
     }
     let debug_artifacts = if micro || lean {
         Vec::new()
