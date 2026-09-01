@@ -758,7 +758,10 @@ fn is_callee_saved_spill(rendered: &str) -> bool {
         || rhs == "x30"
         || rhs == "fp"
         || rhs == "lr"
-        || rhs.starts_with("arg_");
+        || rhs.starts_with("arg_")
+        || rhs == "env"
+        || rhs == "thiz"
+        || rhs.starts_with("a") && rhs.len() <= 3 && rhs[1..].parse::<u32>().is_ok();
     if !is_spilled_value {
         return false;
     }
@@ -12067,6 +12070,21 @@ fn result_name_for_call(
             "GetStringUTFChars" => "cstr",
             "RegisterNatives" => "reg_rc",
             "GetEnv" | "AttachCurrentThread" => "jni_rc",
+            "GetStringChars" => "jchars",
+            "ReleaseStringChars" => "",
+            "ReleaseStringUTFChars" => "",
+            "strlen" => "len",
+            "malloc" | "calloc" => "mem",
+            "memmove" | "memcpy" => "",
+            "_Znwm" | "Znwm" => "buf",
+            "__android_log_print" => "",
+            "GetStringUTFLength" => "utf_len",
+            "GetArrayLength" => "arr_len",
+            "NewByteArray" => "jarr",
+            "GetByteArrayElements" => "bytes",
+            "ReleaseByteArrayElements" => "",
+            "ThrowNew" => "throw_rc",
+            "delete" | "_ZdlPv" | "ZdlPv" => "",
             _ => "",
         };
         if !pretty.is_empty() {
