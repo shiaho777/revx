@@ -4116,7 +4116,48 @@ fn recover_stack_summary_fast(
     }
 }
 
+/// JNI bridge naming: `Java_com_x_Class_method(JNIEnv*, jobject|jclass, ...)`.
+/// The first two slots are fully determined by the ABI; remaining args get
+/// stable `a1..aN` names. Returns true when the function is a JNI bridge.
+fn polish_jni_argument_names(function_name: &str, arguments: &mut [Variable]) -> bool {
+    let Some(rest) = function_name.strip_prefix("Java_") else {
+        return false;
+    };
+    // static vs instance: mangled names carry an underscore separator before
+    // the method (Java_Class_method vs Java_Class_method for static). We do
+    // not guess; both spellings get env first.
+    let _ = rest;
+    if arguments.is_empty() {
+        return false;
+    }
+    for (index, arg) in arguments.iter_mut().enumerate() {
+        if !arg.name.starts_with("arg_") {
+            continue; // already named (debug hints)
+        }
+        match index {
+            0 => {
+                arg.name = "env".to_string();
+                arg.type_name = Some("JNIEnv *".to_string());
+                arg.confidence = arg.confidence.max(0.9);
+            }
+            1 => {
+                arg.name = "thiz".to_string();
+                arg.type_name = Some("jobject".to_string());
+                arg.confidence = arg.confidence.max(0.85);
+            }
+            n => {
+                arg.name = format!("a{n}");
+                arg.confidence = arg.confidence.max(0.5);
+            }
+        }
+    }
+    true
+}
+
 fn polish_argument_names(function_name: &str, arguments: &mut [Variable]) {
+    if polish_jni_argument_names(function_name, arguments) {
+        return;
+    }
     let bare = function_name.trim_start_matches('_');
     if !bare.eq_ignore_ascii_case("main") {
         return;
