@@ -6891,30 +6891,49 @@ impl<'a> RegionWalk<'a> {
     /// an explicit `goto bbN;` guard and keep the main path linear instead.
     fn emit_if_else(&mut self, _block: BlockId, cond: &str, t: BlockId, f: BlockId) -> bool {
         let join = self.join_of(t, f);
-        let t_chain = self.straight_chain(t, join);
-        let f_chain = self.straight_chain(f, join);
+        let mut t_chain = self.straight_chain(t, join);
+        let mut f_chain = self.straight_chain(f, join);
 
-        // early-exit detection: short arm + high-fanin join
+        // early-exit detection: short arm + (far join OR degenerate diamond
+        // where the NCD is the branch block itself — entry-dominated CFGs
+        // hit this constantly, and the short arm is the error path).
         let short_arm_is_true = t_chain.len() <= 2 && t_chain.last() != Some(&join);
         let short_arm_is_false = f_chain.len() <= 2 && f_chain.last() != Some(&join);
         let join_is_far = self.func.cfg.predecessors(join).len() >= 3
             && (t_chain.len() >= 4 || f_chain.len() >= 4);
-        if join_is_far && (short_arm_is_true || short_arm_is_false) {
-            let (short_cond, short_target) = if short_arm_is_true {
-                (cond.to_string(), t)
+        let degenerate = join == _block && (short_arm_is_true || short_arm_is_false);
+        if (join_is_far || degenerate) && (short_arm_is_true || short_arm_is_false) {
+            let (short_cond, short_chain) = if short_arm_is_true {
+                (cond.to_string(), std::mem::take(&mut t_chain))
             } else {
-                (negate_condition_text(cond), f)
+                (negate_condition_text(cond), std::mem::take(&mut f_chain))
             };
-            self.lines
-                .push(format!("    if ({short_cond}) goto bb{};", short_target.0));
+            // Render the short (error-exit) arm inside the guard braces — it
+            // never falls through, so `if (bad) { cleanup-path }` is faithful.
+            // If the arm's content is entirely suppressed (spill-only blocks),
+            // skip the guard: an empty `if` is noise, not information.
+            let mut short_lines = Vec::new();
+            for &b in &short_chain {
+                if let Some((lines, _, _)) = self.terminator(b) {
+                    for line in lines {
+                        short_lines.push(format!("    {line}"));
+                    }
+                }
+            }
+            self.emitted.insert(if short_arm_is_true { t } else { f });
+            if !short_lines.is_empty() {
+                self.lines.push(format!("    if ({short_cond}) {{"));
+                self.lines.extend(short_lines);
+                self.lines.push("    }".to_string());
+            }
             // main path continues through the long arm; the join block itself
             // is walked later (cleanup), not now.
             let (long_chain, last) = if short_arm_is_true {
                 let l = f_chain.last().copied();
-                (f_chain, l)
+                (std::mem::take(&mut f_chain), l)
             } else {
                 let l = t_chain.last().copied();
-                (t_chain, l)
+                (std::mem::take(&mut t_chain), l)
             };
             self.emit_lines(&long_chain);
             let Some(last) = last else {
@@ -6940,29 +6959,57 @@ impl<'a> RegionWalk<'a> {
         }
 
         if t == join && f == join {
-            self.lines.push(format!("    if ({cond}) {{}}"));
             return self.walk_chain(join);
         }
-        if t == join || t_chain.is_empty() {
-            self.lines
-                .push(format!("    if ({}) {{", negate_condition_text(cond)));
-            self.emit_lines(&f_chain);
-            self.lines.push("    }".to_string());
-        } else if f == join || f_chain.is_empty() {
-            self.lines.push(format!("    if ({cond}) {{"));
-            self.emit_lines(&t_chain);
-            self.lines.push("    }".to_string());
-        } else {
-            self.lines.push(format!("    if ({cond}) {{"));
-            self.emit_lines(&t_chain);
-            self.lines.push("    } else {".to_string());
-            self.emit_lines(&f_chain);
-            self.lines.push("    }".to_string());
+        // Arm content can vanish when every statement is suppressed (spill
+        // stores, flag ops). An empty if/else arm is noise; invert the
+        // condition and keep only the arm that actually does something.
+        let t_lines = self.arm_lines(&t_chain);
+        let f_lines = self.arm_lines(&f_chain);
+        let t_empty = t == join || t_lines.is_empty();
+        let f_empty = f == join || f_lines.is_empty();
+        match (t_empty, f_empty) {
+            (true, true) => {}
+            (true, false) => {
+                self.lines
+                    .push(format!("    if ({}) {{", negate_condition_text(cond)));
+                self.lines.extend(f_lines);
+                self.lines.push("    }".to_string());
+            }
+            (false, true) => {
+                self.lines.push(format!("    if ({cond}) {{"));
+                self.lines.extend(t_lines);
+                self.lines.push("    }".to_string());
+            }
+            (false, false) => {
+                self.lines.push(format!("    if ({cond}) {{"));
+                self.lines.extend(t_lines);
+                self.lines.push("    } else {".to_string());
+                self.lines.extend(f_lines);
+                self.lines.push("    }".to_string());
+            }
+        }
+        for &b in t_chain.iter().chain(f_chain.iter()) {
+            self.emitted.insert(b);
         }
         if self.emitted.contains(&join) {
             return true;
         }
         self.walk_chain(join)
+    }
+
+    /// Render an if/else arm's lines without marking blocks emitted (the
+    /// caller decides, based on emptiness, whether the arm survives).
+    fn arm_lines(&mut self, chain: &[BlockId]) -> Vec<String> {
+        let mut out = Vec::new();
+        for &b in chain {
+            if let Some((lines, _, _)) = self.terminator(b) {
+                for line in lines {
+                    out.push(format!("    {line}"));
+                }
+            }
+        }
+        out
     }
 
     /// Branch dispatch shared by walk/walk_chain/early-exit continuation.
