@@ -6636,37 +6636,400 @@ fn render_ssa_pseudocode_named_layered_with_strings_arc_inner(
             let switch_case_blocks = collect_switch_case_block_ids(func);
             let allow_structured_switch = switch_case_blocks.len() <= 48
                 && func.cfg.blocks.len() <= 96
-                && func.values.len() <= 768;
-            for block in &func.cfg.blocks {
-                if allow_structured_switch && switch_case_blocks.contains(&block.id) {
-                    continue;
-                }
-                if allow_structured_switch
-                    && emit_structured_switch(
+                && func.values.len() <= 8192;
+            // A2 (experimental, opt-in via REVX_REGION_TREE=1): dominance-based
+            // if/else + while structuring. Default off — the walk still
+            // mishandles early-exit chains; see issue #59 for the follow-up
+            // (dominance-frontier join detection) before enabling by default.
+            let region_tree_enabled =
+                std::env::var("REVX_REGION_TREE").is_ok_and(|v| !v.is_empty() && v != "0");
+            if region_tree_enabled
+                && allow_structured_switch
+                && emit_ssa_region_tree(
+                    func,
+                    name,
+                    symbols,
+                    local_symbols,
+                    &switch_case_blocks,
+                    &mut lines,
+                )
+            {
+                lines.push("}".to_string());
+                join_lines_fast(&apply_call_result_cse(&lines))
+            } else {
+                for block in &func.cfg.blocks {
+                    if allow_structured_switch && switch_case_blocks.contains(&block.id) {
+                        continue;
+                    }
+                    if allow_structured_switch
+                        && emit_structured_switch(
+                            func,
+                            block,
+                            symbols,
+                            local_symbols,
+                            &mut emitted,
+                            &mut lines,
+                            &switch_case_blocks,
+                        )
+                    {
+                        continue;
+                    }
+                    emit_ssa_block_linear(
                         func,
                         block,
                         symbols,
                         local_symbols,
                         &mut emitted,
                         &mut lines,
-                        &switch_case_blocks,
-                    )
-                {
-                    continue;
+                    );
                 }
-                emit_ssa_block_linear(
-                    func,
-                    block,
-                    symbols,
-                    local_symbols,
-                    &mut emitted,
-                    &mut lines,
-                );
+                lines.push("}".to_string());
+                join_lines_fast(&apply_call_result_cse(&lines))
             }
-            lines.push("}".to_string());
-            join_lines_fast(&apply_call_result_cse(&lines))
         },
     )
+}
+
+/// Region-tree structuring state for one render pass.
+struct RegionWalk<'a> {
+    func: &'a SsaFunction,
+    symbols: &'a HashMap<u64, String>,
+    local_symbols: &'a HashMap<u64, String>,
+    switch_blocks: &'a HashSet<BlockId>,
+    emitted: HashSet<BlockId>,
+    lines: Vec<String>,
+    depth: usize,
+}
+
+const REGION_WALK_MAX_DEPTH: usize = 24;
+const REGION_WALK_MAX_LINES: usize = 2000;
+
+/// Per-block terminator summary used by the region walk.
+type BlockTerm = (
+    Vec<String>,
+    Option<BlockId>,
+    Option<(String, BlockId, BlockId)>,
+);
+
+impl<'a> RegionWalk<'a> {
+    fn new(
+        func: &'a SsaFunction,
+        symbols: &'a HashMap<u64, String>,
+        local_symbols: &'a HashMap<u64, String>,
+        switch_blocks: &'a HashSet<BlockId>,
+    ) -> Self {
+        Self {
+            func,
+            symbols,
+            local_symbols,
+            switch_blocks,
+            emitted: HashSet::new(),
+            lines: Vec::new(),
+            depth: 0,
+        }
+    }
+
+    fn terminator(&self, block: BlockId) -> Option<BlockTerm> {
+        if self.switch_blocks.contains(&block) {
+            return None;
+        }
+        if let Some(result) =
+            block_collect_side_effects(self.func, block, self.symbols, self.local_symbols)
+        {
+            return Some(result);
+        }
+        // Return-only blocks make block_collect_side_effects bail; render
+        // their statements directly so walk can still pass through them.
+        let cfg_block = self.func.cfg.blocks.get(block.0 as usize)?;
+        let mut lines = Vec::new();
+        for &iid in &cfg_block.insts {
+            let inst = self.func.values.get(iid.0 as usize)?;
+            match &inst.op {
+                SsaOp::Return { .. } => {
+                    lines.push(format!("{};", self.func.render_value(inst.id)));
+                }
+                SsaOp::Store { .. } => {
+                    let r =
+                        render_named_value(self.func, inst.id, self.symbols, self.local_symbols);
+                    if is_trivial_stack_prologue_store(&r) || is_callee_saved_spill(&r) {
+                        continue;
+                    }
+                    lines.push(format!("{r};"));
+                }
+                _ => {}
+            }
+        }
+        Some((lines, None, None))
+    }
+
+    /// Chain of straight-line successors starting at `block` until a block
+    /// with a branch/loop/multiple preds (not the chain start) or `stop`.
+    fn straight_chain(&self, block: BlockId, stop: BlockId) -> Vec<BlockId> {
+        let mut chain = vec![block];
+        let mut cur = block;
+        for _ in 0..32 {
+            if cur == stop {
+                break;
+            }
+            let Some((_, jump, branch)) = self.terminator(cur) else {
+                break;
+            };
+            if branch.is_some() {
+                break;
+            }
+            let Some(next) = jump else {
+                break;
+            };
+            // stop when successor has other predecessors (a join) unless it is `stop`
+            if next != stop && self.func.cfg.predecessors(next).len() > 1 {
+                break;
+            }
+            if self.emitted.contains(&next) && next != block {
+                break;
+            }
+            cur = next;
+            chain.push(cur);
+        }
+        chain
+    }
+
+    fn emit_lines(&mut self, blocks: &[BlockId]) {
+        for &block in blocks {
+            if let Some((lines, _, _)) = self.terminator(block) {
+                for line in lines {
+                    self.lines.push(format!("    {line}"));
+                }
+            }
+            self.emitted.insert(block);
+        }
+    }
+
+    /// Structural region walk: if/else diamonds, while loops, linear chains.
+    /// Returns false when the CFG defies structuring (caller falls back to
+    /// the linear emitters) — all-or-nothing keeps output consistent.
+    fn walk(&mut self, block: BlockId) -> bool {
+        if self.lines.len() > REGION_WALK_MAX_LINES {
+            return false;
+        }
+        self.depth += 1;
+        if self.depth > REGION_WALK_MAX_DEPTH {
+            self.depth -= 1;
+            return false;
+        }
+        let result = self.walk_inner(block);
+        self.depth -= 1;
+        result
+    }
+
+    fn walk_inner(&mut self, block: BlockId) -> bool {
+        if self.emitted.contains(&block) {
+            return true; // already rendered via another path
+        }
+        if self.switch_blocks.contains(&block) {
+            return false; // switch regions handled by dedicated emitter
+        }
+        let Some((prelude, jump, branch)) = self.terminator(block) else {
+            return false;
+        };
+        for line in &prelude {
+            self.lines.push(format!("    {line}"));
+        }
+        self.emitted.insert(block);
+
+        if let Some((cond, t, f)) = branch {
+            // Loop? target dominates this block => back edge to loop head.
+            if self.func.dom_tree.dominates(t, block) {
+                return self.emit_loop(block, &cond, t, f);
+            }
+            if self.func.dom_tree.dominates(f, block) {
+                return self.emit_loop(block, &negate_condition_text(&cond), f, t);
+            }
+            return self.emit_if_else(block, &cond, t, f);
+        }
+        if let Some(target) = jump {
+            if self.func.dom_tree.dominates(target, block) {
+                return self.emit_loop(block, "true", target, target);
+            }
+            return self.walk_chain(target);
+        }
+        true
+    }
+
+    /// Branch whose target is a back edge: render loop head + body.
+    fn emit_loop(&mut self, head: BlockId, cond: &str, back: BlockId, exit: BlockId) -> bool {
+        let body_start = if back == head { exit } else { head };
+        let _ = body_start;
+        self.lines.push(format!("    while ({cond}) {{"));
+        // body = blocks strictly between head and back along successor chain
+        let mut body_ok = true;
+        if back != head {
+            let chain = self.straight_chain(head, back);
+            self.emit_lines(&chain);
+            if !self.emitted.contains(&back) {
+                body_ok = self.walk(back);
+            }
+        }
+        self.lines.push("    }".to_string());
+        if !body_ok {
+            return false;
+        }
+        if self.emitted.contains(&exit) {
+            return true;
+        }
+        self.walk_chain(exit)
+    }
+
+    /// Diamond/chain if-else: one arm falls to join; render arm bodies.
+    fn emit_if_else(&mut self, _block: BlockId, cond: &str, t: BlockId, f: BlockId) -> bool {
+        let join = self.join_of(t, f);
+        let t_chain = self.straight_chain(t, join);
+        let f_chain = self.straight_chain(f, join);
+        if t == join && f == join {
+            // pure guard: emit as if (cond) {} — collapse to condition comment
+            self.lines.push(format!("    if ({cond}) {{}}"));
+            return self.walk_chain(join);
+        }
+        if t == join || t_chain.is_empty() {
+            self.lines
+                .push(format!("    if ({}) {{", negate_condition_text(cond)));
+            self.emit_lines(&f_chain);
+            self.lines.push("    }".to_string());
+        } else if f == join || f_chain.is_empty() {
+            self.lines.push(format!("    if ({cond}) {{"));
+            self.emit_lines(&t_chain);
+            self.lines.push("    }".to_string());
+        } else {
+            self.lines.push(format!("    if ({cond}) {{"));
+            self.emit_lines(&t_chain);
+            self.lines.push("    } else {".to_string());
+            self.emit_lines(&f_chain);
+            self.lines.push("    }".to_string());
+        }
+        // recurse into nested structures inside arms (walk handled chain-only
+        // straight lines; nested branches were emitted flat — acceptable v1)
+        if self.emitted.contains(&join) {
+            return true;
+        }
+        self.walk_chain(join)
+    }
+
+    /// Common target where both arms converge (nearest by dominance).
+    fn join_of(&self, t: BlockId, f: BlockId) -> BlockId {
+        if t == f {
+            return t;
+        }
+        // walk t's dominance chain; first block that is also reachable as
+        // f's dominator ancestor is the join
+        let mut cur = Some(t);
+        while let Some(b) = cur {
+            if self.func.dom_tree.dominates(b, f) || b == f {
+                return b;
+            }
+            cur = self.func.dom_tree.idom_of(b);
+        }
+        f
+    }
+
+    /// Emit an unvisited straight-line run, then continue structurally.
+    fn walk_chain(&mut self, block: BlockId) -> bool {
+        if self.emitted.contains(&block) {
+            return true;
+        }
+        let chain = self.straight_chain(block, block);
+        self.emit_lines(&chain);
+        let Some(last) = chain.last().copied() else {
+            return true;
+        };
+        if last != block || chain.len() == 1 {
+            // continue from the last block's terminator
+        }
+        let Some((_, jump, branch)) = self.terminator(last) else {
+            return false;
+        };
+        if let Some((cond, t, f)) = branch {
+            if self.func.dom_tree.dominates(t, last) {
+                return self.emit_loop(last, &cond, t, f);
+            }
+            if self.func.dom_tree.dominates(f, last) {
+                return self.emit_loop(last, &negate_condition_text(&cond), f, t);
+            }
+            return self.emit_if_else(last, &cond, t, f);
+        }
+        match jump {
+            Some(target) => {
+                if self.func.dom_tree.dominates(target, last) {
+                    self.lines.push("    while (true) {".to_string());
+                    let chain2 = self.straight_chain(target, last);
+                    self.emit_lines(&chain2);
+                    self.lines.push("    }".to_string());
+                    true
+                } else {
+                    self.walk_chain(target)
+                }
+            }
+            None => true,
+        }
+    }
+}
+
+/// Attempt whole-function region structuring. Returns false (and leaves
+/// `lines` untouched) when the CFG resists — the caller falls back to the
+/// battle-tested linear emitters.
+fn emit_ssa_region_tree(
+    func: &SsaFunction,
+    name: &str,
+    symbols: &HashMap<u64, String>,
+    local_symbols: &HashMap<u64, String>,
+    switch_blocks: &HashSet<BlockId>,
+    lines: &mut Vec<String>,
+) -> bool {
+    // large lifts may have lower SSA quality, but region structuring only
+    // reorganizes the block graph and falls back per-block, so the block
+    // count bound is the real safety limit here.
+    if func.cfg.blocks.is_empty() || func.cfg.blocks.len() > 96 {
+        region_walk_trace(&format!("disabled: {name}"));
+        return false;
+    }
+    let mut walk = RegionWalk::new(func, symbols, local_symbols, switch_blocks);
+    if !walk.walk(func.cfg.entry) {
+        region_walk_trace(&format!("aborted: {name}"));
+        return false;
+    }
+    // any block left unrendered (unreachable or stray) => fallback keeps
+    // output complete
+    // Partial structuring: linearly emit whatever the walk could not place
+    // (stray joins, odd arms) so output is always complete.
+    for block in &func.cfg.blocks {
+        if walk.emitted.contains(&block.id) || is_pure_jump_block(func, block.id) {
+            continue;
+        }
+        region_walk_trace(&format!("tail: {name} bb{}", block.id.0));
+        let mut scratch = Vec::new();
+        let mut emitted_scratch = walk.emitted.clone();
+        emit_ssa_block_linear(
+            func,
+            block,
+            symbols,
+            local_symbols,
+            &mut emitted_scratch,
+            &mut scratch,
+        );
+        for line in scratch {
+            walk.lines.push(line);
+        }
+    }
+    if walk.lines.is_empty() {
+        region_walk_trace(&format!("empty: {name}"));
+        return false;
+    }
+    lines.extend(walk.lines);
+    true
+}
+
+fn region_walk_trace(message: &str) {
+    if std::env::var("REVX_REGION_TRACE").is_ok_and(|v| !v.is_empty()) {
+        eprintln!("[region-walk] {message}");
+    }
 }
 
 /// Textual common-subexpression elimination for call results (jadx-style
