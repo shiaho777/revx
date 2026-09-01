@@ -6693,6 +6693,7 @@ fn render_ssa_pseudocode_named_layered_with_strings_arc_inner(
 /// Region-tree structuring state for one render pass.
 struct RegionWalk<'a> {
     func: &'a SsaFunction,
+    dom_tree: &'a DominatorTree,
     symbols: &'a HashMap<u64, String>,
     local_symbols: &'a HashMap<u64, String>,
     switch_blocks: &'a HashSet<BlockId>,
@@ -6714,12 +6715,14 @@ type BlockTerm = (
 impl<'a> RegionWalk<'a> {
     fn new(
         func: &'a SsaFunction,
+        dom_tree: &'a DominatorTree,
         symbols: &'a HashMap<u64, String>,
         local_symbols: &'a HashMap<u64, String>,
         switch_blocks: &'a HashSet<BlockId>,
     ) -> Self {
         Self {
             func,
+            dom_tree,
             symbols,
             local_symbols,
             switch_blocks,
@@ -6838,16 +6841,16 @@ impl<'a> RegionWalk<'a> {
 
         if let Some((cond, t, f)) = branch {
             // Loop? target dominates this block => back edge to loop head.
-            if self.func.dom_tree.dominates(t, block) {
+            if self.dom_tree.dominates(t, block) {
                 return self.emit_loop(block, &cond, t, f);
             }
-            if self.func.dom_tree.dominates(f, block) {
+            if self.dom_tree.dominates(f, block) {
                 return self.emit_loop(block, &negate_condition_text(&cond), f, t);
             }
             return self.emit_if_else(block, &cond, t, f);
         }
         if let Some(target) = jump {
-            if self.func.dom_tree.dominates(target, block) {
+            if self.dom_tree.dominates(target, block) {
                 return self.emit_loop(block, "true", target, target);
             }
             return self.walk_chain(target);
@@ -6879,13 +6882,64 @@ impl<'a> RegionWalk<'a> {
         self.walk_chain(exit)
     }
 
-    /// Diamond/chain if-else: one arm falls to join; render arm bodies.
+    /// Diamond/chain if-else with early-exit handling.
+    ///
+    /// JNI-style functions branch to a shared cleanup block from many sites.
+    /// When one arm is a short chain (<= 2 blocks) leading to a far join that
+    /// the other arm's continuation reaches only much later, an if/else would
+    /// drag the whole main body into the wrong nesting. Emit the short arm as
+    /// an explicit `goto bbN;` guard and keep the main path linear instead.
     fn emit_if_else(&mut self, _block: BlockId, cond: &str, t: BlockId, f: BlockId) -> bool {
         let join = self.join_of(t, f);
         let t_chain = self.straight_chain(t, join);
         let f_chain = self.straight_chain(f, join);
+
+        // early-exit detection: short arm + high-fanin join
+        let short_arm_is_true = t_chain.len() <= 2 && t_chain.last() != Some(&join);
+        let short_arm_is_false = f_chain.len() <= 2 && f_chain.last() != Some(&join);
+        let join_is_far = self.func.cfg.predecessors(join).len() >= 3
+            && (t_chain.len() >= 4 || f_chain.len() >= 4);
+        if join_is_far && (short_arm_is_true || short_arm_is_false) {
+            let (short_cond, short_target) = if short_arm_is_true {
+                (cond.to_string(), t)
+            } else {
+                (negate_condition_text(cond), f)
+            };
+            self.lines
+                .push(format!("    if ({short_cond}) goto bb{};", short_target.0));
+            // main path continues through the long arm; the join block itself
+            // is walked later (cleanup), not now.
+            let (long_chain, last) = if short_arm_is_true {
+                let l = f_chain.last().copied();
+                (f_chain, l)
+            } else {
+                let l = t_chain.last().copied();
+                (t_chain, l)
+            };
+            self.emit_lines(&long_chain);
+            let Some(last) = last else {
+                return true;
+            };
+            let Some((_, jump, branch)) = self.terminator(last) else {
+                return false;
+            };
+            if let Some((cond2, t2, f2)) = branch {
+                return self.walk_branch_from(last, &cond2, t2, f2);
+            }
+            if let Some(target) = jump {
+                if self.dom_tree.dominates(target, last) {
+                    self.lines.push("    while (true) {".to_string());
+                    let chain2 = self.straight_chain(target, last);
+                    self.emit_lines(&chain2);
+                    self.lines.push("    }".to_string());
+                    return true;
+                }
+                return self.walk_chain(target);
+            }
+            return true;
+        }
+
         if t == join && f == join {
-            // pure guard: emit as if (cond) {} — collapse to condition comment
             self.lines.push(format!("    if ({cond}) {{}}"));
             return self.walk_chain(join);
         }
@@ -6905,27 +6959,63 @@ impl<'a> RegionWalk<'a> {
             self.emit_lines(&f_chain);
             self.lines.push("    }".to_string());
         }
-        // recurse into nested structures inside arms (walk handled chain-only
-        // straight lines; nested branches were emitted flat — acceptable v1)
         if self.emitted.contains(&join) {
             return true;
         }
         self.walk_chain(join)
     }
 
-    /// Common target where both arms converge (nearest by dominance).
+    /// Branch dispatch shared by walk/walk_chain/early-exit continuation.
+    fn walk_branch_from(&mut self, from: BlockId, cond: &str, t: BlockId, f: BlockId) -> bool {
+        if self.dom_tree.dominates(t, from) {
+            return self.emit_loop(from, cond, t, f);
+        }
+        if self.dom_tree.dominates(f, from) {
+            return self.emit_loop(from, &negate_condition_text(cond), f, t);
+        }
+        self.emit_if_else(from, cond, t, f)
+    }
+
+    /// Nearest common dominator of the two arm entries (the diamond's join).
+    /// Climbs both idom chains to their first intersection, which for
+    /// early-exit patterns lands on the shared cleanup block rather than the
+    /// branch header itself.
     fn join_of(&self, t: BlockId, f: BlockId) -> BlockId {
         if t == f {
             return t;
         }
-        // walk t's dominance chain; first block that is also reachable as
-        // f's dominator ancestor is the join
-        let mut cur = Some(t);
-        while let Some(b) = cur {
-            if self.func.dom_tree.dominates(b, f) || b == f {
-                return b;
+        let mut chain_t = vec![t];
+        let mut cur = t;
+        for _ in 0..self.func.cfg.blocks.len() {
+            let Some(dom) = self.dom_tree.idom_of(cur) else {
+                break;
+            };
+            chain_t.push(dom);
+            if dom == cur {
+                break;
             }
-            cur = self.func.dom_tree.idom_of(b);
+            cur = dom;
+        }
+        cur = f;
+        if std::env::var("REVX_REGION_TRACE").is_ok() {
+            eprintln!(
+                "[region-walk] join_of t=bb{} f=bb{} chain_t={:?}",
+                t.0,
+                f.0,
+                chain_t.iter().map(|b| b.0).collect::<Vec<_>>()
+            );
+        }
+        for _ in 0..=self.func.cfg.blocks.len() {
+            if let Some(pos) = chain_t.iter().position(|&b| b == cur) {
+                return chain_t[pos];
+            }
+            let Some(dom) = self.dom_tree.idom_of(cur) else {
+                break;
+            };
+            if dom == cur {
+                break;
+            }
+            cur = dom;
         }
         f
     }
@@ -6947,17 +7037,17 @@ impl<'a> RegionWalk<'a> {
             return false;
         };
         if let Some((cond, t, f)) = branch {
-            if self.func.dom_tree.dominates(t, last) {
+            if self.dom_tree.dominates(t, last) {
                 return self.emit_loop(last, &cond, t, f);
             }
-            if self.func.dom_tree.dominates(f, last) {
+            if self.dom_tree.dominates(f, last) {
                 return self.emit_loop(last, &negate_condition_text(&cond), f, t);
             }
             return self.emit_if_else(last, &cond, t, f);
         }
         match jump {
             Some(target) => {
-                if self.func.dom_tree.dominates(target, last) {
+                if self.dom_tree.dominates(target, last) {
                     self.lines.push("    while (true) {".to_string());
                     let chain2 = self.straight_chain(target, last);
                     self.emit_lines(&chain2);
@@ -6990,7 +7080,16 @@ fn emit_ssa_region_tree(
         region_walk_trace(&format!("disabled: {name}"));
         return false;
     }
-    let mut walk = RegionWalk::new(func, symbols, local_symbols, switch_blocks);
+    // lift_*_to_ssa uses new_shallow (empty dominator tree); compute one for
+    // the walk. Cheap: single pass over <= 96 blocks.
+    let owned_tree;
+    let dom_tree = if func.dom_tree.idom.is_empty() {
+        owned_tree = DominatorTree::compute(&func.cfg);
+        &owned_tree
+    } else {
+        &func.dom_tree
+    };
+    let mut walk = RegionWalk::new(func, dom_tree, symbols, local_symbols, switch_blocks);
     if !walk.walk(func.cfg.entry) {
         region_walk_trace(&format!("aborted: {name}"));
         return false;
