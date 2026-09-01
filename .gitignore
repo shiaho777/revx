@@ -2,3 +2,14 @@
 /.revx
 *.db
 *.log
+# ghidra vendored build artifacts (sources are committed)
+third_party/ghidra-decompiler/cpp/*.o
+third_party/ghidra-decompiler/cpp/decomp_opt
+third_party/ghidra-decompiler/cpp/decomp_dbg
+third_party/ghidra-decompiler/cpp/sleigh_opt
+third_party/ghidra-decompiler/cpp/sleigh_dbg
+third_party/ghidra-decompiler/cpp/*.a
+third_party/ghidra-decompiler/cpp/com_*/
+third_party/ghidra-decompiler/cpp/sla_*/
+third_party/ghidra-decompiler/cpp/ghi_*/
+third_party/ghidra-decompiler/cpp/gpl_excluded/
