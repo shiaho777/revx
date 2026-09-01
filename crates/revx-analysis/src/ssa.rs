@@ -727,6 +727,38 @@ fn frame_slot_name_from_parts(base_text: &str, offset: i64) -> Option<&'static s
     None
 }
 
+/// Callee-saved / argument spill into stack frame: `*(sp ± ...)(+ off) = x2x;`
+/// or `*(...)= arg_N;` — register-save prologue noise, never a real operation.
+fn is_callee_saved_spill(rendered: &str) -> bool {
+    let t = rendered.trim().trim_end_matches(';');
+    let Some((lhs, rhs)) = t.split_once('=') else {
+        return false;
+    };
+    let rhs = rhs.trim();
+    let rhs_deref = rhs.split('[').next().map(str::trim).unwrap_or(rhs);
+    let is_spilled_value = is_callee_saved_reg(rhs)
+        || is_callee_saved_reg(rhs_deref)
+        || rhs == "x30"
+        || rhs == "fp"
+        || rhs == "lr"
+        || rhs.starts_with("arg_");
+    if !is_spilled_value {
+        return false;
+    }
+    let lhs = lhs.trim();
+    lhs.starts_with("*((sp ")
+        || lhs.starts_with("*(sp ")
+        || lhs.starts_with("*((x29 ")
+        || lhs.starts_with("*(x29 ")
+}
+
+fn is_callee_saved_reg(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix('x') else {
+        return false;
+    };
+    rest.parse::<u32>().is_ok_and(|n| (19..=29).contains(&n))
+}
+
 fn is_trivial_stack_prologue_store(rendered: &str) -> bool {
     let t = rendered.trim();
     if !t.contains('=') {
@@ -6932,7 +6964,7 @@ fn emit_ssa_block_linear_ultra(
         match &inst.op {
             SsaOp::Store { .. } => {
                 let rendered = render_named_value(func, inst.id, symbols, local_symbols);
-                if is_trivial_stack_prologue_store(&rendered) {
+                if is_trivial_stack_prologue_store(&rendered) || is_callee_saved_spill(&rendered) {
                     continue;
                 }
                 lines.push(format!("{pad}{rendered};"));
@@ -7025,7 +7057,7 @@ fn emit_ssa_block_linear_simple(
                     continue;
                 }
                 let rendered = render_named_value(func, inst.id, symbols, local_symbols);
-                if is_trivial_stack_prologue_store(&rendered) {
+                if is_trivial_stack_prologue_store(&rendered) || is_callee_saved_spill(&rendered) {
                     continue;
                 }
                 lines.push(format!("{pad}{rendered};"));
@@ -8373,7 +8405,7 @@ fn block_simple_global_store_jump(
                     continue;
                 }
                 let r = render_named_value(func, inst.id, symbols, local_symbols);
-                if is_trivial_stack_prologue_store(&r) {
+                if is_trivial_stack_prologue_store(&r) || is_callee_saved_spill(&r) {
                     continue;
                 }
                 if store.is_some() {
@@ -8501,7 +8533,7 @@ fn block_collect_side_effects(
                     continue;
                 }
                 let r = render_named_value(func, inst.id, symbols, local_symbols);
-                if is_trivial_stack_prologue_store(&r) {
+                if is_trivial_stack_prologue_store(&r) || is_callee_saved_spill(&r) {
                     continue;
                 }
                 lines.push(format!("{r};"));
@@ -9368,7 +9400,7 @@ fn try_emit_exit_epilogue(
             SsaOp::Store { .. } => {
                 if !store_is_stack_arg_for_call(func, inst.id) {
                     let r = render_named_value(func, inst.id, symbols, local_symbols);
-                    if !is_trivial_stack_prologue_store(&r) {
+                    if !is_trivial_stack_prologue_store(&r) && !is_callee_saved_spill(&r) {
                         return false;
                     }
                 }
@@ -9877,7 +9909,9 @@ fn try_emit_and_guard_assign(
                         continue;
                     }
                     let rendered = render_named_value(func, inst.id, symbols, local_symbols);
-                    if is_trivial_stack_prologue_store(&rendered) {
+                    if is_trivial_stack_prologue_store(&rendered)
+                        || is_callee_saved_spill(&rendered)
+                    {
                         continue;
                     }
                     local_store = Some(rendered);
@@ -10278,7 +10312,7 @@ fn try_emit_getbsize_guard(
                         continue;
                     }
                     let r = render_named_value(func, inst.id, symbols, local_symbols);
-                    if is_trivial_stack_prologue_store(&r) {
+                    if is_trivial_stack_prologue_store(&r) || is_callee_saved_spill(&r) {
                         continue;
                     }
                     block_lines.push(format!("{r};"));
@@ -10331,7 +10365,7 @@ fn try_emit_getbsize_guard(
                                 continue;
                             }
                             let r = render_named_value(func, inst.id, symbols, local_symbols);
-                            if is_trivial_stack_prologue_store(&r) {
+                            if is_trivial_stack_prologue_store(&r) || is_callee_saved_spill(&r) {
                                 continue;
                             }
                             if r.contains("g_blocksize") {
@@ -10669,7 +10703,7 @@ fn emit_ssa_block_linear(
                     continue;
                 }
                 let rendered = render_named_value(func, inst.id, symbols, local_symbols);
-                if is_trivial_stack_prologue_store(&rendered) {
+                if is_trivial_stack_prologue_store(&rendered) || is_callee_saved_spill(&rendered) {
                     continue;
                 }
                 lines.push(format!("{pad}{rendered};"));
