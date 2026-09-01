@@ -426,14 +426,12 @@ fn cmd_decompile(query: &str, engine: Option<&str>) -> Result<(), String> {
         let name = function.name.rsplit("::").next().unwrap_or(&function.name);
         let c_text = ghidra_bridge::try_decompile(&image_path, function.address, name)?;
         match c_text {
-            Some(text) => {
-                print_json(&json!({
-                    "engine": "ghidra",
-                    "function": function.name,
-                    "address": function.address,
-                    "pseudocode": { "language": "c", "text": text }
-                }))
-            }
+            Some(text) => print_json(&json!({
+                "engine": "ghidra",
+                "function": function.name,
+                "address": function.address,
+                "pseudocode": { "language": "c", "text": text }
+            })),
             None => Err(
                 "ghidra engine not found: build third_party/ghidra-decompiler (see its README.md)"
                     .to_string(),
@@ -446,7 +444,9 @@ fn cmd_decompile(query: &str, engine: Option<&str>) -> Result<(), String> {
 
 /// Resolve the on-disk image path for a function address from the workspace.
 fn binary_path_for(address: &u64) -> Result<String, String> {
-    let records = workspace_from_cwd()?.binary_record_list().map_err(|e| e.to_string())?;
+    let records = workspace_from_cwd()?
+        .binary_record_list()
+        .map_err(|e| e.to_string())?;
     for record in &records {
         // functions live under the single analyzed image in thin-CLI workspaces
         if record.function_count > 0 {

@@ -8,7 +8,6 @@
 //! 3. drives the console decompiler: load → load addr → decompile → print C
 //! 4. returns the C text; diagnostics arrive on unbuffered stderr
 
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -85,7 +84,9 @@ impl GhidraBridge {
     /// Ensure the AARCH64 sla + spec XMLs exist under sleigh_home, compiling
     /// them from the vendored upstream layout on first use.
     pub fn ensure_specs(&self) -> Result<(), String> {
-        let lang_dir = self.sleigh_home.join("Ghidra/Processors/AARCH64/data/languages");
+        let lang_dir = self
+            .sleigh_home
+            .join("Ghidra/Processors/AARCH64/data/languages");
         if lang_dir.join("AARCH64.sla").is_file() {
             return Ok(());
         }
@@ -128,11 +129,7 @@ impl GhidraBridge {
 
     /// Emit the binaryimage XML: one hex bytechunk covering from the segment
     /// base through the end of the executable mapping (function + callees).
-    fn write_image_xml(
-        &self,
-        input: &GhidraInput,
-        out_path: &Path,
-    ) -> Result<(), String> {
+    fn write_image_xml(&self, input: &GhidraInput, out_path: &Path) -> Result<(), String> {
         let bytes = std::fs::read(&input.image_path).map_err(|e| e.to_string())?;
         let (seg_file_off, seg_vaddr, seg_filesz) = elf_exec_segment(&bytes, input.address)
             .ok_or_else(|| "function address outside any executable PT_LOAD".to_string())?;
@@ -167,7 +164,7 @@ impl GhidraBridge {
         std::fs::write(&script_path, script).map_err(|e| e.to_string())?;
 
         let script_in = std::fs::File::open(&script_path).map_err(|e| e.to_string())?;
-        let mut child = Command::new(&self.decomp_bin)
+        let child = Command::new(&self.decomp_bin)
             .env("SLEIGHHOME", &self.sleigh_home)
             .stdin(Stdio::from(script_in))
             .stdout(Stdio::piped())
@@ -186,8 +183,7 @@ impl GhidraBridge {
         }
         // console output is routed to unbuffered stderr (VENDORED.md mod #4),
         // while `print C` body flows to the same stream; join both.
-        let mut transcript =
-            String::from_utf8_lossy(&output.stdout).into_owned();
+        let mut transcript = String::from_utf8_lossy(&output.stdout).into_owned();
         transcript.push_str(&String::from_utf8_lossy(&output.stderr));
         let c_text = extract_print_c(&transcript).ok_or_else(|| {
             format!(
@@ -238,11 +234,7 @@ fn extract_print_c(transcript: &str) -> Option<String> {
     let rest = &transcript[start..];
     let end = rest.find("[decomp]> quit").unwrap_or(rest.len());
     let c = rest[..end].trim().to_string();
-    if c.is_empty() {
-        None
-    } else {
-        Some(c)
-    }
+    if c.is_empty() { None } else { Some(c) }
 }
 
 /// Convenience used by the CLI: returns Some(c_text) when the ghidra engine
@@ -263,7 +255,13 @@ pub fn try_decompile(image_path: &str, address: u64, name: &str) -> Result<Optio
 fn sanitize_symbol(name: &str) -> String {
     let cleaned: String = name
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     if cleaned.is_empty() || cleaned.chars().next().is_some_and(|c| c.is_ascii_digit()) {
         format!("revx_fn_{cleaned}")
@@ -311,18 +309,19 @@ mod tests {
     #[test]
     fn sanitize_symbol() {
         assert_eq!(super::sanitize_symbol("decrypt"), "decrypt");
-        assert_eq!(super::sanitize_symbol("Java_a_b_decrypt"), "Java_a_b_decrypt");
+        assert_eq!(
+            super::sanitize_symbol("Java_a_b_decrypt"),
+            "Java_a_b_decrypt"
+        );
         assert_eq!(super::sanitize_symbol("weird name!"), "weird_name_");
         assert_eq!(super::sanitize_symbol("0addr"), "revx_fn_0addr");
     }
 
     #[test]
     fn extract_print_c_basic() {
-        let t = "[decomp]> load file x\n[decomp]> print C\n\nint f() { return 0; }\n[decomp]> quit\n";
-        assert_eq!(
-            extract_print_c(t).as_deref(),
-            Some("int f() { return 0; }")
-        );
+        let t =
+            "[decomp]> load file x\n[decomp]> print C\n\nint f() { return 0; }\n[decomp]> quit\n";
+        assert_eq!(extract_print_c(t).as_deref(), Some("int f() { return 0; }"));
         assert_eq!(extract_print_c("no marker"), None);
     }
 }
