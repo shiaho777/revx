@@ -6632,9 +6632,76 @@ fn render_ssa_pseudocode_named_layered_with_strings_arc_inner(
                 );
             }
             lines.push("}".to_string());
-            lines.join("\n")
+            join_lines_fast(&apply_call_result_cse(&lines))
         },
     )
+}
+
+/// Textual common-subexpression elimination for call results (jadx-style
+/// value naming, implemented as a post-pass over the rendered lines).
+///
+/// The block emitters print each call site with its full argument expansion
+/// even when the same call text reappears later (e.g. inside the branch
+/// condition that tests its result). The first `name = call(...)` line owns
+/// the expression; every later verbatim occurrence of `call(...)` is rewritten
+/// to `name`, which reads like a real local and kills the triple-expansion
+/// noise seen on JNI-heavy functions.
+fn apply_call_result_cse(lines: &[String]) -> Vec<String> {
+    let mut bindings: Vec<(String, String)> = Vec::new();
+    let mut out = Vec::with_capacity(lines.len());
+    for line in lines {
+        let trimmed = line.trim_start();
+        let indent_len = line.len() - trimmed.len();
+        let (indent, body) = line.split_at(indent_len);
+        // binding shape: `name = call(args);` or `return call(...);`-adjacent
+        if let Some((name, call_expr)) = split_call_binding(trimmed) {
+            let mut expr = call_expr.clone();
+            for (prev_call, prev_name) in &bindings {
+                if expr.contains(prev_call.as_str()) {
+                    expr = expr.replace(prev_call.as_str(), prev_name);
+                }
+            }
+            if !bindings.iter().any(|(c, _)| c == &expr) {
+                bindings.push((expr.clone(), name.to_string()));
+            }
+            out.push(format!("{indent}{name} = {expr};"));
+            continue;
+        }
+        let mut rewritten = body.to_string();
+        for (call_expr, name) in &bindings {
+            if rewritten.contains(call_expr.as_str()) {
+                rewritten = rewritten.replace(call_expr.as_str(), name);
+            }
+        }
+        out.push(format!("{indent}{rewritten}"));
+    }
+    out
+}
+
+/// `name = call(args);` → Some((name, "call(args)")); None otherwise.
+fn split_call_binding(trimmed: &str) -> Option<(String, String)> {
+    let eq = trimmed.find(" = ")?;
+    let name = &trimmed[..eq];
+    if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return None;
+    }
+    let rest = trimmed[eq + 3..].strip_suffix(';')?;
+    let open = rest.find('(')?;
+    let close = rest.rfind(')')?;
+    if close + 1 != rest.len() || open == 0 {
+        return None;
+    }
+    let callee = &rest[..open];
+    if callee.contains(' ')
+        || callee.contains('(')
+        || !callee
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+    {
+        return None;
+    }
+    Some((name.to_string(), rest.to_string()))
 }
 
 pub fn render_ssa_pseudocode_linear_with_string_arc(
@@ -12671,6 +12738,42 @@ pub fn ssa_pseudocode_regions(
 
 #[cfg(test)]
 mod string_call_tests {
+    #[test]
+    fn cse_replaces_repeated_call_text_with_result_name() {
+        let lines = vec![
+            "    r_sub_7440 = sub_7440(arg_0);".to_string(),
+            "    if ((sub_7440(arg_0) & 1) != 0) goto bb4;".to_string(),
+            "    r_sub_62e0 = sub_62e0(sub_7440(arg_0));".to_string(),
+        ];
+        let out = apply_call_result_cse(&lines);
+        assert_eq!(out[0], "    r_sub_7440 = sub_7440(arg_0);");
+        assert_eq!(out[1], "    if ((r_sub_7440 & 1) != 0) goto bb4;");
+        assert_eq!(out[2], "    r_sub_62e0 = sub_62e0(r_sub_7440);");
+    }
+
+    #[test]
+    fn cse_ignores_non_binding_and_non_call_lines() {
+        let lines = vec![
+            "    *(sp - 0x10) = x29;".to_string(),
+            "    if (x != foo) goto bb2;".to_string(),
+            "    if ((x & 1) != 0) goto bb4;".to_string(),
+        ];
+        let out = apply_call_result_cse(&lines);
+        assert_eq!(out, lines);
+    }
+
+    #[test]
+    fn cse_binds_each_distinct_call_once() {
+        let lines = vec![
+            "    r_a = alpha(x1);".to_string(),
+            "    r_b = beta(alpha(x1), alpha(x1));".to_string(),
+            "    r_c = alpha(x1);".to_string(),
+        ];
+        let out = apply_call_result_cse(&lines);
+        assert_eq!(out[1], "    r_b = beta(r_a, r_a);");
+        assert_eq!(out[2], "    r_c = r_a;");
+    }
+
     use super::*;
     use revx_core::{BasicBlock, Instruction, Reference, ReferenceKind};
     use std::sync::Arc;
