@@ -5,6 +5,8 @@ use std::env;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+mod ghidra_bridge;
+
 fn main() {
     if let Err(err) = run() {
         eprintln!("error: {err}");
@@ -64,7 +66,8 @@ fn run() -> Result<(), String> {
                 .get(1)
                 .cloned()
                 .ok_or_else(|| "usage: revx decompile <query>".to_string())?;
-            cmd_decompile(&query)
+            let engine = parse_opt_flag(&args[1..], "--engine");
+            cmd_decompile(&query, engine.as_deref())
         }
         "disasm" => {
             let query = args
@@ -409,13 +412,48 @@ fn cmd_func(query: &str) -> Result<(), String> {
     print_json(&json!({ "function": function }))
 }
 
-fn cmd_decompile(query: &str) -> Result<(), String> {
+fn cmd_decompile(query: &str, engine: Option<&str>) -> Result<(), String> {
     let ws = workspace_from_cwd()?;
     let function = ws
         .resolve_function(query)
         .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("function not found: {query}"))?;
-    print_json(&json!({ "pseudocode": function.pseudocode }))
+    if engine == Some("ghidra") {
+        // Vendored Ghidra core: feed function bytes as a binaryimage XML and
+        // hand back native-quality C. Falls through to an error when the
+        // vendored binary has not been built (see third_party README).
+        let image_path = binary_path_for(&function.address)?;
+        let name = function.name.rsplit("::").next().unwrap_or(&function.name);
+        let c_text = ghidra_bridge::try_decompile(&image_path, function.address, name)?;
+        match c_text {
+            Some(text) => {
+                print_json(&json!({
+                    "engine": "ghidra",
+                    "function": function.name,
+                    "address": function.address,
+                    "pseudocode": { "language": "c", "text": text }
+                }))
+            }
+            None => Err(
+                "ghidra engine not found: build third_party/ghidra-decompiler (see its README.md)"
+                    .to_string(),
+            ),
+        }
+    } else {
+        print_json(&json!({ "pseudocode": function.pseudocode }))
+    }
+}
+
+/// Resolve the on-disk image path for a function address from the workspace.
+fn binary_path_for(address: &u64) -> Result<String, String> {
+    let records = workspace_from_cwd()?.binary_record_list().map_err(|e| e.to_string())?;
+    for record in &records {
+        // functions live under the single analyzed image in thin-CLI workspaces
+        if record.function_count > 0 {
+            return Ok(record.path.clone());
+        }
+    }
+    Err(format!("no analyzed binary contains address {address:#x}"))
 }
 
 fn cmd_disasm(query: &str) -> Result<(), String> {
