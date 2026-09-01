@@ -727,6 +727,23 @@ fn frame_slot_name_from_parts(base_text: &str, offset: i64) -> Option<&'static s
     None
 }
 
+/// ARM64 stack-protector frame guard: `reg[0x28] != *(x29 - 0x10)` compares
+/// the stack canary; compiler-generated, never interesting to a reader.
+fn is_stack_protector_guard(cond: &str) -> bool {
+    let compact = cond.replace(' ', "");
+    (compact.contains("[0x28]") && compact.contains("(x29-0x10)"))
+        || (compact.contains("[0x28]") && compact.contains("(x29+0x10)"))
+}
+
+/// Self-assignment noise like `r_stack_chk_fail = r_stack_chk_fail;`
+fn is_self_assignment(rendered: &str) -> bool {
+    let t = rendered.trim().trim_end_matches(';');
+    let Some((lhs, rhs)) = t.split_once('=') else {
+        return false;
+    };
+    lhs.trim() == rhs.trim() && lhs.trim().starts_with("r_stack_chk_fail")
+}
+
 /// Callee-saved / argument spill into stack frame: `*(sp ± ...)(+ off) = x2x;`
 /// or `*(...)= arg_N;` — register-save prologue noise, never a real operation.
 fn is_callee_saved_spill(rendered: &str) -> bool {
@@ -11212,7 +11229,10 @@ fn emit_ssa_block_linear(
                     continue;
                 }
                 let rendered = render_named_value(func, inst.id, symbols, local_symbols);
-                if is_trivial_stack_prologue_store(&rendered) || is_callee_saved_spill(&rendered) {
+                if is_trivial_stack_prologue_store(&rendered)
+                    || is_callee_saved_spill(&rendered)
+                    || is_self_assignment(&rendered)
+                {
                     continue;
                 }
                 lines.push(format!("{pad}{rendered};"));
@@ -11247,6 +11267,9 @@ fn emit_ssa_block_linear(
                     let call = render_named_value(func, vid, symbols, local_symbols);
                     cond_text = if negated { format!("!{call}") } else { call };
                     cond_text = simplify_condition_text(cond_text);
+                }
+                if is_stack_protector_guard(&cond_text) {
+                    continue;
                 }
                 let t = resolve_jump_target(func, *true_block);
                 let f = resolve_jump_target(func, *false_block);
