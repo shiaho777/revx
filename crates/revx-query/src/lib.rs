@@ -441,7 +441,7 @@ impl QueryWorkspace {
         if let Some(address) = parse_address(query) {
             let row = conn
                 .query_row(
-                    "SELECT address, size FROM functions WHERE address = ?1 LIMIT 1",
+                    "SELECT address, size FROM functions WHERE address = ?1 ORDER BY (pseudocode_artifact_path IS NULL OR pseudocode_artifact_path = '') ASC, rowid DESC LIMIT 1",
                     [address as i64],
                     |row| Ok((row.get::<_, i64>(0)? as u64, row.get::<_, i64>(1)? as u64)),
                 )
@@ -451,7 +451,7 @@ impl QueryWorkspace {
         let pattern = format!("%{query}%");
         let row = conn
             .query_row(
-                "SELECT address, size FROM functions WHERE name = ?1 OR name LIKE ?2 ORDER BY address ASC LIMIT 1",
+                "SELECT address, size FROM functions WHERE name = ?1 OR name LIKE ?2 ORDER BY CASE WHEN name = ?1 THEN 0 ELSE 1 END, (pseudocode_artifact_path IS NULL OR pseudocode_artifact_path = '') ASC, address ASC LIMIT 1",
                 params![query, pattern],
                 |row| Ok((row.get::<_, i64>(0)? as u64, row.get::<_, i64>(1)? as u64)),
             )
@@ -479,7 +479,7 @@ impl QueryWorkspace {
         if let Some(address) = parse_address(query) {
             let row = conn
                 .query_row(
-                    "SELECT name, address, size, function_snapshot_path, pseudocode_artifact_path, stack_summary_json, evidence_ids_json, warnings_json FROM functions WHERE address = ?1 LIMIT 1",
+                    "SELECT name, address, size, function_snapshot_path, pseudocode_artifact_path, stack_summary_json, evidence_ids_json, warnings_json FROM functions WHERE address = ?1 ORDER BY (pseudocode_artifact_path IS NULL OR pseudocode_artifact_path = '') ASC, rowid DESC LIMIT 1",
                     [address as i64],
                     map,
                 )
@@ -489,7 +489,7 @@ impl QueryWorkspace {
         let pattern = format!("%{query}%");
         let row = conn
             .query_row(
-                "SELECT name, address, size, function_snapshot_path, pseudocode_artifact_path, stack_summary_json, evidence_ids_json, warnings_json FROM functions WHERE name = ?1 OR name LIKE ?2 ORDER BY CASE WHEN name = ?1 THEN 0 ELSE 1 END, address ASC LIMIT 1",
+                "SELECT name, address, size, function_snapshot_path, pseudocode_artifact_path, stack_summary_json, evidence_ids_json, warnings_json FROM functions WHERE name = ?1 OR name LIKE ?2 ORDER BY CASE WHEN name = ?1 THEN 0 ELSE 1 END, (pseudocode_artifact_path IS NULL OR pseudocode_artifact_path = '') ASC, address ASC LIMIT 1",
                 params![query, pattern],
                 map,
             )
@@ -674,4 +674,112 @@ fn civil_from_unix(secs: u64) -> (i32, u32, u32, u32, u32, u32) {
 
 fn is_leap(y: i32) -> bool {
     (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+
+    fn seed_dup_workspace() -> QueryWorkspace {
+        let dir = std::env::temp_dir().join(format!(
+            "revx-query-dup-{}-{}",
+            std::process::id(),
+            NEXT_ID.fetch_add(1, Ordering::SeqCst)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let ws = QueryWorkspace::init(&dir, "t").unwrap();
+        let conn = Connection::open(ws.root.join("state.sqlite")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE functions(
+                binary_id TEXT NOT NULL,
+                address INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                size INTEGER NOT NULL,
+                function_snapshot_hash TEXT NOT NULL,
+                function_snapshot_path TEXT NOT NULL,
+                function_snapshot_size INTEGER NOT NULL,
+                pseudocode_artifact_hash TEXT,
+                pseudocode_artifact_path TEXT,
+                pseudocode_artifact_size INTEGER,
+                stack_summary_json TEXT NOT NULL,
+                evidence_ids_json TEXT NOT NULL,
+                warnings_json TEXT NOT NULL DEFAULT '[]'
+            );
+            CREATE TABLE code_references(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                binary_id TEXT NOT NULL,
+                from_addr INTEGER NOT NULL,
+                to_addr INTEGER NOT NULL,
+                kind TEXT NOT NULL
+            );",
+        )
+        .unwrap();
+        std::fs::write(ws.root.join("snap-stale.json"), r#"{"blocks":[]}"#).unwrap();
+        std::fs::write(ws.root.join("snap-rich.json"), r#"{"blocks":[]}"#).unwrap();
+        std::fs::write(ws.root.join("pseudo-rich.json"), r#"{"text":"FULL"}"#).unwrap();
+        conn.execute(
+            "INSERT INTO functions VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+            rusqlite::params![
+                "bin-fast",
+                0xd68i64,
+                "sub_d68",
+                296i64,
+                "h",
+                "snap-stale.json",
+                1i64,
+                Option::<String>::None,
+                Option::<String>::None,
+                Option::<i64>::None,
+                "null",
+                "[]",
+                "[]"
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO functions VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+            rusqlite::params![
+                "bin-full",
+                0xd68i64,
+                "sub_d68",
+                6188i64,
+                "h",
+                "snap-rich.json",
+                1i64,
+                Option::<String>::None,
+                Some("pseudo-rich.json".to_string()),
+                Option::<i64>::None,
+                "null",
+                "[]",
+                "[]"
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO code_references(binary_id, from_addr, to_addr, kind) VALUES (?1,?2,?3,?4)",
+            rusqlite::params!["bin-full", 0x2000i64, 0x2010i64, "call"],
+        )
+        .unwrap();
+        ws
+    }
+
+    #[test]
+    fn resolve_function_prefers_richest_analysis() {
+        let ws = seed_dup_workspace();
+        let by_addr = ws.resolve_function("0xd68").unwrap().unwrap();
+        assert_eq!(by_addr.size, 6188);
+        assert_eq!(
+            by_addr.pseudocode.as_ref().and_then(|v| v.get("text")),
+            Some(&json!("FULL"))
+        );
+        let by_name = ws.resolve_function("sub_d68").unwrap().unwrap();
+        assert_eq!(by_name.size, 6188);
+        let refs = ws.find_references("0xd68").unwrap();
+        assert_eq!(refs.len(), 1);
+        assert_eq!((refs[0].from, refs[0].to), (0x2000, 0x2010));
+        let _ = std::fs::remove_dir_all(ws.root.parent().unwrap());
+    }
 }
