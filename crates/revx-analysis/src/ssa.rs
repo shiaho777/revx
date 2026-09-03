@@ -6675,6 +6675,8 @@ fn render_ssa_pseudocode_named_layered_with_strings_arc_inner(
                 )
             {
                 lines.push("}".to_string());
+                let labels = semantic_block_labels(func);
+                let lines = rename_block_labels(lines, &labels);
                 join_lines_fast(&polish_rendered_lines(&apply_call_result_cse(&lines)))
             } else {
                 for block in &func.cfg.blocks {
@@ -6704,10 +6706,76 @@ fn render_ssa_pseudocode_named_layered_with_strings_arc_inner(
                     );
                 }
                 lines.push("}".to_string());
+                let labels = semantic_block_labels(func);
+                let lines = rename_block_labels(lines, &labels);
                 join_lines_fast(&polish_rendered_lines(&apply_call_result_cse(&lines)))
             }
         },
     )
+}
+
+/// Semantic label names for block ids: blocks targeted by >= 3 guard gotos
+/// become cleanup_N; blocks that only conditionally return become fail_N;
+/// everything else keeps bbN (with address) as before.
+fn semantic_block_labels(func: &SsaFunction) -> HashMap<BlockId, String> {
+    let mut guard_targets: HashMap<BlockId, u32> = HashMap::new();
+    for inst in &func.values {
+        if let SsaOp::Branch { true_block, .. } = &inst.op {
+            *guard_targets
+                .entry(resolve_jump_target(func, *true_block))
+                .or_default() += 1;
+        }
+    }
+    let mut labels = HashMap::new();
+    let mut cleanup_idx = 0usize;
+    let mut fail_idx = 0usize;
+    for block in &func.cfg.blocks {
+        let count = guard_targets.get(&block.id).copied().unwrap_or(0);
+        let has_return = block.insts.iter().any(|iid| {
+            matches!(
+                &func.values.get(iid.0 as usize).map(|i| &i.op),
+                Some(SsaOp::Return { .. })
+            )
+        });
+        if has_return && count >= 1 {
+            fail_idx += 1;
+            labels.insert(block.id, format!("fail_{fail_idx}"));
+        } else if count >= 3 {
+            cleanup_idx += 1;
+            labels.insert(block.id, format!("cleanup_{cleanup_idx}"));
+        }
+    }
+    labels
+}
+
+/// Rewrite `// bbN @ addr` label comments to semantic names where the block
+/// qualifies (cleanup_N for shared guard targets, fail_N for guard+return).
+fn rename_block_labels(lines: Vec<String>, labels: &HashMap<BlockId, String>) -> Vec<String> {
+    lines
+        .into_iter()
+        .map(|line| {
+            let trimmed = line.trim_start();
+            let indent_len = line.len() - trimmed.len();
+            let indent = &line[..indent_len];
+            // label comment: `// bbN @ addr`
+            if let Some(rest) = trimmed.strip_prefix("// bb")
+                && let Some((id_part, _)) = rest.split_once(' ')
+                && let Ok(id) = id_part.parse::<u32>()
+                && let Some(name) = labels.get(&BlockId(id))
+            {
+                return format!("{indent}// {name} (bb{id})");
+            }
+            // guard goto: `if (...) goto bbN;` / `goto bbN;`
+            if line.contains("goto bb") {
+                let mut out = line.clone();
+                for (id, name) in labels {
+                    out = out.replace(&format!("goto bb{};", id.0), &format!("goto {name};"));
+                }
+                return out;
+            }
+            line
+        })
+        .collect()
 }
 
 /// Final text-level cleanup shared by all render paths:
