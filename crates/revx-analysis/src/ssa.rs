@@ -6677,7 +6677,9 @@ fn render_ssa_pseudocode_named_layered_with_strings_arc_inner(
                 lines.push("}".to_string());
                 let labels = semantic_block_labels(func);
                 let lines = rename_block_labels(lines, &labels);
-                join_lines_fast(&polish_rendered_lines(&apply_call_result_types(&apply_call_result_cse(&lines))))
+                join_lines_fast(&polish_rendered_lines(&apply_call_result_types(
+                    &apply_call_result_cse(&lines),
+                )))
             } else {
                 for block in &func.cfg.blocks {
                     if allow_structured_switch && switch_case_blocks.contains(&block.id) {
@@ -6708,7 +6710,9 @@ fn render_ssa_pseudocode_named_layered_with_strings_arc_inner(
                 lines.push("}".to_string());
                 let labels = semantic_block_labels(func);
                 let lines = rename_block_labels(lines, &labels);
-                join_lines_fast(&polish_rendered_lines(&apply_call_result_types(&apply_call_result_cse(&lines))))
+                join_lines_fast(&polish_rendered_lines(&apply_call_result_types(
+                    &apply_call_result_cse(&lines),
+                )))
             }
         },
     )
@@ -6866,12 +6870,7 @@ impl<'a> RegionWalk<'a> {
                 SsaOp::Return { .. } => {
                     lines.push(format!(
                         "{};",
-                        render_named_value(
-                            self.func,
-                            inst.id,
-                            self.symbols,
-                            self.local_symbols
-                        )
+                        render_named_value(self.func, inst.id, self.symbols, self.local_symbols)
                     ));
                 }
                 SsaOp::Store { .. } => {
@@ -13578,10 +13577,7 @@ mod string_call_tests {
         assert_eq!(out[1], "    jchars = 0;");
         assert_eq!(out[2], "    r_foo = foo(x1);");
         assert_eq!(out[3], "    void * mem = malloc(0x20);");
-        assert_eq!(
-            out[4],
-            "    const char * cstr = _GetStringUTFChars(e, s);"
-        );
+        assert_eq!(out[4], "    const char * cstr = _GetStringUTFChars(e, s);");
     }
 
     #[test]
@@ -13632,15 +13628,13 @@ mod string_call_tests {
         symbols.insert(0x110c, "GetStringChars".to_string());
         symbols.insert(0x1200, "strlen".to_string());
         let ssa = lift_arm64_to_ssa(&blocks, &refs, &[]);
-        let text = render_ssa_pseudocode_named_layered(
-            &ssa,
-            "probe",
-            &[],
-            &symbols,
-            &HashMap::new(),
-        );
+        let text =
+            render_ssa_pseudocode_named_layered(&ssa, "probe", &[], &symbols, &HashMap::new());
         assert!(text.contains("return len;"), "{text}");
-        assert!(!text.contains("sub_110c") && !text.contains("sub_1200"), "{text}");
+        assert!(
+            !text.contains("sub_110c") && !text.contains("sub_1200"),
+            "{text}"
+        );
     }
 
     use super::*;
