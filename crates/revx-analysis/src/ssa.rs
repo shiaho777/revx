@@ -6677,7 +6677,9 @@ fn render_ssa_pseudocode_named_layered_with_strings_arc_inner(
                 lines.push("}".to_string());
                 let labels = semantic_block_labels(func);
                 let lines = rename_block_labels(lines, &labels);
-                join_lines_fast(&polish_rendered_lines(&apply_call_result_cse(&lines)))
+                join_lines_fast(&polish_rendered_lines(&apply_call_result_types(
+                    &apply_call_result_cse(&lines),
+                )))
             } else {
                 for block in &func.cfg.blocks {
                     if allow_structured_switch && switch_case_blocks.contains(&block.id) {
@@ -6708,7 +6710,9 @@ fn render_ssa_pseudocode_named_layered_with_strings_arc_inner(
                 lines.push("}".to_string());
                 let labels = semantic_block_labels(func);
                 let lines = rename_block_labels(lines, &labels);
-                join_lines_fast(&polish_rendered_lines(&apply_call_result_cse(&lines)))
+                join_lines_fast(&polish_rendered_lines(&apply_call_result_types(
+                    &apply_call_result_cse(&lines),
+                )))
             }
         },
     )
@@ -6864,7 +6868,10 @@ impl<'a> RegionWalk<'a> {
             let inst = self.func.values.get(iid.0 as usize)?;
             match &inst.op {
                 SsaOp::Return { .. } => {
-                    lines.push(format!("{};", self.func.render_value(inst.id)));
+                    lines.push(format!(
+                        "{};",
+                        render_named_value(self.func, inst.id, self.symbols, self.local_symbols)
+                    ));
                 }
                 SsaOp::Store { .. } => {
                     let r =
@@ -7334,6 +7341,58 @@ fn apply_call_result_cse(lines: &[String]) -> Vec<String> {
     out
 }
 
+fn known_call_result_type(callee: &str) -> Option<&'static str> {
+    match callee.trim_start_matches('_') {
+        "GetStringChars" => Some("const jchar *"),
+        "GetStringUTFChars" => Some("const char *"),
+        "GetStringUTFLength" | "GetArrayLength" => Some("jsize"),
+        "strlen" => Some("size_t"),
+        "malloc" | "calloc" => Some("void *"),
+        "strcmp" | "strncmp" | "memcmp" => Some("int"),
+        "FindClass" | "GetObjectClass" => Some("jclass"),
+        "GetMethodID" | "GetStaticMethodID" => Some("jmethodID"),
+        "GetFieldID" | "GetStaticFieldID" => Some("jfieldID"),
+        "NewStringUTF" => Some("jstring"),
+        "NewByteArray" => Some("jbyteArray"),
+        "GetByteArrayElements" => Some("jbyte *"),
+        _ => None,
+    }
+}
+
+fn split_assign_name(trimmed: &str) -> Option<String> {
+    let eq = trimmed.find(" = ")?;
+    let name = &trimmed[..eq];
+    if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return None;
+    }
+    Some(name.to_string())
+}
+
+fn apply_call_result_types(lines: &[String]) -> Vec<String> {
+    let mut bound: HashSet<String> = HashSet::new();
+    let mut out = Vec::with_capacity(lines.len());
+    for line in lines {
+        let trimmed = line.trim_start();
+        let indent_len = line.len() - trimmed.len();
+        let (indent, _) = line.split_at(indent_len);
+        if let Some((name, call_expr)) = split_call_binding(trimmed) {
+            let open = call_expr.find('(').unwrap_or(call_expr.len());
+            let callee = &call_expr[..open];
+            if !bound.contains(&name) {
+                bound.insert(name.clone());
+                if let Some(ty) = known_call_result_type(callee) {
+                    out.push(format!("{indent}{ty} {name} = {call_expr};"));
+                    continue;
+                }
+            }
+        } else if let Some(name) = split_assign_name(trimmed) {
+            bound.insert(name);
+        }
+        out.push(line.clone());
+    }
+    out
+}
+
 /// `name = call(args);` → Some((name, "call(args)")); None otherwise.
 fn split_call_binding(trimmed: &str) -> Option<(String, String)> {
     let eq = trimmed.find(" = ")?;
@@ -7520,7 +7579,7 @@ fn render_ssa_pseudocode_linear_with_strings_arc_inner(
                 }
             }
             lines.push("}".to_string());
-            join_lines_fast(&lines)
+            join_lines_fast(&apply_call_result_types(&lines))
         },
     )
 }
@@ -7616,7 +7675,10 @@ fn emit_ssa_block_linear_ultra(
                 *stmt_budget = stmt_budget.saturating_sub(1);
             }
             SsaOp::Return { .. } => {
-                lines.push(format!("{pad}{};", func.render_value(inst.id)));
+                lines.push(format!(
+                    "{pad}{};",
+                    render_named_value(func, inst.id, symbols, local_symbols)
+                ));
                 *stmt_budget = stmt_budget.saturating_sub(1);
             }
             SsaOp::Copy {
@@ -7717,7 +7779,10 @@ fn emit_ssa_block_linear_simple(
                 *stmt_budget = stmt_budget.saturating_sub(1);
             }
             SsaOp::Return { .. } => {
-                lines.push(format!("{pad}{};", func.render_value(inst.id)));
+                lines.push(format!(
+                    "{pad}{};",
+                    render_named_value(func, inst.id, symbols, local_symbols)
+                ));
                 *stmt_budget = stmt_budget.saturating_sub(1);
             }
             SsaOp::Copy {
@@ -11413,7 +11478,10 @@ fn emit_ssa_block_linear(
                 }
             }
             SsaOp::Return { .. } => {
-                lines.push(format!("{pad}{};", func.render_value(inst.id)));
+                lines.push(format!(
+                    "{pad}{};",
+                    render_named_value(func, inst.id, symbols, local_symbols)
+                ));
             }
             SsaOp::Phi { .. } | SsaOp::Unknown => {}
             SsaOp::BinOp { kind, .. }
@@ -12660,6 +12728,13 @@ fn render_named_value_depth_inner(
             }
             render_operand_named_depth(func, src, symbols, local_symbols, depth + 1)
         }
+        SsaOp::Return { value } => match value {
+            Some(v) => format!(
+                "return {}",
+                render_operand_named_depth(func, v, symbols, local_symbols, depth + 1)
+            ),
+            None => "return".to_string(),
+        },
         _ => func.render_value(id),
     }
 }
@@ -13467,6 +13542,99 @@ mod string_call_tests {
         let out = apply_call_result_cse(&lines);
         assert_eq!(out[1], "    r_b = beta(r_a, r_a);");
         assert_eq!(out[2], "    r_c = r_a;");
+    }
+
+    #[test]
+    fn call_result_types_annotate_first_binding() {
+        let lines = vec![
+            "    jchars = GetStringChars(env, a2, 0);".to_string(),
+            "    len = strlen(jchars);".to_string(),
+            "    if (len >= 0x17) goto bb16;".to_string(),
+        ];
+        let out = apply_call_result_types(&lines);
+        assert_eq!(
+            out[0],
+            "    const jchar * jchars = GetStringChars(env, a2, 0);"
+        );
+        assert_eq!(out[1], "    size_t len = strlen(jchars);");
+        assert_eq!(out[2], "    if (len >= 0x17) goto bb16;");
+    }
+
+    #[test]
+    fn call_result_types_skip_redefinition_and_unknown() {
+        let lines = vec![
+            "    jchars = GetStringChars(env, a2, 0);".to_string(),
+            "    jchars = 0;".to_string(),
+            "    r_foo = foo(x1);".to_string(),
+            "    mem = malloc(0x20);".to_string(),
+            "    cstr = _GetStringUTFChars(e, s);".to_string(),
+        ];
+        let out = apply_call_result_types(&lines);
+        assert_eq!(
+            out[0],
+            "    const jchar * jchars = GetStringChars(env, a2, 0);"
+        );
+        assert_eq!(out[1], "    jchars = 0;");
+        assert_eq!(out[2], "    r_foo = foo(x1);");
+        assert_eq!(out[3], "    void * mem = malloc(0x20);");
+        assert_eq!(out[4], "    const char * cstr = _GetStringUTFChars(e, s);");
+    }
+
+    #[test]
+    fn call_result_types_plain_assign_blocks_later_binding() {
+        let lines = vec![
+            "    len = x5;".to_string(),
+            "    len = strlen(jchars);".to_string(),
+        ];
+        let out = apply_call_result_types(&lines);
+        assert_eq!(out[0], "    len = x5;");
+        assert_eq!(out[1], "    len = strlen(jchars);");
+    }
+
+    #[test]
+    fn arm64_ssa_return_site_uses_result_names() {
+        let mk = |addr: u64, text: &str| Instruction {
+            address: addr,
+            bytes: Arc::from("00"),
+            text: Arc::from(text),
+        };
+        let blocks = vec![BasicBlock {
+            address: 0x1000,
+            size: 0x20,
+            instructions: vec![
+                mk(0x1000, "mov x0, x1"),
+                mk(0x1004, "mov x1, x2"),
+                mk(0x1008, "mov w2, #0x0"),
+                mk(0x100c, "bl $+0x100"),
+                mk(0x1010, "mov x19, x0"),
+                mk(0x1014, "bl $+0x200"),
+                mk(0x1018, "str x0, [sp, #0x8]"),
+                mk(0x101c, "ret"),
+            ],
+        }];
+        let refs = vec![
+            Reference {
+                from: 0x100c,
+                to: 0x110c,
+                kind: ReferenceKind::Call,
+            },
+            Reference {
+                from: 0x1014,
+                to: 0x1200,
+                kind: ReferenceKind::Call,
+            },
+        ];
+        let mut symbols = HashMap::new();
+        symbols.insert(0x110c, "GetStringChars".to_string());
+        symbols.insert(0x1200, "strlen".to_string());
+        let ssa = lift_arm64_to_ssa(&blocks, &refs, &[]);
+        let text =
+            render_ssa_pseudocode_named_layered(&ssa, "probe", &[], &symbols, &HashMap::new());
+        assert!(text.contains("return len;"), "{text}");
+        assert!(
+            !text.contains("sub_110c") && !text.contains("sub_1200"),
+            "{text}"
+        );
     }
 
     use super::*;
