@@ -6675,7 +6675,7 @@ fn render_ssa_pseudocode_named_layered_with_strings_arc_inner(
                 )
             {
                 lines.push("}".to_string());
-                join_lines_fast(&apply_call_result_cse(&lines))
+                join_lines_fast(&polish_rendered_lines(&apply_call_result_cse(&lines)))
             } else {
                 for block in &func.cfg.blocks {
                     if allow_structured_switch && switch_case_blocks.contains(&block.id) {
@@ -6704,10 +6704,37 @@ fn render_ssa_pseudocode_named_layered_with_strings_arc_inner(
                     );
                 }
                 lines.push("}".to_string());
-                join_lines_fast(&apply_call_result_cse(&lines))
+                join_lines_fast(&polish_rendered_lines(&apply_call_result_cse(&lines)))
             }
         },
     )
+}
+
+/// Final text-level cleanup shared by all render paths:
+/// - `X = X;` identity copies (call results echoing their only argument)
+/// - `return xzr;` → `return 0;`
+fn polish_rendered_lines(lines: &[String]) -> Vec<String> {
+    lines
+        .iter()
+        .filter(|line| {
+            let t = line.trim().trim_end_matches(';');
+            if let Some((lhs, rhs)) = t.split_once(" = ")
+                && lhs.trim() == rhs.trim()
+                && !lhs.trim().is_empty()
+            {
+                return false; // drop identity copy
+            }
+            true
+        })
+        .map(|line| {
+            let trimmed = line.trim_end();
+            if trimmed.ends_with("return xzr;") {
+                line.replace("return xzr;", "return 0;")
+            } else {
+                line.clone()
+            }
+        })
+        .collect()
 }
 
 /// Region-tree structuring state for one render pass.
@@ -8045,7 +8072,11 @@ fn emit_block_statements_for_switch(
                 term = Some(*target);
             }
             SsaOp::Return { .. } => {
-                lines.push(format!("{pad}{};", func.render_value(inst.id)));
+                let mut rendered = func.render_value(inst.id);
+                if rendered == "xzr" {
+                    rendered = "0".to_string();
+                }
+                lines.push(format!("{pad}{rendered};"));
             }
             SsaOp::Phi { .. } | SsaOp::Unknown => {}
             SsaOp::BinOp { kind, .. }
@@ -11248,12 +11279,24 @@ fn emit_ssa_block_linear(
                     continue;
                 }
                 let call = render_named_value(func, inst.id, symbols, local_symbols);
+                let result = result_name_for_call(func, inst.id, symbols, local_symbols);
+                // `jstr = jstr;`-style identity result (result name equal to
+                // the sole argument) is a no-op copy, not information.
+                let identity_copy = call
+                    .strip_suffix(')')
+                    .and_then(|inner| inner.rsplit_once('('))
+                    .map(|(callee, args)| {
+                        let callee_last = callee.rsplit("::").next().unwrap_or("");
+                        callee_last == result
+                            && args.split(',').map(str::trim).collect::<Vec<_>>()
+                                == vec![result.as_str()]
+                    })
+                    .unwrap_or(false);
+                if identity_copy {
+                    continue;
+                }
                 if ssa_value_is_used(func, inst.id) {
-                    lines.push(format!(
-                        "{pad}{} = {};",
-                        result_name_for_call(func, inst.id, symbols, local_symbols),
-                        call
-                    ));
+                    lines.push(format!("{pad}{result} = {call};"));
                 } else {
                     lines.push(format!("{pad}{};", call));
                 }
