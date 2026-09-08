@@ -92,6 +92,15 @@ enum DexCommands {
     Disasm(DexDisasmArgs),
     Decompile(DexDecompileArgs),
     Java(DexJavaArgs),
+    JniLink(DexJniLinkArgs),
+}
+
+#[derive(Args)]
+struct DexJniLinkArgs {
+    dex_path: PathBuf,
+    so_path: Option<PathBuf>,
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Args)]
@@ -781,7 +790,93 @@ async fn main() -> Result<()> {
         Command::Dex(DexCommands::Disasm(args)) => cmd_dex_disasm(args),
         Command::Dex(DexCommands::Decompile(args)) => cmd_dex_decompile(args),
         Command::Dex(DexCommands::Java(args)) => cmd_dex_java(args),
+        Command::Dex(DexCommands::JniLink(args)) => cmd_dex_jni_link(args),
     }
+}
+
+fn cmd_dex_jni_link(args: DexJniLinkArgs) -> Result<()> {
+    let data = fs::read(&args.dex_path)
+        .with_context(|| format!("failed to read {}", args.dex_path.display()))?;
+    let dex =
+        revx_dex::DexFile::parse(data).map_err(|e| anyhow::anyhow!("DEX parse failed: {e}"))?;
+    let natives = revx_dex::jni::all_native_methods(&dex);
+
+    let mut export_map: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    if let Some(so_path) = &args.so_path {
+        let image = load_binary(so_path)
+            .with_context(|| format!("failed to load {}", so_path.display()))?;
+        for e in &image.exports {
+            if let Some(addr) = e.address {
+                export_map.insert(e.name.clone(), addr);
+            }
+        }
+    }
+
+    let mut matched = 0usize;
+    let mut json_rows = Vec::new();
+    for n in &natives {
+        let mut found_addr: Option<u64> = export_map
+            .get(&n.mangled)
+            .or_else(|| n.mangled_overload.as_ref().and_then(|o| export_map.get(o)))
+            .copied();
+        let symbol_used = if export_map.contains_key(&n.mangled) {
+            n.mangled.clone()
+        } else if let Some(o) = &n.mangled_overload
+            && export_map.contains_key(o)
+        {
+            o.clone()
+        } else {
+            String::new()
+        };
+        if found_addr.is_none()
+            && let Some(o) = &n.mangled_overload
+            && let Some(a) = export_map.get(o)
+        {
+            found_addr = Some(*a);
+        }
+        let addr = found_addr;
+        if addr.is_some() {
+            matched += 1;
+        }
+        if args.json {
+            json_rows.push(serde_json::json!({
+                "class": n.class,
+                "method": n.method,
+                "signature": n.signature,
+                "symbol": symbol_used,
+                "address": addr,
+            }));
+        } else {
+            let status = addr
+                .map(|a| format!("{a:#x}"))
+                .unwrap_or_else(|| "unresolved".to_string());
+            println!(
+                "{}->{}\t{}\t{}\t{status}",
+                n.class, n.method, n.signature, n.mangled
+            );
+        }
+    }
+    if args.json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "native_methods": natives.len(),
+                "matched": matched,
+                "rows": json_rows,
+            })
+        );
+    } else {
+        eprintln!(
+            "// {} native methods, {} matched in {}",
+            natives.len(),
+            matched,
+            args.so_path
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "(no library)".to_string())
+        );
+    }
+    Ok(())
 }
 
 fn cmd_dex_java(args: DexJavaArgs) -> Result<()> {

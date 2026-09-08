@@ -3,6 +3,7 @@
 
 pub mod classgen;
 pub mod insns;
+pub mod jni;
 pub mod lift;
 pub mod render;
 pub mod structure;
