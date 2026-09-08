@@ -22,6 +22,7 @@ pub struct StructuredRenderer<'a> {
     visited: HashSet<BlockId>,
     goto_targets: BTreeSet<BlockId>,
     block_starts: HashMap<BlockId, usize>,
+    loop_stack: Vec<(BlockId, BlockId)>,
     lines: Vec<String>,
     depth: usize,
 }
@@ -77,6 +78,7 @@ impl<'a> StructuredRenderer<'a> {
             visited: HashSet::new(),
             goto_targets: BTreeSet::new(),
             block_starts: HashMap::new(),
+            loop_stack: Vec::new(),
             lines: Vec::new(),
             depth: 0,
         }
@@ -91,12 +93,40 @@ impl<'a> StructuredRenderer<'a> {
         self.lines.push(format!("{}{}", self.indent(), line));
     }
 
+    fn emit_goto(&mut self, target: BlockId) {
+        if let Some(&(head, exit)) = self.loop_stack.last() {
+            if target == exit {
+                self.push("break;");
+                return;
+            }
+            if target == head {
+                let is_latch = self
+                    .lines
+                    .last()
+                    .is_some_and(|l| !l.trim().is_empty() && !l.trim().starts_with('}'));
+                if is_latch {
+                    self.push("continue;");
+                }
+                return;
+            }
+        }
+        self.goto_targets.insert(target);
+        self.push(format!("goto L{};", target.0));
+    }
+
     fn walk(
         &mut self,
         block: BlockId,
         blocks: &HashMap<BlockId, BlockRender>,
         stop_at: Option<BlockId>,
     ) {
+        if let Some(&(_, exit)) = self.loop_stack.last()
+            && block == exit
+            && !self.visited.contains(&block)
+        {
+            self.push("break;");
+            return;
+        }
         if Some(block) == stop_at {
             return;
         }
@@ -104,8 +134,7 @@ impl<'a> StructuredRenderer<'a> {
             return;
         }
         if self.visited.contains(&block) {
-            self.goto_targets.insert(block);
-            self.push(format!("goto L{};", block.0));
+            self.emit_goto(block);
             return;
         }
         self.visited.insert(block);
@@ -150,7 +179,9 @@ impl<'a> StructuredRenderer<'a> {
                 negate(cond_text)
             };
             self.push(format!("while ({cond}) {{"));
+            self.loop_stack.push((head, exit));
             self.walk(body, blocks, Some(exit));
+            self.loop_stack.pop();
             self.push("}");
             self.walk(exit, blocks, outer_stop);
             return;
@@ -186,8 +217,7 @@ impl<'a> StructuredRenderer<'a> {
         stop_at: Option<BlockId>,
     ) {
         if self.visited.contains(&target) {
-            self.goto_targets.insert(target);
-            self.push(format!("goto L{};", target.0));
+            self.emit_goto(target);
             return;
         }
         self.walk(target, blocks, stop_at);

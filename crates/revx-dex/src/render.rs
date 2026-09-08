@@ -874,6 +874,52 @@ fn parse_increment(line: &str, var: &str) -> Option<String> {
     None
 }
 
+fn apply_dead_allocation_cleanup(text: &str) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut out = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.contains("= new StringBuilder()") {
+            let var = trimmed
+                .strip_suffix(";")
+                .and_then(|l| l.split_once(" = "))
+                .map(|(v, _)| v.trim())
+                .map(|v| v.split_whitespace().last().unwrap_or(v))
+                .unwrap_or("");
+            if !var.is_empty() {
+                let uses = lines
+                    .iter()
+                    .enumerate()
+                    .filter(|(j, l2)| *j != i && contains_token(l2, var))
+                    .count();
+                if uses == 0 {
+                    continue;
+                }
+            }
+        }
+        out.push(*line);
+    }
+    out.join("\n")
+}
+
+fn apply_latch_continue_cleanup(text: &str) -> String {
+    let mut lines: Vec<String> = text.lines().map(|l| l.to_string()).collect();
+    let mut i = 1usize;
+    while i < lines.len() {
+        if lines[i].trim() == "}" {
+            let mut j = i;
+            while j > 0 && lines[j - 1].trim().is_empty() {
+                j -= 1;
+            }
+            if j > 0 && lines[j - 1].trim() == "continue;" {
+                lines[j - 1] = String::new();
+            }
+        }
+        i += 1;
+    }
+    lines.join("\n")
+}
+
 pub struct TryInfo {
     pub handler_types: HashMap<u32, Vec<String>>,
     pub catch_all_addrs: Vec<u32>,
@@ -1003,12 +1049,7 @@ pub fn render_method_pseudocode_full(
         if try_regions.iter().any(|(s, _)| block_addr == *s) {
             prefix.push("try {".to_string());
         }
-        if try_regions
-            .iter()
-            .any(|(s, e)| *s < block_addr && block_addr < *e)
-        {
-            prefix.push("// (inside try region)".to_string());
-        }
+        let _ = &try_regions;
         let mut all_lines = prefix;
         all_lines.extend(lines);
         block_renders.insert(
@@ -1031,6 +1072,8 @@ pub fn render_method_pseudocode_full(
     let text = apply_copy_chain_collapse(&text);
     let text = apply_string_concat_fold(&text);
     let text = apply_for_loop_recovery(&text);
+    let text = apply_latch_continue_cleanup(&text);
+    let text = apply_dead_allocation_cleanup(&text);
     let name_to_id: HashMap<String, SsaValueId> = ctx
         .value_names
         .iter()
