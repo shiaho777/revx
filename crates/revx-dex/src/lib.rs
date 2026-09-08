@@ -2,6 +2,8 @@
 //! class definitions, class data, and code items.
 
 pub mod insns;
+pub mod lift;
+pub mod render;
 
 use std::fmt;
 

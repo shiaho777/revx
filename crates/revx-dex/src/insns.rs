@@ -1116,7 +1116,7 @@ fn render_regs35c(count: u8, nibbles: [u8; 5]) -> String {
     format!("{{{}}}", regs.join(", "))
 }
 
-fn escape_string(s: &str) -> String {
+pub fn escape_string(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     for c in s.chars() {
         match c {

@@ -90,6 +90,7 @@ enum Command {
 #[derive(Subcommand)]
 enum DexCommands {
     Disasm(DexDisasmArgs),
+    Decompile(DexDecompileArgs),
 }
 
 #[derive(Args)]
@@ -98,6 +99,17 @@ struct DexDisasmArgs {
     #[arg(long)]
     class: Option<String>,
     #[arg(long, default_value_t = 200)]
+    limit: usize,
+}
+
+#[derive(Args)]
+struct DexDecompileArgs {
+    path: PathBuf,
+    #[arg(long)]
+    class: Option<String>,
+    #[arg(long)]
+    method: Option<String>,
+    #[arg(long, default_value_t = 20)]
     limit: usize,
 }
 
@@ -757,6 +769,7 @@ async fn main() -> Result<()> {
             init_workspace,
         }) => cmd_mcp_install(prefix, workspace, host, write_config, init_workspace),
         Command::Dex(DexCommands::Disasm(args)) => cmd_dex_disasm(args),
+        Command::Dex(DexCommands::Decompile(args)) => cmd_dex_decompile(args),
     }
 }
 
@@ -780,6 +793,29 @@ fn cmd_dex_disasm(args: DexDisasmArgs) -> Result<()> {
         println!("{line}");
     }
     eprintln!("// {} methods disassembled", args.limit.min(lines.len()));
+    Ok(())
+}
+
+fn cmd_dex_decompile(args: DexDecompileArgs) -> Result<()> {
+    let data =
+        fs::read(&args.path).with_context(|| format!("failed to read {}", args.path.display()))?;
+    let dex =
+        revx_dex::DexFile::parse(data).map_err(|e| anyhow::anyhow!("DEX parse failed: {e}"))?;
+    let methods = revx_dex::render::decompile_dex(
+        &dex,
+        args.class.as_deref(),
+        args.method.as_deref(),
+        args.limit,
+    );
+    println!("// {} methods decompiled", methods.len());
+    for mc in &methods {
+        println!(
+            "// {} (regs={} insns={})",
+            mc.signature, mc.registers, mc.insn_units
+        );
+        println!("{}", mc.pseudocode);
+        println!();
+    }
     Ok(())
 }
 
