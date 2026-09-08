@@ -13,6 +13,7 @@ pub struct BlockRender {
     pub lines: Vec<String>,
     pub cond: Option<(String, BlockId, BlockId)>,
     pub jump: Option<BlockId>,
+    pub switch: Option<(String, Vec<(String, BlockId)>)>,
 }
 
 pub struct StructuredRenderer<'a> {
@@ -117,6 +118,10 @@ impl<'a> StructuredRenderer<'a> {
             self.handle_branch(block, &cond_text, t, f, blocks);
         } else if let Some(target) = render.jump {
             self.handle_jump(target, blocks);
+        } else if let Some((switch_val, cases)) = &render.switch {
+            let switch_val = switch_val.clone();
+            let cases = cases.clone();
+            self.handle_switch(&switch_val, &cases, blocks);
         }
         self.depth -= 1;
     }
@@ -172,6 +177,26 @@ impl<'a> StructuredRenderer<'a> {
             return;
         }
         self.walk(target, blocks);
+    }
+
+    fn handle_switch(
+        &mut self,
+        switch_val: &str,
+        cases: &[(String, BlockId)],
+        blocks: &HashMap<BlockId, BlockRender>,
+    ) {
+        self.push(format!("switch ({switch_val}) {{"));
+        for (key, target) in cases {
+            self.push(format!("case {key}:"));
+            self.walk(*target, blocks);
+        }
+        self.push("}");
+        let after = cases.iter().map(|(_, t)| t.0).max().map(|m| BlockId(m + 1));
+        if let Some(next) = after
+            && (next.0 as usize) < self.func.cfg.blocks.len()
+        {
+            self.walk(next, blocks);
+        }
     }
 
     fn while_shape(&self, head: BlockId, t: BlockId, f: BlockId) -> Option<(BlockId, BlockId)> {

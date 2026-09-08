@@ -95,15 +95,42 @@ impl<'a> RenderCtx<'a> {
         }
     }
 
+    fn resolve_param_alias(&self, id: SsaValueId, depth: usize) -> Option<String> {
+        if depth > 4 {
+            return None;
+        }
+        let inst = self.func.values.get(id.0 as usize)?;
+        match &inst.op {
+            SsaOp::Copy { src } => match src {
+                Operand::Symbol(s) => {
+                    if s == "this"
+                        || (s.starts_with('p') && s[1..].chars().all(|c| c.is_ascii_digit()))
+                    {
+                        Some(s.clone())
+                    } else {
+                        None
+                    }
+                }
+                Operand::Value(other) => self.resolve_param_alias(*other, depth + 1),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     fn render_inst(&mut self, id: SsaValueId) -> Option<String> {
         let inst = self.func.values.get(id.0 as usize)?;
         let line = match &inst.op {
             SsaOp::Copy { src } => {
-                let src_text = self.operand_text(src);
                 if self.emitted_defs.contains(&id) {
                     return None;
                 }
                 self.emitted_defs.insert(id);
+                if let Some(param) = self.resolve_param_alias(id, 0) {
+                    self.value_names.insert(id, param);
+                    return None;
+                }
+                let src_text = self.operand_text(src);
                 let name = self.name_of(id);
                 if src_text == name {
                     return None;
@@ -325,76 +352,6 @@ fn operand_uses(op: &Operand, id: SsaValueId) -> bool {
     }
 }
 
-pub fn render_method_pseudocode(
-    func: &SsaFunction,
-    value_types: &crate::types::ValueTypes,
-) -> String {
-    let mut ctx = RenderCtx::new(func);
-    ctx.value_types = value_types.clone();
-
-    // Pre-render every block's statements + terminator summary in RPO order
-    // so value names are allocated deterministically before structuring.
-    let order = reverse_post_order(func);
-    let mut block_renders: HashMap<BlockId, crate::structure::BlockRender> = HashMap::new();
-    for &bid in &order {
-        let block = &func.cfg.blocks[bid.0 as usize];
-        let mut lines = Vec::new();
-        let mut cond: Option<(String, BlockId, BlockId)> = None;
-        let mut jump: Option<BlockId> = None;
-        let mut cond_value_id: Option<SsaValueId> = None;
-        for &iid in &block.insts {
-            if let Some(inst) = func.values.get(iid.0 as usize)
-                && let SsaOp::Branch { cond: c, .. } = &inst.op
-                && let Operand::Value(id) = c
-            {
-                cond_value_id = Some(*id);
-            }
-        }
-        for &iid in &block.insts {
-            let Some(inst) = func.values.get(iid.0 as usize) else {
-                continue;
-            };
-            match &inst.op {
-                SsaOp::Branch {
-                    cond: c,
-                    true_block,
-                    false_block,
-                } => {
-                    cond = Some((ctx.cond_text(c), *true_block, *false_block));
-                }
-                SsaOp::Jump { target } => {
-                    jump = Some(*target);
-                }
-                _ => {
-                    if cond_value_id == Some(iid) {
-                        continue;
-                    }
-                    if let Some(line) = ctx.render_inst(iid)
-                        && !line.starts_with("// phi()")
-                    {
-                        lines.push(line);
-                    }
-                }
-            }
-        }
-        block_renders.insert(bid, crate::structure::BlockRender { lines, cond, jump });
-    }
-
-    let text = crate::structure::render_structured(func, &block_renders);
-    let text = text.trim_end().to_string();
-    if text.is_empty() {
-        return "    <empty>".to_string();
-    }
-    let text = fuse_new_init(&text);
-    let text = apply_copy_chain_collapse(&text);
-    let name_to_id: HashMap<String, SsaValueId> = ctx
-        .value_names
-        .iter()
-        .map(|(id, name)| (name.clone(), *id))
-        .collect();
-    apply_typed_declarations(&text, value_types, &name_to_id)
-}
-
 fn reverse_post_order(func: &SsaFunction) -> Vec<BlockId> {
     let n = func.cfg.blocks.len();
     if n == 0 {
@@ -455,7 +412,8 @@ fn apply_typed_declarations(
                 && !rest.trim().starts_with("new ")
             {
                 declared.insert(var.to_string());
-                out_lines.push(format!("    {t} {var} = {rest};"));
+                let indent_len = line.len() - line.trim_start().len();
+                out_lines.push(format!("{}{t} {var} = {rest};", " ".repeat(indent_len)));
                 continue;
             }
         }
@@ -499,7 +457,11 @@ fn fuse_new_init(text: &str) -> String {
                     .trim_start_matches('(')
                     .trim_end_matches(')')
                     .to_string();
-                lines[i] = format!("    {var} = new {class_part}({args});");
+                let indent_len = lines[i].len() - lines[i].trim_start().len();
+                lines[i] = format!(
+                    "{}{var} = new {class_part}({args});",
+                    " ".repeat(indent_len)
+                );
                 lines.remove(j);
                 fused = true;
                 break;
@@ -517,17 +479,20 @@ fn apply_copy_chain_collapse(text: &str) -> String {
     let mut lines: Vec<String> = text.lines().map(|l| l.to_string()).collect();
     let mut changed = true;
     let mut rounds = 0;
-    while changed && rounds < 8 {
+    while changed && rounds < 10 {
         changed = false;
         rounds += 1;
         let mut i = 0;
         while i < lines.len() {
             let line = lines[i].trim().to_string();
-            let Some((var, src)) = line.strip_suffix(';').and_then(|l| l.split_once(" = ")) else {
+            let Some((raw_var, expr)) = line.strip_suffix(';').and_then(|l| l.split_once(" = "))
+            else {
                 i += 1;
                 continue;
             };
-            if !src.chars().all(|c| c.is_alphanumeric() || c == '_') || src.parse::<i64>().is_ok() {
+            let var = raw_var.split_whitespace().last().unwrap_or(raw_var).trim();
+            let expr = expr.trim();
+            if !is_inlinable_expr(var, expr) {
                 i += 1;
                 continue;
             }
@@ -542,7 +507,28 @@ fn apply_copy_chain_collapse(text: &str) -> String {
             }
             if use_lines.len() == 1 && use_lines[0] > i {
                 let j = use_lines[0];
-                lines[j] = replace_token(&lines[j], var, src);
+                let target = lines[j].trim().to_string();
+                if target.starts_with("goto ") || target.starts_with('L') && target.ends_with(':') {
+                    i += 1;
+                    continue;
+                }
+                let use_is_plain_copy = target
+                    .strip_suffix(';')
+                    .map(|t| {
+                        t.split_once(" = ")
+                            .is_some_and(|(_, rhs)| rhs.trim() == var)
+                    })
+                    .unwrap_or(false);
+                let replacement = if use_is_plain_copy
+                    || expr
+                        .chars()
+                        .all(|c| c.is_alphanumeric() || c == '_' || c == '.')
+                {
+                    expr.to_string()
+                } else {
+                    format!("({expr})")
+                };
+                lines[j] = replace_token(&lines[j], var, &replacement);
                 lines.remove(i);
                 changed = true;
             } else {
@@ -551,6 +537,70 @@ fn apply_copy_chain_collapse(text: &str) -> String {
         }
     }
     lines.join("\n")
+}
+
+fn is_inlinable_expr(var: &str, expr: &str) -> bool {
+    if !(var.starts_with('v') && var[1..].chars().all(|c| c.is_ascii_digit())) {
+        return false;
+    }
+    if expr.contains("new ")
+        || expr.contains("super(")
+        || expr.starts_with("synchronized")
+        || expr.starts_with("throw")
+        || expr.starts_with("return")
+    {
+        return false;
+    }
+    if expr.starts_with('"') && expr.ends_with('"') {
+        return true;
+    }
+    if expr.parse::<i64>().is_ok() {
+        return true;
+    }
+    if expr
+        .chars()
+        .all(|c| c.is_alphanumeric() || c == '_' || c == '.')
+    {
+        return true;
+    }
+    if expr.starts_with('(') && expr.ends_with(')') && !expr.contains(" new ") {
+        return true;
+    }
+    let op_head = expr
+        .split_whitespace()
+        .nth(1)
+        .map(|op| {
+            matches!(
+                op,
+                "+" | "-"
+                    | "*"
+                    | "/"
+                    | "%"
+                    | "&"
+                    | "|"
+                    | "^"
+                    | "<<"
+                    | ">>"
+                    | ">>>"
+                    | "=="
+                    | "!="
+                    | "<"
+                    | ">"
+                    | "<="
+                    | ">="
+            )
+        })
+        .unwrap_or(false);
+    if op_head {
+        return true;
+    }
+    if expr.contains('[') && expr.contains(']') && !expr.contains("->") {
+        return true;
+    }
+    if expr.contains('(') && expr.contains(')') && !expr.contains("-><init>") {
+        return true;
+    }
+    false
 }
 
 fn contains_token(line: &str, token: &str) -> bool {
@@ -584,15 +634,110 @@ pub struct MethodPseudocode {
 }
 
 pub fn decompile_method(dex: &DexFile, code: &CodeItem, method_idx: u32) -> MethodPseudocode {
-    let (func, value_types) = lift_method_to_ssa(dex, code, method_idx);
+    let output = lift_method_to_ssa(dex, code, method_idx);
     let sig = dex.method_signature(method_idx);
-    let text = render_method_pseudocode(&func, &value_types);
+    let text = render_method_pseudocode_full(&output);
     MethodPseudocode {
         signature: sig,
         pseudocode: text,
         registers: code.registers_size,
         insn_units: code.insns.len(),
     }
+}
+
+pub fn render_method_pseudocode_full(output: &crate::lift::LiftOutput) -> String {
+    let func = &output.func;
+    let value_types = &output.value_types;
+    let switch_cases = &output.switch_cases;
+    let mut ctx = RenderCtx::new(func);
+    ctx.value_types = value_types.clone();
+
+    let order = reverse_post_order(func);
+    let mut block_renders: HashMap<BlockId, crate::structure::BlockRender> = HashMap::new();
+    for &bid in &order {
+        let block = &func.cfg.blocks[bid.0 as usize];
+        let mut lines = Vec::new();
+        let mut cond: Option<(String, BlockId, BlockId)> = None;
+        let mut jump: Option<BlockId> = None;
+        let mut cond_value_id: Option<SsaValueId> = None;
+        for &iid in &block.insts {
+            if let Some(inst) = func.values.get(iid.0 as usize)
+                && let SsaOp::Branch { cond: c, .. } = &inst.op
+                && let Operand::Value(id) = c
+            {
+                cond_value_id = Some(*id);
+            }
+        }
+        let mut is_switch_block = false;
+        let mut switch_val = String::new();
+        for &iid in &block.insts {
+            let Some(inst) = func.values.get(iid.0 as usize) else {
+                continue;
+            };
+            match &inst.op {
+                SsaOp::Branch {
+                    cond: c,
+                    true_block,
+                    false_block,
+                } => {
+                    cond = Some((ctx.cond_text(c), *true_block, *false_block));
+                }
+                SsaOp::Jump { target } => {
+                    jump = Some(*target);
+                }
+                SsaOp::Call { target, args } => {
+                    if let Operand::Symbol(s) = target
+                        && s == "__switch"
+                    {
+                        is_switch_block = true;
+                        switch_val = args
+                            .first()
+                            .map(|a| ctx.operand_text(a))
+                            .unwrap_or_default();
+                    }
+                }
+                _ => {
+                    if cond_value_id == Some(iid) {
+                        continue;
+                    }
+                    if let Some(line) = ctx.render_inst(iid)
+                        && !line.starts_with("// phi()")
+                    {
+                        lines.push(line);
+                    }
+                }
+            }
+        }
+        let switch = if is_switch_block && let Some(cases) = switch_cases.get(&bid) {
+            lines.retain(|l| !l.contains("// switch ("));
+            Some((switch_val.clone(), cases.clone()))
+        } else {
+            None
+        };
+        block_renders.insert(
+            bid,
+            crate::structure::BlockRender {
+                lines,
+                cond,
+                jump,
+                switch,
+            },
+        );
+    }
+
+    let text = crate::structure::render_structured(func, &block_renders);
+    let text = text.trim_end().to_string();
+    if text.is_empty() {
+        return "    <empty>".to_string();
+    }
+    let text = fuse_new_init(&text);
+    let text = apply_copy_chain_collapse(&text);
+    let name_to_id: HashMap<String, SsaValueId> = ctx
+        .value_names
+        .iter()
+        .map(|(id, name)| (name.clone(), *id))
+        .collect();
+    apply_typed_declarations(&text, value_types, &name_to_id)
 }
 
 pub fn decompile_dex(

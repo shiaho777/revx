@@ -1060,6 +1060,7 @@ pub struct DexMethodLifter<'a> {
     pending_call_result: Option<SsaValueId>,
     pending_call_type: Option<String>,
     value_types: crate::types::ValueTypes,
+    switch_cases: HashMap<BlockId, Vec<(String, BlockId)>>,
 }
 
 impl<'a> DexMethodLifter<'a> {
@@ -1077,6 +1078,7 @@ impl<'a> DexMethodLifter<'a> {
             pending_call_result: None,
             pending_call_type: None,
             value_types: HashMap::new(),
+            switch_cases: HashMap::new(),
         }
     }
 
@@ -1198,7 +1200,7 @@ impl<'a> DexMethodLifter<'a> {
         self.block_ids = id_map.into_iter().collect();
     }
 
-    pub fn lift(mut self) -> (SsaFunction, crate::types::ValueTypes) {
+    pub fn lift(mut self) -> LiftOutput {
         let insns = decode_all(self.ctx.code);
         let blocks = build_basic_blocks(self.ctx.code, &insns);
         self.build_cfg(&blocks);
@@ -1235,9 +1237,16 @@ impl<'a> DexMethodLifter<'a> {
 
         let registers = self.ctx.code.registers_size;
         let ins = self.ctx.code.ins_size;
+        let mut param_symbols: Vec<(u16, String)> = Vec::with_capacity(ins as usize);
         for i in 0..ins {
             let reg = registers - ins + i;
-            let name = format!("p{i}");
+            let name = if !is_static && i == 0 {
+                "this".to_string()
+            } else {
+                let param_index = if is_static { i } else { i - 1 };
+                format!("p{param_index}")
+            };
+            param_symbols.push((reg, name.clone()));
             let id = self.func.new_value_id();
             let inst = SsaInstruction {
                 id,
@@ -1295,7 +1304,11 @@ impl<'a> DexMethodLifter<'a> {
             }
         }
 
-        (self.func, self.value_types)
+        LiftOutput {
+            func: self.func,
+            value_types: self.value_types,
+            switch_cases: self.switch_cases,
+        }
     }
 
     fn reverse_post_order(&self) -> Vec<BlockId> {
@@ -1619,7 +1632,7 @@ impl<'a> DexMethodLifter<'a> {
                 let tid = self.block_id_for_addr(*target);
                 self.push_inst(block, SsaOp::Jump { target: tid });
             }
-            Insn::PackedSwitch { reg, .. } | Insn::SparseSwitch { reg, .. } => {
+            Insn::PackedSwitch { reg, payload_off } | Insn::SparseSwitch { reg, payload_off } => {
                 let val = self.value(*reg);
                 self.push_inst(
                     block,
@@ -1628,6 +1641,41 @@ impl<'a> DexMethodLifter<'a> {
                         args: vec![val],
                     },
                 );
+                let keys: Vec<String> = match &insn {
+                    Insn::PackedSwitch { .. } => {
+                        match crate::insns::decode_payload(
+                            &self.ctx.code.insns,
+                            *payload_off as usize,
+                        ) {
+                            Some(crate::insns::Payload::PackedSwitch {
+                                first_key,
+                                targets,
+                                ..
+                            }) => (0..targets.len() as i32)
+                                .map(|i| (first_key + i).to_string())
+                                .collect(),
+                            _ => vec![],
+                        }
+                    }
+                    _ => match crate::insns::decode_payload(
+                        &self.ctx.code.insns,
+                        *payload_off as usize,
+                    ) {
+                        Some(crate::insns::Payload::SparseSwitch { keys, .. }) => {
+                            keys.iter().map(|k| k.to_string()).collect()
+                        }
+                        _ => vec![],
+                    },
+                };
+                let succs = self.func.cfg.succs[block.0 as usize].clone();
+                for (i, key) in keys.iter().enumerate() {
+                    if let Some(&target) = succs.get(i) {
+                        self.switch_cases
+                            .entry(block)
+                            .or_default()
+                            .push((key.clone(), target));
+                    }
+                }
             }
             Insn::Cmp {
                 dst,
@@ -2030,11 +2078,13 @@ impl<'a> DexMethodLifter<'a> {
     }
 }
 
-pub fn lift_method_to_ssa(
-    dex: &DexFile,
-    code: &CodeItem,
-    method_idx: u32,
-) -> (SsaFunction, crate::types::ValueTypes) {
+pub struct LiftOutput {
+    pub func: SsaFunction,
+    pub value_types: crate::types::ValueTypes,
+    pub switch_cases: HashMap<BlockId, Vec<(String, BlockId)>>,
+}
+
+pub fn lift_method_to_ssa(dex: &DexFile, code: &CodeItem, method_idx: u32) -> LiftOutput {
     let ctx = DexLiftContext::new(dex, code, method_idx);
     DexMethodLifter::new(ctx).lift()
 }
