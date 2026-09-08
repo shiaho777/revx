@@ -646,6 +646,108 @@ pub fn decompile_method(dex: &DexFile, code: &CodeItem, method_idx: u32) -> Meth
     }
 }
 
+fn apply_string_concat_fold(text: &str) -> String {
+    let mut out_lines: Vec<String> = Vec::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.contains(".append(")
+            && trimmed.contains(".toString()")
+            && let Some(folded) = fold_concat_line(trimmed)
+        {
+            let indent = line.len() - line.trim_start().len();
+            out_lines.push(format!("{}{}", " ".repeat(indent), folded));
+            continue;
+        }
+        out_lines.push(line.to_string());
+    }
+    out_lines.join("\n")
+}
+
+fn fold_concat_line(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    let (prefix, chain) = if let Some(rest) = trimmed.strip_prefix("return ") {
+        let after_semi = rest.trim().strip_suffix(';').unwrap_or(rest.trim());
+        let inner = after_semi
+            .strip_suffix(')')
+            .and_then(|r| r.strip_suffix(".toString()"))
+            .or_else(|| after_semi.strip_suffix(".toString()"))
+            .unwrap_or(after_semi)
+            .trim();
+        ("return ".to_string(), inner.to_string())
+    } else if let Some((p, rest)) = trimmed.split_once(" = ") {
+        if p.contains('"') {
+            return None;
+        }
+        let inner = rest
+            .trim()
+            .strip_suffix(';')
+            .and_then(|r| r.strip_suffix(".toString()"))
+            .unwrap_or(rest.trim())
+            .trim();
+        (format!("{p} = "), inner.to_string())
+    } else {
+        return None;
+    };
+    if !chain.contains(".append(") {
+        return None;
+    }
+    let parts = split_append_args(&chain);
+    if parts.len() >= 2 {
+        Some(format!("{prefix}{};", parts.join(" + ")))
+    } else {
+        None
+    }
+}
+
+fn split_append_args(chain: &str) -> Vec<String> {
+    let segments: Vec<&str> = chain.split(".append(").collect();
+    if segments.len() < 2 {
+        return vec![];
+    }
+    let mut args: Vec<String> = Vec::new();
+    for seg in &segments[1..] {
+        let arg = balanced_prefix(seg);
+        let arg = arg.trim();
+        let arg = arg
+            .strip_prefix('(')
+            .and_then(|a| a.strip_suffix(')'))
+            .unwrap_or(arg);
+        if !arg.is_empty() {
+            args.push(arg.trim().to_string());
+        }
+    }
+    args
+}
+
+fn balanced_prefix(s: &str) -> &str {
+    let bytes = s.as_bytes();
+    let mut depth = 0i32;
+    let mut in_string = false;
+    let mut end = s.len();
+    for (i, &b) in bytes.iter().enumerate() {
+        if b == b'"' && (i == 0 || bytes[i - 1] != b'\\') {
+            in_string = !in_string;
+        }
+        if in_string {
+            continue;
+        }
+        if b == b'(' {
+            depth += 1;
+        } else if b == b')' {
+            if depth == 0 {
+                end = i;
+                break;
+            }
+            depth -= 1;
+            if depth == 0 {
+                end = i + 1;
+                break;
+            }
+        }
+    }
+    &s[..end.min(s.len())]
+}
+
 pub struct TryInfo {
     pub handler_types: HashMap<u32, Vec<String>>,
     pub catch_all_addrs: Vec<u32>,
@@ -736,6 +838,12 @@ pub fn render_method_pseudocode_full(
                             .first()
                             .map(|a| ctx.operand_text(a))
                             .unwrap_or_default();
+                    } else {
+                        if let Some(line) = ctx.render_inst(iid)
+                            && !line.starts_with("// phi()")
+                        {
+                            lines.push(line);
+                        }
                     }
                 }
                 _ => {
@@ -795,6 +903,7 @@ pub fn render_method_pseudocode_full(
     }
     let text = fuse_new_init(&text);
     let text = apply_copy_chain_collapse(&text);
+    let text = apply_string_concat_fold(&text);
     let name_to_id: HashMap<String, SsaValueId> = ctx
         .value_names
         .iter()
@@ -948,5 +1057,45 @@ fn render_invoke_call(
                 format!("{class_name}.{method_name}({});", arg_texts.join(", "))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod concat_tests {
+    use super::*;
+
+    #[test]
+    fn folds_simple_append_chain() {
+        let line = "return ((v1.append((\" [ SEQ = \"))).append(this.j)).toString();";
+        let folded = fold_concat_line(line);
+        eprintln!("folded: {folded:?}");
+        assert!(folded.is_some(), "should fold");
+    }
+
+    #[test]
+    fn folds_real_tostring_chain() {
+        let line = "return (((((((((v1.append((this.a()))).append((\" [ SEQ = \"))).append(this.j)).append((\", ACK = \"))).append(v30)).append((\", LEN = \"))).append((this.b()))).append((\" ]\"))).toString();";
+        let folded = fold_concat_line(line);
+        eprintln!("folded: {folded:?}");
+        assert!(folded.is_some(), "should fold real chain");
+        let f = folded.unwrap();
+        assert!(f.contains(" + "), "result should contain +: {f}");
+        assert!(
+            !f.contains("append"),
+            "result should not contain append: {f}"
+        );
+    }
+
+    #[test]
+    fn trace_strip_steps() {
+        let line = "return (((v1.append((this.a()))).append(v30)).toString());";
+        let rest = line.trim().strip_prefix("return ").unwrap();
+        let after_semi = rest.trim().strip_suffix(';');
+        eprintln!("after_semi: {after_semi:?}");
+        let after_paren = after_semi.and_then(|r| r.strip_suffix(')'));
+        eprintln!("after_paren: {after_paren:?}");
+        let after_ts = after_paren.and_then(|r| r.strip_suffix(".toString()"));
+        eprintln!("after_toString: {after_ts:?}");
+        assert!(after_ts.is_some(), "toString strip should work");
     }
 }
