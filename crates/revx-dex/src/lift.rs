@@ -1346,37 +1346,38 @@ impl<'a> DexMethodLifter<'a> {
         if preds.is_empty() {
             return;
         }
-        let mut common: HashMap<u16, Vec<SsaValueId>> = HashMap::new();
-        for pred in &preds {
-            if let Some(defs) = self.block_defs.get(pred) {
+        let mut common: HashMap<u16, Vec<(BlockId, SsaValueId)>> = HashMap::new();
+        for &pred in &preds {
+            if let Some(defs) = self.block_defs.get(&pred) {
                 for (&reg, &id) in defs {
-                    common.entry(reg).or_default().push(id);
+                    common.entry(reg).or_default().push((pred, id));
                 }
             }
         }
-        for (reg, ids) in common {
-            if ids.len() == preds.len() {
-                let first = ids[0];
-                if ids.iter().all(|&id| id == first) {
-                    self.reg_values.insert(reg, first);
-                } else {
-                    let phi_id = self.func.new_value_id();
-                    let incoming: Vec<(BlockId, SsaValueId)> =
-                        preds.iter().map(|&p| (p, first)).collect();
-                    let phi = SsaInstruction {
-                        id: phi_id,
-                        op: SsaOp::Phi { incoming },
-                        source_addr: 0,
-                        block,
-                    };
-                    self.func.cfg.block_mut(block).phis.push(phi_id);
-                    self.func.values.push(phi);
-                    self.reg_values.insert(reg, phi_id);
-                    self.block_defs
-                        .entry(block)
-                        .or_default()
-                        .insert(reg, phi_id);
-                }
+        for (reg, pairs) in common {
+            if pairs.len() != preds.len() {
+                continue;
+            }
+            let first = pairs[0].1;
+            if pairs.iter().all(|&(_, id)| id == first) {
+                self.reg_values.insert(reg, first);
+            } else {
+                let phi_id = self.func.new_value_id();
+                let incoming: Vec<(BlockId, SsaValueId)> =
+                    pairs.iter().map(|&(p, id)| (p, id)).collect();
+                let phi = SsaInstruction {
+                    id: phi_id,
+                    op: SsaOp::Phi { incoming },
+                    source_addr: 0,
+                    block,
+                };
+                self.func.cfg.block_mut(block).phis.push(phi_id);
+                self.func.values.push(phi);
+                self.reg_values.insert(reg, phi_id);
+                self.block_defs
+                    .entry(block)
+                    .or_default()
+                    .insert(reg, phi_id);
             }
         }
     }
