@@ -47,6 +47,32 @@ impl<'a> RenderCtx<'a> {
         }
     }
 
+    fn cond_text(&mut self, cond: &Operand) -> String {
+        let Operand::Value(id) = cond else {
+            return self.operand_text(cond);
+        };
+        let Some(inst) = self.func.values.get(id.0 as usize) else {
+            return format!("v{}", id.0);
+        };
+        match &inst.op {
+            SsaOp::BinOp { kind, lhs, rhs } => {
+                let op = match kind {
+                    revx_analysis::ssa::BinOpKind::Eq => "==",
+                    revx_analysis::ssa::BinOpKind::Ne => "!=",
+                    revx_analysis::ssa::BinOpKind::Lt => "<",
+                    revx_analysis::ssa::BinOpKind::Le => "<=",
+                    revx_analysis::ssa::BinOpKind::Gt => ">",
+                    revx_analysis::ssa::BinOpKind::Ge => ">=",
+                    _ => "?",
+                };
+                let l = self.operand_text(lhs);
+                let r = self.operand_text(rhs);
+                format!("{l} {op} {r}")
+            }
+            _ => self.value_text(*id),
+        }
+    }
+
     fn value_text(&mut self, id: SsaValueId) -> String {
         if let Some(inst) = self.func.values.get(id.0 as usize) {
             match &inst.op {
@@ -157,25 +183,27 @@ impl<'a> RenderCtx<'a> {
                 } else if t.starts_with("__iget:") {
                     let field = t.strip_prefix("__iget:").unwrap_or("");
                     let obj = arg_texts.first().cloned().unwrap_or_default();
-                    let fname = field.rsplit('.').next().unwrap_or(field);
+                    let fname = field_name(field);
                     let name = self.name_of(id);
                     format!("{name} = {obj}.{fname};")
                 } else if t.starts_with("__iput:") {
                     let field = t.strip_prefix("__iput:").unwrap_or("");
                     let obj = arg_texts.first().cloned().unwrap_or_default();
                     let val = arg_texts.get(1).cloned().unwrap_or_default();
-                    let fname = field.rsplit('.').next().unwrap_or(field);
+                    let fname = field_name(field);
                     format!("{obj}.{fname} = {val};")
                 } else if t.starts_with("__sget:") {
                     let field = t.strip_prefix("__sget:").unwrap_or("");
-                    let fname = field.rsplit('.').next().unwrap_or(field);
+                    let fname = field_name(field);
+                    let owner = field_class(field);
                     let name = self.name_of(id);
-                    format!("{name} = {fname};")
+                    format!("{name} = {owner}.{fname};")
                 } else if t.starts_with("__sput:") {
                     let field = t.strip_prefix("__sput:").unwrap_or("");
                     let val = arg_texts.first().cloned().unwrap_or_default();
-                    let fname = field.rsplit('.').next().unwrap_or(field);
-                    format!("{fname} = {val};")
+                    let fname = field_name(field);
+                    let owner = field_class(field);
+                    format!("{owner}.{fname} = {val};")
                 } else if t.starts_with("new ") {
                     let ty_desc = t.strip_prefix("new ").unwrap_or("");
                     let name = self.name_of(id);
@@ -303,32 +331,60 @@ pub fn render_method_pseudocode(
 ) -> String {
     let mut ctx = RenderCtx::new(func);
     ctx.value_types = value_types.clone();
-    let mut lines = Vec::new();
 
-    // Reverse post-order: every value is defined before its uses along any path.
+    // Pre-render every block's statements + terminator summary in RPO order
+    // so value names are allocated deterministically before structuring.
     let order = reverse_post_order(func);
-    let mut visited = HashSet::new();
+    let mut block_renders: HashMap<BlockId, crate::structure::BlockRender> = HashMap::new();
     for &bid in &order {
-        if !visited.insert(bid) {
-            continue;
-        }
-        if bid != func.cfg.entry {
-            lines.push(format!("L{}:", bid.0));
-        }
         let block = &func.cfg.blocks[bid.0 as usize];
+        let mut lines = Vec::new();
+        let mut cond: Option<(String, BlockId, BlockId)> = None;
+        let mut jump: Option<BlockId> = None;
+        let mut cond_value_id: Option<SsaValueId> = None;
         for &iid in &block.insts {
-            if let Some(line) = ctx.render_inst(iid)
-                && !line.starts_with("// phi()")
+            if let Some(inst) = func.values.get(iid.0 as usize)
+                && let SsaOp::Branch { cond: c, .. } = &inst.op
+                && let Operand::Value(id) = c
             {
-                lines.push(format!("    {line}"));
+                cond_value_id = Some(*id);
             }
         }
+        for &iid in &block.insts {
+            let Some(inst) = func.values.get(iid.0 as usize) else {
+                continue;
+            };
+            match &inst.op {
+                SsaOp::Branch {
+                    cond: c,
+                    true_block,
+                    false_block,
+                } => {
+                    cond = Some((ctx.cond_text(c), *true_block, *false_block));
+                }
+                SsaOp::Jump { target } => {
+                    jump = Some(*target);
+                }
+                _ => {
+                    if cond_value_id == Some(iid) {
+                        continue;
+                    }
+                    if let Some(line) = ctx.render_inst(iid)
+                        && !line.starts_with("// phi()")
+                    {
+                        lines.push(line);
+                    }
+                }
+            }
+        }
+        block_renders.insert(bid, crate::structure::BlockRender { lines, cond, jump });
     }
 
-    if lines.is_empty() {
-        lines.push("    <empty>".to_string());
+    let text = crate::structure::render_structured(func, &block_renders);
+    let text = text.trim_end().to_string();
+    if text.is_empty() {
+        return "    <empty>".to_string();
     }
-    let text = lines.join("\n");
     let text = fuse_new_init(&text);
     let text = apply_copy_chain_collapse(&text);
     let name_to_id: HashMap<String, SsaValueId> = ctx
@@ -591,6 +647,21 @@ pub fn decompile_dex(
         }
     }
     out
+}
+
+fn field_name(field_ref: &str) -> String {
+    field_ref
+        .split_once("->")
+        .map(|(_, rest)| rest.split(':').next().unwrap_or(rest).to_string())
+        .unwrap_or_else(|| field_ref.to_string())
+}
+
+fn field_class(field_ref: &str) -> String {
+    let class = field_ref
+        .split_once("->")
+        .map(|(class, _)| class)
+        .unwrap_or(field_ref);
+    crate::types::simple_name(&crate::types::java_type(class))
 }
 
 fn clean_type_name(t: &str) -> String {
