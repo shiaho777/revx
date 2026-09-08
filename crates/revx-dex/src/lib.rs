@@ -12,6 +12,31 @@ pub mod types;
 
 use std::fmt;
 
+fn sleb128_at(data: &[u8], off: usize) -> std::result::Result<(i64, usize), DexError> {
+    let mut result = 0i64;
+    let mut shift = 0u32;
+    let mut pos = off;
+    loop {
+        let byte = *data.get(pos).ok_or(()).map_err(|_| DexError {
+            message: "sleb128 out of bounds".into(),
+            offset: pos,
+        })?;
+        pos += 1;
+        result |= ((byte & 0x7f) as i64) << shift;
+        shift += 7;
+        if byte & 0x80 == 0 {
+            if shift < 64 && (byte & 0x40) != 0 {
+                result |= (-1i64) << shift;
+            }
+            break;
+        }
+        if shift >= 64 {
+            break;
+        }
+    }
+    Ok((result, pos))
+}
+
 #[derive(Debug, Clone)]
 pub struct DexError {
     pub message: String,
@@ -116,6 +141,21 @@ pub struct CodeItem {
     pub tries_size: u16,
     pub debug_info_off: u32,
     pub insns: Vec<u16>,
+    pub tries: Vec<TryItem>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TryItem {
+    pub start_addr: u32,
+    pub insn_count: u16,
+    pub handlers: Vec<CatchHandler>,
+    pub catch_all_addr: Option<u32>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CatchHandler {
+    pub type_idx: u32,
+    pub addr: u32,
 }
 
 pub struct DexFile {
@@ -488,6 +528,26 @@ impl DexFile {
         for i in 0..insns_size {
             insns.push(r.u16_at(off + 16 + i as usize * 2)?);
         }
+        let mut tries = Vec::new();
+        if tries_size > 0 {
+            let tries_start =
+                off + 16 + insns_size as usize * 2 + if insns_size % 2 == 1 { 2 } else { 0 };
+            let handlers_list_off = tries_start + tries_size as usize * 8;
+            for i in 0..tries_size {
+                let tries_off = tries_start + i as usize * 8;
+                let start_addr = r.u32_at(tries_off)?;
+                let insn_count = r.u16_at(tries_off + 4)?;
+                let handler_off = r.u16_at(tries_off + 6)? as usize;
+                let (handlers, catch_all) =
+                    Self::parse_catch_handlers(&r, handlers_list_off + handler_off)?;
+                tries.push(TryItem {
+                    start_addr,
+                    insn_count,
+                    handlers,
+                    catch_all_addr: catch_all,
+                });
+            }
+        }
         Ok(CodeItem {
             registers_size,
             ins_size,
@@ -495,7 +555,34 @@ impl DexFile {
             tries_size,
             debug_info_off,
             insns,
+            tries,
         })
+    }
+
+    fn parse_catch_handlers(r: &Reader, base: usize) -> Result<(Vec<CatchHandler>, Option<u32>)> {
+        let Ok((size, mut p)) = sleb128_at(r.data, base) else {
+            return Ok((vec![], None));
+        };
+        let mut handlers = Vec::new();
+        let mut catch_all = None;
+        let typed = if size <= 0 { size + 1 } else { size };
+        for _ in 0..typed.max(0) {
+            let Ok((type_idx, np)) = r.uleb128_at(p) else {
+                break;
+            };
+            p = np;
+            let Ok((addr, np)) = r.uleb128_at(p) else {
+                break;
+            };
+            p = np;
+            handlers.push(CatchHandler { type_idx, addr });
+        }
+        if size <= 0
+            && let Ok((addr, _)) = r.uleb128_at(p)
+        {
+            catch_all = Some(addr);
+        }
+        Ok((handlers, catch_all))
     }
 
     pub fn method_proto(&self, method_idx: u32) -> Option<&ProtoId> {

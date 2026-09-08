@@ -636,7 +636,8 @@ pub struct MethodPseudocode {
 pub fn decompile_method(dex: &DexFile, code: &CodeItem, method_idx: u32) -> MethodPseudocode {
     let output = lift_method_to_ssa(dex, code, method_idx);
     let sig = dex.method_signature(method_idx);
-    let text = render_method_pseudocode_full(&output);
+    let try_info = build_try_info(dex, &code.tries);
+    let text = render_method_pseudocode_full(&output, &try_info);
     MethodPseudocode {
         signature: sig,
         pseudocode: text,
@@ -645,12 +646,53 @@ pub fn decompile_method(dex: &DexFile, code: &CodeItem, method_idx: u32) -> Meth
     }
 }
 
-pub fn render_method_pseudocode_full(output: &crate::lift::LiftOutput) -> String {
+pub struct TryInfo {
+    pub handler_types: HashMap<u32, Vec<String>>,
+    pub catch_all_addrs: Vec<u32>,
+    pub try_regions: Vec<(u32, u32)>,
+}
+
+pub fn build_try_info(dex: &DexFile, tries: &[crate::TryItem]) -> TryInfo {
+    let mut handler_types: HashMap<u32, Vec<String>> = HashMap::new();
+    let mut catch_all_addrs = Vec::new();
+    let mut try_regions = Vec::new();
+    for t in tries {
+        try_regions.push((t.start_addr, t.start_addr + t.insn_count as u32));
+        for h in &t.handlers {
+            let type_desc = dex
+                .types
+                .get(h.type_idx as usize)
+                .cloned()
+                .unwrap_or_default();
+            handler_types
+                .entry(h.addr)
+                .or_default()
+                .push(crate::types::java_type(&type_desc));
+        }
+        if let Some(addr) = t.catch_all_addr {
+            catch_all_addrs.push(addr);
+        }
+    }
+    TryInfo {
+        handler_types,
+        catch_all_addrs,
+        try_regions,
+    }
+}
+
+pub fn render_method_pseudocode_full(
+    output: &crate::lift::LiftOutput,
+    try_info: &TryInfo,
+) -> String {
     let func = &output.func;
     let value_types = &output.value_types;
     let switch_cases = &output.switch_cases;
     let mut ctx = RenderCtx::new(func);
     ctx.value_types = value_types.clone();
+
+    let handler_types = &try_info.handler_types;
+    let catch_all_addrs = &try_info.catch_all_addrs;
+    let try_regions = &try_info.try_regions;
 
     let order = reverse_post_order(func);
     let mut block_renders: HashMap<BlockId, crate::structure::BlockRender> = HashMap::new();
@@ -714,10 +756,31 @@ pub fn render_method_pseudocode_full(output: &crate::lift::LiftOutput) -> String
         } else {
             None
         };
+        let block_addr = block.start_addr as u32;
+        let mut prefix: Vec<String> = Vec::new();
+        if let Some(types) = handler_types.get(&block_addr) {
+            for ty in types {
+                prefix.push(format!("catch ({ty} e) {{"));
+            }
+        }
+        if catch_all_addrs.contains(&block_addr) {
+            prefix.push("catch (Throwable e) {".to_string());
+        }
+        if try_regions.iter().any(|(s, _)| block_addr == *s) {
+            prefix.push("try {".to_string());
+        }
+        if try_regions
+            .iter()
+            .any(|(s, e)| *s < block_addr && block_addr < *e)
+        {
+            prefix.push("// (inside try region)".to_string());
+        }
+        let mut all_lines = prefix;
+        all_lines.extend(lines);
         block_renders.insert(
             bid,
             crate::structure::BlockRender {
-                lines,
+                lines: all_lines,
                 cond,
                 jump,
                 switch,
