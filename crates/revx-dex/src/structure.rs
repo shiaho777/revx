@@ -32,7 +32,7 @@ const MAX_LOOP_MEMBERS: usize = 128;
 
 pub fn render_structured(func: &SsaFunction, blocks: &HashMap<BlockId, BlockRender>) -> String {
     let mut r = StructuredRenderer::new(func);
-    r.walk(func.cfg.entry, blocks);
+    r.walk(func.cfg.entry, blocks, None);
     if r.lines.is_empty() {
         return "    <empty>".to_string();
     }
@@ -91,7 +91,15 @@ impl<'a> StructuredRenderer<'a> {
         self.lines.push(format!("{}{}", self.indent(), line));
     }
 
-    fn walk(&mut self, block: BlockId, blocks: &HashMap<BlockId, BlockRender>) {
+    fn walk(
+        &mut self,
+        block: BlockId,
+        blocks: &HashMap<BlockId, BlockRender>,
+        stop_at: Option<BlockId>,
+    ) {
+        if Some(block) == stop_at {
+            return;
+        }
         if self.depth > MAX_DEPTH || self.lines.len() > MAX_LINES {
             return;
         }
@@ -115,13 +123,13 @@ impl<'a> StructuredRenderer<'a> {
         if let Some((cond_text, t, f)) = &render.cond {
             let cond_text = cond_text.clone();
             let (t, f) = (*t, *f);
-            self.handle_branch(block, &cond_text, t, f, blocks);
+            self.handle_branch(block, &cond_text, t, f, blocks, stop_at);
         } else if let Some(target) = render.jump {
-            self.handle_jump(target, blocks);
+            self.handle_jump(target, blocks, stop_at);
         } else if let Some((switch_val, cases)) = &render.switch {
             let switch_val = switch_val.clone();
             let cases = cases.clone();
-            self.handle_switch(&switch_val, &cases, blocks);
+            self.handle_switch(&switch_val, &cases, blocks, stop_at);
         }
         self.depth -= 1;
     }
@@ -133,6 +141,7 @@ impl<'a> StructuredRenderer<'a> {
         t: BlockId,
         f: BlockId,
         blocks: &HashMap<BlockId, BlockRender>,
+        outer_stop: Option<BlockId>,
     ) {
         if let Some((body, exit)) = self.while_shape(head, t, f) {
             let cond = if body == t {
@@ -141,42 +150,47 @@ impl<'a> StructuredRenderer<'a> {
                 negate(cond_text)
             };
             self.push(format!("while ({cond}) {{"));
-            self.walk(body, blocks);
+            self.walk(body, blocks, Some(exit));
             self.push("}");
-            self.walk(exit, blocks);
+            self.walk(exit, blocks, outer_stop);
             return;
         }
         let join = self.join_of(t, f);
         if t == join && f == join {
-            self.walk(join, blocks);
+            self.walk(join, blocks, outer_stop);
             return;
         }
         if t == join {
             let negated = negate(cond_text);
             self.push(format!("if ({negated}) {{"));
-            self.walk(f, blocks);
+            self.walk(f, blocks, Some(join));
             self.push("}");
         } else if f == join {
             self.push(format!("if ({cond_text}) {{"));
-            self.walk(t, blocks);
+            self.walk(t, blocks, Some(join));
             self.push("}");
         } else {
             self.push(format!("if ({cond_text}) {{"));
-            self.walk(t, blocks);
+            self.walk(t, blocks, Some(join));
             self.push("} else {");
-            self.walk(f, blocks);
+            self.walk(f, blocks, Some(join));
             self.push("}");
         }
-        self.walk(join, blocks);
+        self.walk(join, blocks, outer_stop);
     }
 
-    fn handle_jump(&mut self, target: BlockId, blocks: &HashMap<BlockId, BlockRender>) {
+    fn handle_jump(
+        &mut self,
+        target: BlockId,
+        blocks: &HashMap<BlockId, BlockRender>,
+        stop_at: Option<BlockId>,
+    ) {
         if self.visited.contains(&target) {
             self.goto_targets.insert(target);
             self.push(format!("goto L{};", target.0));
             return;
         }
-        self.walk(target, blocks);
+        self.walk(target, blocks, stop_at);
     }
 
     fn handle_switch(
@@ -184,18 +198,19 @@ impl<'a> StructuredRenderer<'a> {
         switch_val: &str,
         cases: &[(String, BlockId)],
         blocks: &HashMap<BlockId, BlockRender>,
+        stop_at: Option<BlockId>,
     ) {
         self.push(format!("switch ({switch_val}) {{"));
         for (key, target) in cases {
             self.push(format!("case {key}:"));
-            self.walk(*target, blocks);
+            self.walk(*target, blocks, stop_at);
         }
         self.push("}");
         let after = cases.iter().map(|(_, t)| t.0).max().map(|m| BlockId(m + 1));
         if let Some(next) = after
             && (next.0 as usize) < self.func.cfg.blocks.len()
         {
-            self.walk(next, blocks);
+            self.walk(next, blocks, stop_at);
         }
     }
 
