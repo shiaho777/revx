@@ -93,6 +93,14 @@ enum DexCommands {
     Decompile(DexDecompileArgs),
     Java(DexJavaArgs),
     JniLink(DexJniLinkArgs),
+    KotlinNames(DexKotlinNamesArgs),
+}
+
+#[derive(Args)]
+struct DexKotlinNamesArgs {
+    path: PathBuf,
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Args)]
@@ -791,7 +799,47 @@ async fn main() -> Result<()> {
         Command::Dex(DexCommands::Decompile(args)) => cmd_dex_decompile(args),
         Command::Dex(DexCommands::Java(args)) => cmd_dex_java(args),
         Command::Dex(DexCommands::JniLink(args)) => cmd_dex_jni_link(args),
+        Command::Dex(DexCommands::KotlinNames(args)) => cmd_dex_kotlin_names(args),
     }
+}
+
+fn cmd_dex_kotlin_names(args: DexKotlinNamesArgs) -> Result<()> {
+    let data =
+        fs::read(&args.path).with_context(|| format!("failed to read {}", args.path.display()))?;
+    let dex =
+        revx_dex::DexFile::parse(data).map_err(|e| anyhow::anyhow!("DEX parse failed: {e}"))?;
+    let metadata = revx_dex::kotlin::extract_kotlin_metadata(&dex);
+    let recovered = revx_dex::kotlin::recover_names(&metadata);
+    if args.json {
+        let rows: Vec<serde_json::Value> = recovered
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "obfuscated": r.obfuscated,
+                    "real": r.real,
+                    "members": r.members,
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::json!({
+                "kotlin_classes": metadata.len(),
+                "recovered": recovered.len(),
+                "rows": rows,
+            })
+        );
+    } else {
+        for r in &recovered {
+            println!("{}\t{}\t{}", r.obfuscated, r.real, r.members.join(","));
+        }
+        eprintln!(
+            "// {} kotlin @Metadata classes, {} names recovered",
+            metadata.len(),
+            recovered.len()
+        );
+    }
+    Ok(())
 }
 
 fn cmd_dex_jni_link(args: DexJniLinkArgs) -> Result<()> {

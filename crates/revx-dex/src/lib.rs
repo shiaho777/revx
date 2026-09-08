@@ -4,6 +4,7 @@
 pub mod classgen;
 pub mod insns;
 pub mod jni;
+pub mod kotlin;
 pub mod lift;
 pub mod render;
 pub mod structure;
@@ -103,6 +104,7 @@ pub struct ClassDef {
     pub superclass: Option<String>,
     pub interfaces: Vec<String>,
     pub source_file: Option<String>,
+    pub annotations_off: u32,
     pub class_data: Option<ClassData>,
 }
 
@@ -336,6 +338,7 @@ impl DexFile {
             let interfaces_off = r.u32_at(base + 12)?;
             let source_file_idx = r.u32_at(base + 16)?;
             let class_data_off = r.u32_at(base + 24)?;
+            let annotations_off = r.u32_at(base + 20)?;
 
             let superclass = if superclass_idx == u32::MAX {
                 None
@@ -376,6 +379,7 @@ impl DexFile {
                 superclass,
                 interfaces,
                 source_file,
+                annotations_off,
                 class_data,
             });
         }
