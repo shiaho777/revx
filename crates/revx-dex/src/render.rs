@@ -9,6 +9,7 @@ struct RenderCtx<'a> {
     func: &'a SsaFunction,
     value_names: HashMap<SsaValueId, String>,
     emitted_defs: HashSet<SsaValueId>,
+    value_types: crate::types::ValueTypes,
 }
 
 impl<'a> RenderCtx<'a> {
@@ -17,6 +18,7 @@ impl<'a> RenderCtx<'a> {
             func,
             value_names: HashMap::new(),
             emitted_defs: HashSet::new(),
+            value_types: HashMap::new(),
         }
     }
 
@@ -295,13 +297,18 @@ fn operand_uses(op: &Operand, id: SsaValueId) -> bool {
     }
 }
 
-pub fn render_method_pseudocode(func: &SsaFunction) -> String {
+pub fn render_method_pseudocode(
+    func: &SsaFunction,
+    value_types: &crate::types::ValueTypes,
+) -> String {
     let mut ctx = RenderCtx::new(func);
+    ctx.value_types = value_types.clone();
     let mut lines = Vec::new();
-    let mut visited = HashSet::new();
-    let mut queue: Vec<BlockId> = vec![func.cfg.entry];
 
-    while let Some(bid) = queue.pop() {
+    // Reverse post-order: every value is defined before its uses along any path.
+    let order = reverse_post_order(func);
+    let mut visited = HashSet::new();
+    for &bid in &order {
         if !visited.insert(bid) {
             continue;
         }
@@ -316,11 +323,6 @@ pub fn render_method_pseudocode(func: &SsaFunction) -> String {
                 lines.push(format!("    {line}"));
             }
         }
-        for &succ in &func.cfg.succs[bid.0 as usize] {
-            if !visited.contains(&succ) {
-                queue.push(succ);
-            }
-        }
     }
 
     if lines.is_empty() {
@@ -328,7 +330,82 @@ pub fn render_method_pseudocode(func: &SsaFunction) -> String {
     }
     let text = lines.join("\n");
     let text = fuse_new_init(&text);
-    apply_copy_chain_collapse(&text)
+    let text = apply_copy_chain_collapse(&text);
+    let name_to_id: HashMap<String, SsaValueId> = ctx
+        .value_names
+        .iter()
+        .map(|(id, name)| (name.clone(), *id))
+        .collect();
+    apply_typed_declarations(&text, value_types, &name_to_id)
+}
+
+fn reverse_post_order(func: &SsaFunction) -> Vec<BlockId> {
+    let n = func.cfg.blocks.len();
+    if n == 0 {
+        return vec![];
+    }
+    let mut visited = vec![false; n];
+    let mut post: Vec<BlockId> = Vec::with_capacity(n);
+    let mut stack: Vec<(BlockId, usize)> = vec![(func.cfg.entry, 0)];
+    visited[func.cfg.entry.0 as usize] = true;
+    while let Some(&mut (bid, ref mut next)) = stack.last_mut() {
+        let succs = func
+            .cfg
+            .succs
+            .get(bid.0 as usize)
+            .cloned()
+            .unwrap_or_default();
+        if *next < succs.len() {
+            let succ = succs[*next];
+            *next += 1;
+            if (succ.0 as usize) < n && !visited[succ.0 as usize] {
+                visited[succ.0 as usize] = true;
+                stack.push((succ, 0));
+            }
+        } else {
+            post.push(bid);
+            stack.pop();
+        }
+    }
+    post.reverse();
+    post
+}
+
+fn apply_typed_declarations(
+    text: &str,
+    value_types: &crate::types::ValueTypes,
+    name_to_id: &HashMap<String, SsaValueId>,
+) -> String {
+    let mut var_type: HashMap<String, String> = HashMap::new();
+    for (name, id) in name_to_id {
+        if let Some(t) = value_types.get(id)
+            && !t.is_empty()
+        {
+            var_type.insert(name.clone(), crate::types::java_type(t));
+        }
+    }
+    if var_type.is_empty() {
+        return text.to_string();
+    }
+    let mut out_lines: Vec<String> = Vec::new();
+    let mut declared: HashSet<String> = HashSet::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if let Some((var, rest)) = trimmed.strip_suffix(';').and_then(|l| l.split_once(" = ")) {
+            let var = var.trim();
+            if let Some(t) = var_type.get(var)
+                && !declared.contains(var)
+                && var.starts_with('v')
+                && !rest.trim().starts_with("new ")
+            {
+                declared.insert(var.to_string());
+                out_lines.push(format!("    {t} {var} = {rest};"));
+                continue;
+            }
+        }
+        out_lines.push(line.to_string());
+    }
+    out_lines.join("\n")
 }
 
 fn fuse_new_init(text: &str) -> String {
@@ -451,9 +528,9 @@ pub struct MethodPseudocode {
 }
 
 pub fn decompile_method(dex: &DexFile, code: &CodeItem, method_idx: u32) -> MethodPseudocode {
-    let func = lift_method_to_ssa(dex, code);
+    let (func, value_types) = lift_method_to_ssa(dex, code, method_idx);
     let sig = dex.method_signature(method_idx);
-    let text = render_method_pseudocode(&func);
+    let text = render_method_pseudocode(&func, &value_types);
     MethodPseudocode {
         signature: sig,
         pseudocode: text,

@@ -4,6 +4,7 @@
 pub mod insns;
 pub mod lift;
 pub mod render;
+pub mod types;
 
 use std::fmt;
 

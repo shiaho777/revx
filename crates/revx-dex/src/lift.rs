@@ -1038,11 +1038,16 @@ pub fn build_basic_blocks(
 pub struct DexLiftContext<'a> {
     pub dex: &'a DexFile,
     pub code: &'a CodeItem,
+    pub method_idx: u32,
 }
 
 impl<'a> DexLiftContext<'a> {
-    pub fn new(dex: &'a DexFile, code: &'a CodeItem) -> Self {
-        Self { dex, code }
+    pub fn new(dex: &'a DexFile, code: &'a CodeItem, method_idx: u32) -> Self {
+        Self {
+            dex,
+            code,
+            method_idx,
+        }
     }
 }
 
@@ -1053,6 +1058,8 @@ pub struct DexMethodLifter<'a> {
     reg_values: HashMap<u16, SsaValueId>,
     block_defs: HashMap<BlockId, HashMap<u16, SsaValueId>>,
     pending_call_result: Option<SsaValueId>,
+    pending_call_type: Option<String>,
+    value_types: crate::types::ValueTypes,
 }
 
 impl<'a> DexMethodLifter<'a> {
@@ -1068,7 +1075,38 @@ impl<'a> DexMethodLifter<'a> {
             reg_values: HashMap::new(),
             block_defs: HashMap::new(),
             pending_call_result: None,
+            pending_call_type: None,
+            value_types: HashMap::new(),
         }
+    }
+
+    fn set_type(&mut self, id: SsaValueId, ty: &str) {
+        let java = crate::types::java_type(ty);
+        self.value_types.insert(id, java);
+    }
+
+    fn method_return_type(&self, method_idx: u32) -> Option<String> {
+        let m = self.ctx.dex.methods.get(method_idx as usize)?;
+        let p = self.ctx.dex.protos.get(m.proto as usize)?;
+        Some(p.return_type.clone())
+    }
+
+    fn field_type(&self, field_idx: u32) -> Option<String> {
+        self.ctx
+            .dex
+            .fields
+            .get(field_idx as usize)
+            .map(|f| f.ty.clone())
+    }
+
+    fn array_element_type(&self, arr: u16) -> Option<String> {
+        let id = self.reg_values.get(&arr)?;
+        let desc = self.value_types.get(id)?;
+        let elem = desc.trim_end_matches("[]");
+        if elem == desc {
+            return None;
+        }
+        Some(elem.to_string())
     }
 
     fn block_id(&mut self, addr: u32) -> BlockId {
@@ -1160,10 +1198,40 @@ impl<'a> DexMethodLifter<'a> {
         self.block_ids = id_map.into_iter().collect();
     }
 
-    pub fn lift(mut self) -> SsaFunction {
+    pub fn lift(mut self) -> (SsaFunction, crate::types::ValueTypes) {
         let insns = decode_all(self.ctx.code);
         let blocks = build_basic_blocks(self.ctx.code, &insns);
         self.build_cfg(&blocks);
+
+        // Parameter types from the method's proto (instance methods: p0 is the receiver).
+        let is_static = {
+            let mut found = false;
+            for class in &self.ctx.dex.classes {
+                let Some(cd) = &class.class_data else {
+                    continue;
+                };
+                for m in cd.direct_methods.iter().chain(cd.virtual_methods.iter()) {
+                    if m.method_idx == self.ctx.method_idx {
+                        found = m.access_flags & 0x0008 != 0;
+                    }
+                }
+            }
+            found
+        };
+        let param_types: Vec<String> = self
+            .ctx
+            .dex
+            .protos
+            .get(
+                self.ctx
+                    .dex
+                    .methods
+                    .get(self.ctx.method_idx as usize)
+                    .map(|m| m.proto as usize)
+                    .unwrap_or(0),
+            )
+            .map(|p| p.parameters.clone())
+            .unwrap_or_default();
 
         let registers = self.ctx.code.registers_size;
         let ins = self.ctx.code.ins_size;
@@ -1181,6 +1249,22 @@ impl<'a> DexMethodLifter<'a> {
             };
             self.func.cfg.block_mut(BlockId(0)).insts.push(id);
             self.func.values.push(inst);
+            let ty = if !is_static && i == 0 {
+                self.ctx
+                    .dex
+                    .methods
+                    .get(self.ctx.method_idx as usize)
+                    .map(|m| m.class.clone())
+                    .unwrap_or_default()
+            } else {
+                param_types
+                    .get(if is_static { i } else { i - 1 } as usize)
+                    .cloned()
+                    .unwrap_or_default()
+            };
+            if !ty.is_empty() {
+                self.set_type(id, &ty);
+            }
             self.reg_values.insert(reg, id);
             self.block_defs
                 .entry(BlockId(0))
@@ -1188,9 +1272,9 @@ impl<'a> DexMethodLifter<'a> {
                 .insert(reg, id);
         }
 
-        let mut worklist: Vec<BlockId> = vec![BlockId(0)];
+        let order = self.reverse_post_order();
         let mut visited = BTreeSet::new();
-        while let Some(bid) = worklist.pop() {
+        for &bid in &order {
             if !visited.insert(bid) {
                 continue;
             }
@@ -1209,15 +1293,39 @@ impl<'a> DexMethodLifter<'a> {
                 self.lift_insn(bid, cur_off, insn);
                 cur_off += *size as u32;
             }
-
-            for &succ in &self.func.cfg.succs[bid.0 as usize] {
-                if !visited.contains(&succ) {
-                    worklist.push(succ);
-                }
-            }
         }
 
-        self.func
+        (self.func, self.value_types)
+    }
+
+    fn reverse_post_order(&self) -> Vec<BlockId> {
+        let n = self.func.cfg.blocks.len();
+        let mut visited = vec![false; n];
+        let mut post: Vec<BlockId> = Vec::with_capacity(n);
+        let mut stack: Vec<(BlockId, usize)> = vec![(BlockId(0), 0)];
+        visited[0] = true;
+        while let Some(&mut (bid, ref mut next)) = stack.last_mut() {
+            let succs = self
+                .func
+                .cfg
+                .succs
+                .get(bid.0 as usize)
+                .cloned()
+                .unwrap_or_default();
+            if *next < succs.len() {
+                let succ = succs[*next];
+                *next += 1;
+                if !visited[succ.0 as usize] {
+                    visited[succ.0 as usize] = true;
+                    stack.push((succ, 0));
+                }
+            } else {
+                post.push(bid);
+                stack.pop();
+            }
+        }
+        post.reverse();
+        post
     }
 
     fn merge_predecessor_regs(&mut self, block: BlockId) {
@@ -1296,23 +1404,30 @@ impl<'a> DexMethodLifter<'a> {
                 self.push_inst(block, SsaOp::Return { value });
             }
             Insn::Const { dst, value } => {
-                self.define(
+                let id = self.define(
                     *dst,
                     block,
                     SsaOp::Copy {
                         src: Operand::Constant(*value),
                     },
                 );
+                let t = if *value < i32::MIN as i64 || *value > u32::MAX as i64 {
+                    "J"
+                } else {
+                    "I"
+                };
+                self.set_type(id, t);
             }
             Insn::ConstString { dst, idx } => {
                 let s = crate::insns::escape_string(self.ctx.dex.string_value(*idx));
-                self.define(
+                let id = self.define(
                     *dst,
                     block,
                     SsaOp::Copy {
                         src: Operand::Symbol(format!("\"{s}\"")),
                     },
                 );
+                self.set_type(id, "Ljava/lang/String;");
             }
             Insn::ConstClass { dst, idx } => {
                 let t = self.ctx.dex.type_name(*idx);
@@ -1398,13 +1513,15 @@ impl<'a> DexMethodLifter<'a> {
                         args: vec![val],
                     },
                 );
-                self.define(
+                let copy_id = self.define(
                     *dst,
                     block,
                     SsaOp::Copy {
                         src: Operand::Value(id),
                     },
                 );
+                self.set_type(id, "Z");
+                self.set_type(copy_id, "Z");
             }
             Insn::ArrayLength { dst, arr } => {
                 let val = self.value(*arr);
@@ -1432,13 +1549,15 @@ impl<'a> DexMethodLifter<'a> {
                         args: vec![],
                     },
                 );
-                self.define(
+                let copy_id = self.define(
                     *dst,
                     block,
                     SsaOp::Copy {
                         src: Operand::Value(id),
                     },
                 );
+                self.set_type(id, &t);
+                self.set_type(copy_id, &t);
             }
             Insn::NewArray {
                 dst,
@@ -1454,13 +1573,15 @@ impl<'a> DexMethodLifter<'a> {
                         args: vec![size_val],
                     },
                 );
-                self.define(
+                let copy_id = self.define(
                     *dst,
                     block,
                     SsaOp::Copy {
                         src: Operand::Value(id),
                     },
                 );
+                self.set_type(id, &t);
+                self.set_type(copy_id, &t);
             }
             Insn::FilledNewArray { regs, type_idx } => {
                 let t = self.ctx.dex.type_name(*type_idx);
@@ -1598,13 +1719,17 @@ impl<'a> DexMethodLifter<'a> {
                         args: vec![a, i],
                     },
                 );
-                self.define(
+                let copy_id = self.define(
                     *dst,
                     block,
                     SsaOp::Copy {
                         src: Operand::Value(id),
                     },
                 );
+                if let Some(elem) = self.array_element_type(*arr) {
+                    self.set_type(id, &elem);
+                    self.set_type(copy_id, &elem);
+                }
             }
             Insn::ArrayPut { src, arr, idx, .. } => {
                 let s = self.value(*src);
@@ -1632,13 +1757,17 @@ impl<'a> DexMethodLifter<'a> {
                         args: vec![o],
                     },
                 );
-                self.define(
+                let copy_id = self.define(
                     *dst,
                     block,
                     SsaOp::Copy {
                         src: Operand::Value(id),
                     },
                 );
+                if let Some(t) = self.field_type(*field_idx) {
+                    self.set_type(id, &t);
+                    self.set_type(copy_id, &t);
+                }
             }
             Insn::FieldPut {
                 src,
@@ -1665,13 +1794,17 @@ impl<'a> DexMethodLifter<'a> {
                         args: vec![],
                     },
                 );
-                self.define(
+                let copy_id = self.define(
                     *dst,
                     block,
                     SsaOp::Copy {
                         src: Operand::Value(id),
                     },
                 );
+                if let Some(t) = self.field_type(*field_idx) {
+                    self.set_type(id, &t);
+                    self.set_type(copy_id, &t);
+                }
             }
             Insn::StaticPut { src, field_idx } => {
                 let s = self.value(*src);
@@ -1699,6 +1832,7 @@ impl<'a> DexMethodLifter<'a> {
                     },
                 );
                 self.pending_call_result = Some(id);
+                self.pending_call_type = self.method_return_type(*method_idx);
             }
             Insn::InvokeRange {
                 kind,
@@ -1718,6 +1852,7 @@ impl<'a> DexMethodLifter<'a> {
                     },
                 );
                 self.pending_call_result = Some(id);
+                self.pending_call_type = self.method_return_type(*method_idx);
             }
             Insn::InvokePolymorphic {
                 regs,
@@ -1895,8 +2030,12 @@ impl<'a> DexMethodLifter<'a> {
     }
 }
 
-pub fn lift_method_to_ssa(dex: &DexFile, code: &CodeItem) -> SsaFunction {
-    let ctx = DexLiftContext::new(dex, code);
+pub fn lift_method_to_ssa(
+    dex: &DexFile,
+    code: &CodeItem,
+    method_idx: u32,
+) -> (SsaFunction, crate::types::ValueTypes) {
+    let ctx = DexLiftContext::new(dex, code, method_idx);
     DexMethodLifter::new(ctx).lift()
 }
 
