@@ -1,6 +1,7 @@
 //! DEX file format parser: header, string/type/proto/field/method tables,
 //! class definitions, class data, and code items.
 
+pub mod classgen;
 pub mod insns;
 pub mod lift;
 pub mod render;

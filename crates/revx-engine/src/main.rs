@@ -91,6 +91,16 @@ enum Command {
 enum DexCommands {
     Disasm(DexDisasmArgs),
     Decompile(DexDecompileArgs),
+    Java(DexJavaArgs),
+}
+
+#[derive(Args)]
+struct DexJavaArgs {
+    path: PathBuf,
+    #[arg(long)]
+    class: Option<String>,
+    #[arg(long, default_value_t = 3)]
+    limit: usize,
 }
 
 #[derive(Args)]
@@ -770,7 +780,53 @@ async fn main() -> Result<()> {
         }) => cmd_mcp_install(prefix, workspace, host, write_config, init_workspace),
         Command::Dex(DexCommands::Disasm(args)) => cmd_dex_disasm(args),
         Command::Dex(DexCommands::Decompile(args)) => cmd_dex_decompile(args),
+        Command::Dex(DexCommands::Java(args)) => cmd_dex_java(args),
     }
+}
+
+fn cmd_dex_java(args: DexJavaArgs) -> Result<()> {
+    let data =
+        fs::read(&args.path).with_context(|| format!("failed to read {}", args.path.display()))?;
+    let dex =
+        revx_dex::DexFile::parse(data).map_err(|e| anyhow::anyhow!("DEX parse failed: {e}"))?;
+    let mut emitted = 0usize;
+    for class in &dex.classes {
+        if let Some(f) = args.class.as_deref()
+            && !class.class.contains(f)
+        {
+            continue;
+        }
+        if emitted >= args.limit {
+            break;
+        }
+        emitted += 1;
+        let mut method_bodies: Vec<(u32, u32, String)> = Vec::new();
+        if let Some(cd) = &class.class_data {
+            for m in cd.direct_methods.iter().chain(cd.virtual_methods.iter()) {
+                if m.code_off == 0 {
+                    method_bodies.push((m.method_idx, 0, "    // no code".to_string()));
+                    continue;
+                }
+                match dex.code_item(m.code_off) {
+                    Ok(code) => {
+                        let mc = revx_dex::render::decompile_method(&dex, &code, m.method_idx);
+                        method_bodies.push((
+                            m.method_idx,
+                            code.registers_size as u32,
+                            mc.pseudocode,
+                        ));
+                    }
+                    Err(e) => {
+                        method_bodies.push((m.method_idx, 0, format!("    // code error: {e}")));
+                    }
+                }
+            }
+        }
+        let text = revx_dex::classgen::render_java_class(&dex, class, &method_bodies);
+        println!("{text}");
+    }
+    eprintln!("// {emitted} classes rendered");
+    Ok(())
 }
 
 fn cmd_dex_disasm(args: DexDisasmArgs) -> Result<()> {
