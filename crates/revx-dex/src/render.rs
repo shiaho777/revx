@@ -874,6 +874,28 @@ fn parse_increment(line: &str, var: &str) -> Option<String> {
     None
 }
 
+fn apply_arm_tail_goto_cleanup(text: &str) -> String {
+    let mut lines: Vec<String> = text.lines().map(|l| l.to_string()).collect();
+    let mut i = 0usize;
+    while i < lines.len() {
+        let trimmed = lines[i].trim();
+        if trimmed.starts_with("goto L") && trimmed.ends_with(';') {
+            let mut j = i + 1;
+            while j < lines.len() && lines[j].trim().is_empty() {
+                j += 1;
+            }
+            if j < lines.len() {
+                let next = lines[j].trim();
+                if next == "}" || next == "} else {" {
+                    lines[i] = String::new();
+                }
+            }
+        }
+        i += 1;
+    }
+    lines.join("\n")
+}
+
 fn apply_dead_allocation_cleanup(text: &str) -> String {
     let lines: Vec<&str> = text.lines().collect();
     let mut out = Vec::new();
@@ -1074,6 +1096,7 @@ pub fn render_method_pseudocode_full(
     let text = apply_for_loop_recovery(&text);
     let text = apply_latch_continue_cleanup(&text);
     let text = apply_dead_allocation_cleanup(&text);
+    let text = apply_arm_tail_goto_cleanup(&text);
     let name_to_id: HashMap<String, SsaValueId> = ctx
         .value_names
         .iter()
