@@ -748,6 +748,132 @@ fn balanced_prefix(s: &str) -> &str {
     &s[..end.min(s.len())]
 }
 
+fn apply_for_loop_recovery(text: &str) -> String {
+    let mut lines: Vec<String> = text.lines().map(|l| l.to_string()).collect();
+    let mut i = 0usize;
+    while i < lines.len() {
+        let trimmed = lines[i].trim().to_string();
+        let Some(cond) = trimmed
+            .strip_prefix("while (")
+            .and_then(|r| r.strip_suffix(") {"))
+        else {
+            i += 1;
+            continue;
+        };
+        let Some(var) = loop_var(cond) else {
+            i += 1;
+            continue;
+        };
+        // find init: previous non-empty line is TYPE VAR = INIT;
+        let init_line = if i > 0 {
+            lines[i - 1].trim().to_string()
+        } else {
+            String::new()
+        };
+        let Some(init_info) = parse_init(&init_line, &var) else {
+            i += 1;
+            continue;
+        };
+        // find matching close brace and check last body line for increment
+        let open_indent = lines[i].len() - lines[i].trim_start().len();
+        let mut j = i + 1;
+        let mut depth = 1usize;
+        while j < lines.len() && depth > 0 {
+            let t = lines[j].trim();
+            depth += t.matches('{').count();
+            depth = depth.saturating_sub(t.matches('}').count());
+            if depth == 0 {
+                break;
+            }
+            j += 1;
+        }
+        if j >= lines.len() {
+            i += 1;
+            continue;
+        }
+        // last non-empty line inside the loop
+        let mut last_body = j;
+        while last_body > i + 1 && lines[last_body - 1].trim().is_empty() {
+            last_body -= 1;
+        }
+        last_body -= 1;
+        let inc_line = lines[last_body].trim().to_string();
+        let Some(inc_text) = parse_increment(&inc_line, &var) else {
+            i += 1;
+            continue;
+        };
+        // transform: remove init line, rewrite while line, remove increment line
+        let indent = " ".repeat(open_indent);
+        lines[i] = format!(
+            "{indent}for ({} {} = {}; {}; {}) {{",
+            init_info.0, var, init_info.1, cond, inc_text
+        );
+        lines[last_body] = String::new();
+        lines[i - 1] = String::new();
+        i = j;
+    }
+    lines.join("\n")
+}
+
+fn loop_var(cond: &str) -> Option<String> {
+    for op in [" <= ", " >= ", " < ", " > ", " != ", " == "] {
+        if let Some(pos) = cond.find(op) {
+            let lhs = cond[..pos].trim();
+            if lhs.chars().all(|c| c.is_alphanumeric() || c == '_') && !lhs.is_empty() {
+                return Some(lhs.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn parse_init(line: &str, var: &str) -> Option<(String, String)> {
+    let (decl, init) = line.strip_suffix(';').and_then(|l| l.split_once(" = "))?;
+    let init = init.trim();
+    let name = decl.split_whitespace().last()?;
+    if name != var {
+        return None;
+    }
+    let ty = decl.split_whitespace().next()?;
+    if ty == name {
+        return None;
+    }
+    Some((ty.to_string(), init.to_string()))
+}
+
+fn parse_increment(line: &str, var: &str) -> Option<String> {
+    let line = line.strip_suffix(';').unwrap_or(line);
+    let Some((lhs, rhs)) = line.split_once(" = ") else {
+        if line == format!("{var}++") || line == format!("++{var}") {
+            return Some(format!("{var}++"));
+        }
+        return None;
+    };
+    if lhs.trim() != var {
+        return None;
+    }
+    let rhs = rhs.trim();
+    for op in [" + ", " - "] {
+        if let Some(pos) = rhs.find(op) {
+            let base = rhs[..pos].trim();
+            let step = rhs[pos + op.len()..].trim();
+            if base == var && step.parse::<i64>().is_ok() {
+                let n: i64 = step.parse().ok()?;
+                let sign = if op == " + " { "+" } else { "-" };
+                let mag = n.unsigned_abs();
+                if sign == "+" && mag == 1 {
+                    return Some(format!("{var}++"));
+                }
+                if sign == "-" && mag == 1 {
+                    return Some(format!("{var}--"));
+                }
+                return Some(format!("{var} {sign}= {mag}"));
+            }
+        }
+    }
+    None
+}
+
 pub struct TryInfo {
     pub handler_types: HashMap<u32, Vec<String>>,
     pub catch_all_addrs: Vec<u32>,
@@ -904,6 +1030,7 @@ pub fn render_method_pseudocode_full(
     let text = fuse_new_init(&text);
     let text = apply_copy_chain_collapse(&text);
     let text = apply_string_concat_fold(&text);
+    let text = apply_for_loop_recovery(&text);
     let name_to_id: HashMap<String, SsaValueId> = ctx
         .value_names
         .iter()
