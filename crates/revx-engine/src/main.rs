@@ -83,6 +83,22 @@ enum Command {
     Daemon(DaemonCommands),
     #[command(subcommand)]
     Mcp(McpCommands),
+    #[command(subcommand)]
+    Dex(DexCommands),
+}
+
+#[derive(Subcommand)]
+enum DexCommands {
+    Disasm(DexDisasmArgs),
+}
+
+#[derive(Args)]
+struct DexDisasmArgs {
+    path: PathBuf,
+    #[arg(long)]
+    class: Option<String>,
+    #[arg(long, default_value_t = 200)]
+    limit: usize,
 }
 
 #[derive(Args)]
@@ -740,7 +756,31 @@ async fn main() -> Result<()> {
             write_config,
             init_workspace,
         }) => cmd_mcp_install(prefix, workspace, host, write_config, init_workspace),
+        Command::Dex(DexCommands::Disasm(args)) => cmd_dex_disasm(args),
     }
+}
+
+fn cmd_dex_disasm(args: DexDisasmArgs) -> Result<()> {
+    let data =
+        fs::read(&args.path).with_context(|| format!("failed to read {}", args.path.display()))?;
+    let dex =
+        revx_dex::DexFile::parse(data).map_err(|e| anyhow::anyhow!("DEX parse failed: {e}"))?;
+    println!(
+        "// dex v{} strings={} types={} protos={} fields={} methods={} classes={}",
+        dex.header.version,
+        dex.strings.len(),
+        dex.types.len(),
+        dex.protos.len(),
+        dex.fields.len(),
+        dex.methods.len(),
+        dex.classes.len()
+    );
+    let lines = revx_dex::insns::disassemble_dex(&dex, args.class.as_deref(), args.limit);
+    for line in &lines {
+        println!("{line}");
+    }
+    eprintln!("// {} methods disassembled", args.limit.min(lines.len()));
+    Ok(())
 }
 
 fn cmd_init(path: &Path) -> Result<()> {
