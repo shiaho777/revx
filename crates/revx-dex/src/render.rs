@@ -2055,42 +2055,100 @@ fn paren_match(chars: &[char], open: usize) -> Option<usize> {
     None
 }
 
-fn simplify_double_paren(chars: &[char], pos: usize, close: usize) -> Option<String> {
-    let inner: Vec<char> = chars[pos + 1..close].to_vec();
-    if inner.first() != Some(&'(') {
-        return None;
+fn unwrap_paren_ok(chars: &[char], i: usize, close: usize, prefix: &[char]) -> bool {
+    let content = &chars[i + 1..close];
+    if content.is_empty() {
+        return false;
     }
-    let im = paren_match(&inner, 0)?;
-    if im == inner.len() - 1 {
-        return Some(inner.iter().collect());
+    let cs: String = content.iter().collect();
+    let base = cs.strip_suffix("[]").unwrap_or(&cs);
+    if matches!(
+        base,
+        "int" | "byte" | "short" | "char" | "long" | "float" | "double" | "boolean"
+    ) {
+        return false;
     }
-    let rest: Vec<char> = inner[im + 1..].to_vec();
-    let rest_start = rest.iter().position(|c| !c.is_whitespace())?;
-    if rest[rest_start] != '(' {
-        return None;
+    let mut p = prefix.len();
+    while p > 0 && prefix[p - 1].is_whitespace() {
+        p -= 1;
     }
-    let rm = paren_match(&rest, rest_start)?;
-    if rm != rest.len() - 1 || !rest[rm..].iter().all(|c| *c == ')' || c.is_whitespace()) {
-        return None;
+    if p > 0 {
+        let pc = prefix[p - 1];
+        if pc.is_alphanumeric() || pc == '_' || pc == ')' || pc == ']' || pc == '"' {
+            let mut w = p;
+            while w > 0 && (prefix[w - 1].is_alphanumeric() || prefix[w - 1] == '_') {
+                w -= 1;
+            }
+            let word: String = prefix[w..p].iter().collect();
+            if word != "return" && word != "throw" {
+                return false;
+            }
+        }
     }
-    let type_part: String = inner[1..im].iter().collect();
-    let expr: String = rest[rest_start + 1..rm].iter().collect();
-    Some(format!("({type_part}) ({expr})"))
+    let mut nx = close + 1;
+    while nx < chars.len() && chars[nx].is_whitespace() {
+        nx += 1;
+    }
+    if nx < chars.len() {
+        let nc = chars[nx];
+        if nc.is_alphanumeric() || nc == '_' || matches!(nc, '(' | '"' | '\'' | '!' | '~') {
+            return false;
+        }
+    }
+    if content[0] == '(' && paren_match(content, 0) == Some(content.len() - 1) {
+        return true;
+    }
+    let mut depth = 0i32;
+    let mut in_str = false;
+    let mut esc = false;
+    for &c in content {
+        if in_str {
+            if esc {
+                esc = false;
+            } else if c == '\\' {
+                esc = true;
+            } else if c == '"' {
+                in_str = false;
+            }
+            continue;
+        }
+        match c {
+            '"' => in_str = true,
+            '(' | '[' => depth += 1,
+            ')' | ']' => depth -= 1,
+            '+' | '-' | '*' | '/' | '%' | '&' | '|' | '^' | '<' | '>' | '=' | '?' | ':' | ','
+            | '!' | '~'
+                if depth == 0 =>
+            {
+                return false;
+            }
+            _ => {}
+        }
+    }
+    true
 }
 
 fn apply_cast_paren_cleanup(text: &str) -> String {
     let out: Vec<String> = text
         .lines()
         .map(|l| {
+            if l.trim_start().starts_with("//") {
+                return l.to_string();
+            }
             let mut line = l.to_string();
             for _round in 0..8 {
                 let chars: Vec<char> = line.chars().collect();
-                let mut result = String::with_capacity(line.len());
+                let mut result: Vec<char> = Vec::with_capacity(chars.len());
+                let mut drop: std::collections::HashSet<usize> = std::collections::HashSet::new();
                 let mut i = 0usize;
                 let mut in_str = false;
                 let mut esc = false;
                 let mut changed = false;
                 while i < chars.len() {
+                    if drop.contains(&i) {
+                        i += 1;
+                        continue;
+                    }
                     let c = chars[i];
                     if in_str {
                         result.push(c);
@@ -2111,21 +2169,18 @@ fn apply_cast_paren_cleanup(text: &str) -> String {
                         continue;
                     }
                     if c == '('
-                        && i + 1 < chars.len()
-                        && chars[i + 1] == '('
-                        && !result.trim_start().starts_with("//")
                         && let Some(close) = paren_match(&chars, i)
-                        && let Some(rep) = simplify_double_paren(&chars, i, close)
+                        && unwrap_paren_ok(&chars, i, close, &result)
                     {
-                        result.push_str(&rep);
-                        i = close + 1;
+                        drop.insert(close);
                         changed = true;
+                        i += 1;
                         continue;
                     }
                     result.push(c);
                     i += 1;
                 }
-                line = result;
+                line = result.into_iter().collect();
                 if !changed {
                     break;
                 }
@@ -2550,6 +2605,7 @@ pub fn render_method_pseudocode_full(
     let text = apply_control_kind_repair(&text);
     let text = apply_condition_paren_repair(&text);
     let text = apply_stmt_paren_repair(&text);
+    let text = apply_cast_paren_cleanup(&text);
     let text = apply_brace_repair(&text);
     apply_reindent(&text)
 }
