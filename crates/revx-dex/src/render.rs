@@ -874,6 +874,34 @@ fn parse_increment(line: &str, var: &str) -> Option<String> {
     None
 }
 
+fn apply_boxing_cleanup(text: &str) -> String {
+    let mut out: Vec<String> = Vec::new();
+    for line in text.lines() {
+        let mut l = line.to_string();
+        // Simple iterative replacement: String.valueOf(X) → X for simple X
+        while let Some(start) = l.find("String.valueOf(") {
+            let after = &l[start + 15..];
+            if let Some(close) = after.find(')') {
+                let inner = &after[..close];
+                if inner
+                    .chars()
+                    .all(|c| c.is_alphanumeric() || c == '_' || c == '.' || c == '$' || c == '"')
+                    && !inner.is_empty()
+                {
+                    l = format!("{}{}{}", &l[..start], inner, &l[start + 15 + close + 1..]);
+                } else {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+        l = l.replace("(java.lang.Object) ", "");
+        out.push(l);
+    }
+    out.join("\n")
+}
+
 fn apply_arm_tail_goto_cleanup(text: &str) -> String {
     let mut lines: Vec<String> = text.lines().map(|l| l.to_string()).collect();
     let mut i = 0usize;
@@ -1097,6 +1125,7 @@ pub fn render_method_pseudocode_full(
     let text = apply_latch_continue_cleanup(&text);
     let text = apply_dead_allocation_cleanup(&text);
     let text = apply_arm_tail_goto_cleanup(&text);
+    let text = apply_boxing_cleanup(&text);
     let name_to_id: HashMap<String, SsaValueId> = ctx
         .value_names
         .iter()
@@ -1290,5 +1319,27 @@ mod concat_tests {
         let after_ts = after_paren.and_then(|r| r.strip_suffix(".toString()"));
         eprintln!("after_toString: {after_ts:?}");
         assert!(after_ts.is_some(), "toString strip should work");
+    }
+}
+
+#[cfg(test)]
+mod boxing_tests {
+    use super::*;
+
+    #[test]
+    fn removes_string_value_of_identifier() {
+        let input = "v1 = (\"text\").concat((String.valueOf(p1)));";
+        let out = apply_boxing_cleanup(input);
+        eprintln!("in:  {input}");
+        eprintln!("out: {out}");
+        assert!(!out.contains("String.valueOf(p1)"), "{out}");
+    }
+
+    #[test]
+    fn removes_string_value_of_literal() {
+        let input = "v1 = String.valueOf(\"hello\");";
+        let out = apply_boxing_cleanup(input);
+        eprintln!("out: {out}");
+        assert!(!out.contains("String.valueOf"), "{out}");
     }
 }
