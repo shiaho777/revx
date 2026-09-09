@@ -207,7 +207,12 @@ impl<'a> StructuredRenderer<'a> {
             self.walk(f, blocks, Some(join));
             self.push("}");
         }
-        self.walk(join, blocks, outer_stop);
+        // If both arms terminate (return/throw), there is no continuation to walk
+        let t_terminates = self.func.cfg.succs[t.0 as usize].is_empty();
+        let f_terminates = self.func.cfg.succs[f.0 as usize].is_empty();
+        if !(t_terminates && f_terminates) {
+            self.walk(join, blocks, outer_stop);
+        }
     }
 
     fn handle_jump(

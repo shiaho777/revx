@@ -1110,31 +1110,45 @@ fn apply_empty_then_inversion(text: &str) -> String {
             i += 1;
             continue;
         };
-        // Next non-empty line must be "}" (empty then arm)
+        // Next non-empty line must be "}" or "} else {" (empty then arm)
         let mut j = i + 1;
         while j < lines.len() && lines[j].trim().is_empty() {
             j += 1;
         }
-        if j >= lines.len() || lines[j].trim() != "}" {
+        if j >= lines.len() {
             i += 1;
             continue;
         }
-        // Next non-empty line must be "else {"
-        let mut k = j + 1;
-        while k < lines.len() && lines[k].trim().is_empty() {
-            k += 1;
-        }
-        if k >= lines.len() || lines[k].trim() != "else {" {
+        let next_t = lines[j].trim();
+        let (close_line, else_line) = if next_t == "} else {" {
+            // Combined "} else {" on one line
+            (j, j)
+        } else if next_t == "}" {
+            // Separate "}" then "else {"
+            let mut k = j + 1;
+            while k < lines.len() && lines[k].trim().is_empty() {
+                k += 1;
+            }
+            if k >= lines.len() || lines[k].trim() != "else {" {
+                i += 1;
+                continue;
+            }
+            (j, k)
+        } else {
             i += 1;
             continue;
-        }
+        };
         // Invert: replace if-line, remove } and else {
         let indent = lines[i].len() - lines[i].trim_start().len();
         let negated = negate_condition_text(&cond);
         lines[i] = format!("{}if ({negated}) {{", " ".repeat(indent));
-        lines[j] = String::new();
-        lines[k] = String::new();
-        i = k + 1;
+        if close_line == else_line {
+            lines[close_line] = String::new();
+        } else {
+            lines[close_line] = String::new();
+            lines[else_line] = String::new();
+        }
+        i = else_line + 1;
     }
     lines.join("\n")
 }
@@ -1534,18 +1548,33 @@ fn apply_enhanced_for(text: &str) -> String {
 
 fn apply_arm_tail_goto_cleanup(text: &str) -> String {
     let mut lines: Vec<String> = text.lines().map(|l| l.to_string()).collect();
+    // Build label positions to determine goto direction
+    let mut label_pos: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for (idx, line) in lines.iter().enumerate() {
+        let t = line.trim();
+        if t.len() > 2 && t.starts_with('L') && t.ends_with(':') {
+            label_pos.insert(t[..t.len() - 1].to_string(), idx);
+        }
+    }
     let mut i = 0usize;
     while i < lines.len() {
         let trimmed = lines[i].trim();
-        if trimmed.starts_with("goto L") && trimmed.ends_with(';') {
-            let mut j = i + 1;
-            while j < lines.len() && lines[j].trim().is_empty() {
-                j += 1;
-            }
-            if j < lines.len() {
-                let next = lines[j].trim();
-                if next == "}" || next == "} else {" {
-                    lines[i] = String::new();
+        if let Some(target) = trimmed
+            .strip_prefix("goto L")
+            .and_then(|r| r.strip_suffix(';'))
+        {
+            // Only remove FORWARD gotos (target label appears after this line)
+            let is_forward = label_pos.get(target).is_some_and(|&pos| pos > i);
+            if is_forward {
+                let mut j = i + 1;
+                while j < lines.len() && lines[j].trim().is_empty() {
+                    j += 1;
+                }
+                if j < lines.len() {
+                    let next = lines[j].trim();
+                    if next == "}" || next == "} else {" {
+                        lines[i] = String::new();
+                    }
                 }
             }
         }
