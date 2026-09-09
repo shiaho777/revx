@@ -1239,6 +1239,52 @@ fn strip_outer_parens_pair(s: &str) -> &str {
         .unwrap_or(s)
 }
 
+fn extract_field_name(rhs: &str) -> Option<String> {
+    // vN = this.fieldName; or vN = obj.fieldName;
+    let r = rhs.trim().strip_suffix(';').unwrap_or(rhs.trim());
+    let dot_pos = r.rfind('.')?;
+    let field = &r[dot_pos + 1..];
+    if field.is_empty() || field.contains('(') || field.contains(' ') {
+        return None;
+    }
+    if !field
+        .chars()
+        .all(|c| c.is_alphanumeric() || c == '_' || c == '$')
+    {
+        return None;
+    }
+    // Only if the receiver is `this` or a simple identifier
+    let recv = &r[..dot_pos];
+    if recv.contains('(') || recv.contains('[') {
+        return None;
+    }
+    Some(camel_case(field))
+}
+
+fn extract_getter_name(rhs: &str) -> Option<String> {
+    let r = rhs.trim().strip_suffix(';').unwrap_or(rhs.trim());
+    let paren = r.find('(')?;
+    if !r[paren..].ends_with("()") {
+        return None;
+    }
+    let method_part = &r[..paren];
+    let dot = method_part.rfind('.')?;
+    let method = &method_part[dot + 1..];
+    let rest = method
+        .strip_prefix("get")
+        .or_else(|| method.strip_prefix("is"))?;
+    if rest.len() <= 1 || !rest.chars().next().is_some_and(|c| c.is_uppercase()) {
+        return None;
+    }
+    let mut chars = rest.chars();
+    let first = chars.next()?.to_lowercase().next()?;
+    let name = format!("{first}{}", chars.as_str());
+    if name.is_empty() {
+        return None;
+    }
+    Some(name)
+}
+
 fn apply_semantic_names(text: &str) -> String {
     let lines: Vec<&str> = text.lines().collect();
     let mut name_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
@@ -1268,6 +1314,10 @@ fn apply_semantic_names(text: &str) -> String {
             "size".to_string()
         } else if rhs_t.ends_with(".toString()") {
             "str".to_string()
+        } else if let Some(field) = extract_field_name(rhs_t) {
+            field
+        } else if let Some(getter) = extract_getter_name(rhs_t) {
+            getter
         } else {
             continue;
         };
