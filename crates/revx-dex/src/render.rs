@@ -1026,8 +1026,6 @@ fn apply_loop_recovery(text: &str) -> String {
 
 fn apply_switch_break(text: &str) -> String {
     let mut lines: Vec<String> = text.lines().map(|l| l.to_string()).collect();
-    // Find "goto L{N};" that appears right before "}" inside switch cases
-    // and the target L{N} is AFTER the switch. These should be break;
     let mut i = 0usize;
     while i < lines.len() {
         let t = lines[i].trim().to_string();
@@ -1035,29 +1033,42 @@ fn apply_switch_break(text: &str) -> String {
             i += 1;
             continue;
         };
-        // Check if next non-empty line is "}" (end of case)
+        // Next non-empty line must be a case boundary: "}", "case ", or "default:"
         let mut j = i + 1;
         while j < lines.len() && lines[j].trim().is_empty() {
             j += 1;
         }
-        if j >= lines.len() || lines[j].trim() != "}" {
+        if j >= lines.len() {
             i += 1;
             continue;
         }
-        // Check if we're inside a switch (look back for "case " or "switch (")
+        let next = lines[j].trim();
+        if !(next == "}" || next.starts_with("case ") || next.starts_with("default:")) {
+            i += 1;
+            continue;
+        }
+        // Look back for the enclosing switch (track brace depth for nested blocks)
+        let mut depth = 0i32;
         let mut in_switch = false;
         for k in (0..i).rev() {
             let lt = lines[k].trim();
-            if lt.starts_with("case ") || lt.starts_with("switch (") {
-                in_switch = true;
+            depth += lt.matches('}').count() as i32;
+            depth -= lt.matches('{').count() as i32;
+            if depth < 0 {
+                // We've exited the enclosing block
+                if lt.starts_with("switch (") {
+                    in_switch = true;
+                }
                 break;
             }
-            if lt == "}" && !lt.starts_with("case") {
+            if lt.starts_with("case ") || lt.starts_with("default:") {
+                in_switch = true;
                 break;
             }
         }
         if in_switch {
-            lines[i] = "break;".to_string();
+            let indent = lines[i].len() - lines[i].trim_start().len();
+            lines[i] = format!("{}break;", " ".repeat(indent));
         }
         i += 1;
     }
