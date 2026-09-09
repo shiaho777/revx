@@ -444,7 +444,10 @@ fn fuse_new_init(text: &str) -> String {
             i += 1;
             continue;
         }
-        let class_part = expr.trim_start_matches("new ").trim_end_matches("()");
+        let Some(class_part) = expr.strip_prefix("new ").and_then(|r| r.strip_suffix("()")) else {
+            i += 1;
+            continue;
+        };
         let mut fused = false;
         for j in (i + 1)..lines.len().min(i + 40) {
             let l = lines[j].trim().to_string();
@@ -457,15 +460,23 @@ fn fuse_new_init(text: &str) -> String {
                 break;
             }
             if let Some((_m_var, m_expr)) = l.strip_suffix(';').and_then(|x| x.split_once(" = "))
-                && m_expr.starts_with("new ")
-                && m_expr.contains(class_part)
+                && let Some(after_new) = m_expr.strip_prefix("new ")
             {
-                let args = m_expr
-                    .trim_start_matches("new ")
-                    .trim_start_matches(class_part)
-                    .trim_start_matches('(')
-                    .trim_end_matches(')')
-                    .to_string();
+                let chars: Vec<char> = after_new.chars().collect();
+                let Some(open) = chars.iter().position(|&c| c == '(') else {
+                    continue;
+                };
+                let m_class: String = chars[..open].iter().collect();
+                if m_class != class_part {
+                    continue;
+                }
+                let Some(close) = paren_match(&chars, open) else {
+                    continue;
+                };
+                if close != chars.len() - 1 {
+                    continue;
+                }
+                let args: String = chars[open + 1..close].iter().collect();
                 let indent_len = lines[i].len() - lines[i].trim_start().len();
                 lines[i] = format!(
                     "{}{var} = new {class_part}({args});",
@@ -1282,6 +1293,73 @@ fn apply_condition_paren_repair(text: &str) -> String {
     out.join("\n")
 }
 
+fn apply_stmt_paren_repair(text: &str) -> String {
+    let out: Vec<String> = text
+        .lines()
+        .map(|l| {
+            let t = l.trim();
+            if t.is_empty() || t.starts_with("//") || !t.ends_with(';') {
+                return l.to_string();
+            }
+            if t.starts_with("case ") || t.starts_with("default:") {
+                return l.to_string();
+            }
+            let chars: Vec<char> = t.chars().collect();
+            let mut repaired: Vec<char> = Vec::with_capacity(chars.len() + 4);
+            let mut depth = 0i32;
+            let mut in_str = false;
+            let mut in_chr = false;
+            let mut esc = false;
+            for &c in &chars {
+                if in_str || in_chr {
+                    repaired.push(c);
+                    if esc {
+                        esc = false;
+                    } else if c == '\\' {
+                        esc = true;
+                    } else if (c == '"' && in_str) || (c == '\'' && in_chr) {
+                        in_str = false;
+                        in_chr = false;
+                    }
+                    continue;
+                }
+                match c {
+                    '"' => {
+                        in_str = true;
+                        repaired.push(c);
+                    }
+                    '\'' => {
+                        in_chr = true;
+                        repaired.push(c);
+                    }
+                    '(' => {
+                        depth += 1;
+                        repaired.push(c);
+                    }
+                    ')' => {
+                        if depth == 0 {
+                            continue;
+                        }
+                        depth -= 1;
+                        repaired.push(c);
+                    }
+                    _ => repaired.push(c),
+                }
+            }
+            if depth == 0 && repaired.len() == chars.len() {
+                return l.to_string();
+            }
+            repaired.pop();
+            repaired.extend(")".repeat(depth as usize).chars());
+            repaired.push(';');
+            let indent = " ".repeat(l.len() - l.trim_start().len());
+            let body: String = repaired.into_iter().collect();
+            format!("{indent}{body}")
+        })
+        .collect();
+    out.join("\n")
+}
+
 fn apply_brace_repair(text: &str) -> String {
     let lines: Vec<String> = text.lines().map(|l| l.to_string()).collect();
     let lead_closes = |t: &str| t.chars().take_while(|&c| c == '}').count() as i32;
@@ -1831,30 +1909,115 @@ fn camel_case(s: &str) -> String {
     out
 }
 
-fn apply_cast_paren_cleanup(text: &str) -> String {
-    let mut out = text.to_string();
-    // ((Type) (expr)) → (Type) expr
-    loop {
-        let before = out.clone();
-        if let Some(pos) = out.find("((")
-            && let Some(mid) = out[pos..].find(") (")
-        {
-            let inner_start = pos + 2;
-            let cast_end = pos + mid + 1;
-            let expr_start = cast_end + 2;
-            if let Some(close) = out[expr_start..].find(')') {
-                let expr_end = expr_start + close;
-                let cast_type = &out[inner_start..cast_end - 1];
-                let expr = &out[expr_start..expr_end];
-                let replacement = format!("({cast_type}) {expr}");
-                out = format!("{}{}{}", &out[..pos], replacement, &out[expr_end + 1..]);
+fn paren_match(chars: &[char], open: usize) -> Option<usize> {
+    let mut depth = 0i32;
+    let mut in_str = false;
+    let mut esc = false;
+    for (i, &c) in chars.iter().enumerate().skip(open) {
+        if in_str {
+            if esc {
+                esc = false;
+            } else if c == '\\' {
+                esc = true;
+            } else if c == '"' {
+                in_str = false;
             }
+            continue;
         }
-        if out == before {
-            break;
+        match c {
+            '"' => in_str = true,
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
         }
     }
-    out
+    None
+}
+
+fn simplify_double_paren(chars: &[char], pos: usize, close: usize) -> Option<String> {
+    let inner: Vec<char> = chars[pos + 1..close].to_vec();
+    if inner.first() != Some(&'(') {
+        return None;
+    }
+    let im = paren_match(&inner, 0)?;
+    if im == inner.len() - 1 {
+        return Some(inner.iter().collect());
+    }
+    let rest: Vec<char> = inner[im + 1..].to_vec();
+    let rest_start = rest.iter().position(|c| !c.is_whitespace())?;
+    if rest[rest_start] != '(' {
+        return None;
+    }
+    let rm = paren_match(&rest, rest_start)?;
+    if rm != rest.len() - 1 || !rest[rm..].iter().all(|c| *c == ')' || c.is_whitespace()) {
+        return None;
+    }
+    let type_part: String = inner[1..im].iter().collect();
+    let expr: String = rest[rest_start + 1..rm].iter().collect();
+    Some(format!("({type_part}) ({expr})"))
+}
+
+fn apply_cast_paren_cleanup(text: &str) -> String {
+    let out: Vec<String> = text
+        .lines()
+        .map(|l| {
+            let mut line = l.to_string();
+            for _round in 0..8 {
+                let chars: Vec<char> = line.chars().collect();
+                let mut result = String::with_capacity(line.len());
+                let mut i = 0usize;
+                let mut in_str = false;
+                let mut esc = false;
+                let mut changed = false;
+                while i < chars.len() {
+                    let c = chars[i];
+                    if in_str {
+                        result.push(c);
+                        if esc {
+                            esc = false;
+                        } else if c == '\\' {
+                            esc = true;
+                        } else if c == '"' {
+                            in_str = false;
+                        }
+                        i += 1;
+                        continue;
+                    }
+                    if c == '"' {
+                        in_str = true;
+                        result.push(c);
+                        i += 1;
+                        continue;
+                    }
+                    if c == '('
+                        && i + 1 < chars.len()
+                        && chars[i + 1] == '('
+                        && !result.trim_start().starts_with("//")
+                        && let Some(close) = paren_match(&chars, i)
+                        && let Some(rep) = simplify_double_paren(&chars, i, close)
+                    {
+                        result.push_str(&rep);
+                        i = close + 1;
+                        changed = true;
+                        continue;
+                    }
+                    result.push(c);
+                    i += 1;
+                }
+                line = result;
+                if !changed {
+                    break;
+                }
+            }
+            line
+        })
+        .collect();
+    out.join("\n")
 }
 
 fn apply_enhanced_for(text: &str) -> String {
@@ -2269,6 +2432,7 @@ pub fn render_method_pseudocode_full(
     let text = apply_unused_label_cleanup(&text);
     let text = apply_control_kind_repair(&text);
     let text = apply_condition_paren_repair(&text);
+    let text = apply_stmt_paren_repair(&text);
     let text = apply_brace_repair(&text);
     apply_reindent(&text)
 }
