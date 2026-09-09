@@ -6,7 +6,7 @@
 //! text, and emits `if/else` and `while` constructs, falling back to a
 //! labeled `goto` per construct when the shape resists structuring.
 
-use revx_analysis::ssa::{BlockId, DominatorTree, SsaFunction};
+use revx_analysis::ssa::{BlockId, CfgBlock, DominatorTree, SsaFunction};
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 pub struct BlockRender {
@@ -41,8 +41,9 @@ pub fn render_structured(func: &SsaFunction, blocks: &HashMap<BlockId, BlockRend
     let existing_labels: HashSet<String> = r
         .lines
         .iter()
+        .map(|l| l.trim())
         .filter(|l| l.ends_with(':') && l.starts_with('L'))
-        .cloned()
+        .map(|l| l.to_string())
         .collect();
     for (&target, &start) in &r.block_starts {
         if r.goto_targets.contains(&target) {
@@ -60,6 +61,24 @@ pub fn render_structured(func: &SsaFunction, blocks: &HashMap<BlockId, BlockRend
     insertions.sort_by_key(|(i, _)| *i);
     for (i, (pos, label)) in insertions.iter().enumerate() {
         r.lines.insert(pos + i, label.clone());
+    }
+    let mut orphans: Vec<&CfgBlock> = func
+        .cfg
+        .blocks
+        .iter()
+        .filter(|b| !r.visited.contains(&b.id))
+        .collect();
+    orphans.sort_by_key(|b| b.start_addr);
+    for b in orphans {
+        let Some(br) = blocks.get(&b.id) else {
+            continue;
+        };
+        if r.goto_targets.contains(&b.id) {
+            r.lines.push(format!("{}L{}:", r.indent(), b.id.0));
+        }
+        for l in &br.lines {
+            r.push(l.clone());
+        }
     }
     let mut out = String::new();
     for line in &r.lines {

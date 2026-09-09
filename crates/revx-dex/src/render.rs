@@ -954,46 +954,58 @@ fn apply_loop_recovery(text: &str) -> String {
             i += 1;
             continue;
         }
-        // The goto must be inside a simple if (no else clause).
-        // Find the closing } after the goto, then check it's not followed by else {
-        let mut close = i + 1;
-        while close < lines.len() && lines[close].trim().is_empty() {
-            close += 1;
-        }
-        if close >= lines.len() {
-            i += 1;
-            continue;
-        }
-        let after_close = lines[close].trim();
-        if after_close == "} else {" || after_close == "else {" || after_close.starts_with("else ")
-        {
-            i += 1;
-            continue;
-        }
-        // The if line must not already have an else in the condition area
-        // (between the if and the goto, at the same indent, no "} else {")
-        let if_indent = lines[if_line].len() - lines[if_line].trim_start().len();
-        for (j, line_ref) in lines.iter().enumerate().take(i).skip(if_line + 1) {
-            let lt = line_ref.trim().to_string();
-            let li = line_ref.len() - line_ref.trim_start().len();
-            if lt == "} else {" && li == if_indent {
-                let goto_i = lines[i].len() - lines[i].trim_start().len();
-                if goto_i > li {
-                    continue;
-                }
-                let mut not_loop = true;
-                for k2 in lines.iter().take(i).skip(j) {
-                    let lk = k2.len() - k2.trim_start().len();
-                    if lk <= if_indent && k2.trim() == "}" {
-                        not_loop = false;
-                        break;
-                    }
-                }
-                if not_loop {
-                    i += 1;
-                    continue;
-                }
+        // Strict shape check: the if's then-block must close with a plain `}`
+        // (no else), the backward goto must be inside that block, and no other
+        // goto may target the label (it is about to be deleted).
+        let net = |l: &str| -> i32 {
+            let t = l.trim();
+            let mut d = 0i32;
+            if t.ends_with('{') {
+                d += 1;
             }
+            if t.starts_with('}') {
+                d -= 1;
+            }
+            d
+        };
+        let mut depth = net(&lines[if_line]);
+        let mut close_line = None;
+        for (j, line) in lines.iter().enumerate().skip(if_line + 1) {
+            depth += net(line);
+            if depth <= 0 {
+                close_line = Some(j);
+                break;
+            }
+        }
+        let Some(close_line) = close_line else {
+            i += 1;
+            continue;
+        };
+        if !(if_line < i && i < close_line) {
+            i += 1;
+            continue;
+        }
+        let close_t = lines[close_line].trim();
+        if close_t.starts_with("} else") || close_t.starts_with("else") {
+            i += 1;
+            continue;
+        }
+        let mut after = close_line + 1;
+        while after < lines.len() && lines[after].trim().is_empty() {
+            after += 1;
+        }
+        if after < lines.len() && lines[after].trim().starts_with("else") {
+            i += 1;
+            continue;
+        }
+        let goto_stmt = format!("goto {goto_target};");
+        let outside = lines
+            .iter()
+            .enumerate()
+            .any(|(j, l)| l.trim() == goto_stmt && j != i && (j <= if_line || j >= close_line));
+        if outside {
+            i += 1;
+            continue;
         }
         // Convert: label → remove, if → while (with proper condition), goto → remove
         let indent = lines[if_line].len() - lines[if_line].trim_start().len();
@@ -1014,7 +1026,7 @@ fn apply_loop_recovery(text: &str) -> String {
         lines[label_line] = String::new();
         lines[i] = String::new();
         // Remove any remaining goto to the same label within the while body
-        for line_ref in lines.iter_mut().take(i).skip(if_line + 1) {
+        for line_ref in lines.iter_mut().take(close_line).skip(if_line + 1) {
             if line_ref.trim() == format!("goto {goto_target};") {
                 *line_ref = String::new();
             }
@@ -1024,9 +1036,334 @@ fn apply_loop_recovery(text: &str) -> String {
     lines.join("\n")
 }
 
+fn apply_loop_wrap(text: &str) -> String {
+    let mut lines: Vec<String> = text.lines().map(|l| l.to_string()).collect();
+    let indent_of = |l: &str| l.len() - l.trim_start().len();
+    for _round in 0..64 {
+        let mut labels: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for (i, line) in lines.iter().enumerate() {
+            let t = line.trim();
+            if t.len() > 2 && t.starts_with('L') && t.ends_with(':') {
+                labels.insert(t[..t.len() - 1].to_string(), i);
+            }
+        }
+        let mut fired = false;
+        for i in 0..lines.len() {
+            let t = lines[i].trim();
+            let Some(target) = t.strip_prefix("goto ").and_then(|r| r.strip_suffix(';')) else {
+                continue;
+            };
+            let Some(&ll) = labels.get(target) else {
+                continue;
+            };
+            if ll >= i {
+                continue;
+            }
+            let d = indent_of(&lines[ll]);
+            if indent_of(&lines[i]) != d {
+                continue;
+            }
+            let mut depth = 0i32;
+            let mut ok = true;
+            for line in lines.iter().take(i).skip(ll + 1) {
+                let t2 = line.trim();
+                if t2.is_empty() {
+                    continue;
+                }
+                if indent_of(line) < d {
+                    ok = false;
+                    break;
+                }
+                if t2.ends_with('{') {
+                    depth += 1;
+                }
+                if t2.starts_with('}') {
+                    depth -= 1;
+                }
+                if depth < 0 {
+                    ok = false;
+                    break;
+                }
+            }
+            if !ok || depth != 0 {
+                continue;
+            }
+            let pad = " ".repeat(d);
+            let inner = " ".repeat(d + 4);
+            let goto_stmt = format!("goto {target};");
+            let residual = lines
+                .iter()
+                .enumerate()
+                .any(|(k, l)| k != i && l.trim() == goto_stmt);
+            let mut out: Vec<String> = Vec::with_capacity(lines.len() + 2);
+            out.extend_from_slice(&lines[..ll]);
+            out.push(format!("{pad}while (true) {{"));
+            if residual {
+                out.push(format!("{inner}{target}:"));
+            }
+            for line in lines.iter().take(i).skip(ll + 1) {
+                if line.trim().is_empty() {
+                    out.push(String::new());
+                } else {
+                    out.push(format!("    {line}"));
+                }
+            }
+            out.push(format!("{pad}}}"));
+            out.extend_from_slice(&lines[i + 1..]);
+            lines = out;
+            fired = true;
+            break;
+        }
+        if !fired {
+            break;
+        }
+    }
+    lines.join("\n")
+}
+
+fn apply_unused_label_cleanup(text: &str) -> String {
+    let lines: Vec<String> = text.lines().map(|l| l.to_string()).collect();
+    let mut targets: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for l in &lines {
+        let t = l.trim();
+        if let Some(target) = t.strip_prefix("goto ").and_then(|r| r.strip_suffix(';')) {
+            targets.insert(target.to_string());
+        }
+    }
+    let out: Vec<String> = lines
+        .into_iter()
+        .map(|l| {
+            let t = l.trim();
+            if t.len() > 2
+                && t.starts_with('L')
+                && t.ends_with(':')
+                && !targets.contains(&t[..t.len() - 1])
+            {
+                String::new()
+            } else {
+                l
+            }
+        })
+        .collect();
+    out.join("\n")
+}
+
+fn apply_control_kind_repair(text: &str) -> String {
+    let lines: Vec<String> = text.lines().map(|l| l.to_string()).collect();
+    let opener_kind = |s: &str| -> &str {
+        for (kw, kind) in [
+            ("if ", "if"),
+            ("while ", "while"),
+            ("for ", "for"),
+            ("switch ", "switch"),
+            ("try", "try"),
+            ("synchronized ", "synchronized"),
+            ("do", "do"),
+        ] {
+            if s.starts_with(kw) {
+                return kind;
+            }
+        }
+        "block"
+    };
+    let mut stack: Vec<String> = Vec::new();
+    let mut inserts: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    for (i, l) in lines.iter().enumerate() {
+        let t = l.trim();
+        if t.is_empty() || t.starts_with("//") {
+            continue;
+        }
+        let closes = t.chars().take_while(|&c| c == '}').count();
+        let rest = t[closes..].trim_start();
+        let is_else = rest.starts_with("else");
+        if is_else && closes > 0 {
+            let mut k = 0;
+            while let Some(top) = stack.last() {
+                if top == "if" {
+                    break;
+                }
+                k += 1;
+                stack.pop();
+            }
+            if k > 0 {
+                inserts.insert(i, k);
+            }
+        }
+        for _ in 0..closes {
+            stack.pop();
+        }
+        if t.ends_with('{') {
+            let kind = if is_else {
+                "if"
+            } else if rest.starts_with("catch") {
+                "catch"
+            } else {
+                opener_kind(rest)
+            };
+            stack.push(kind.to_string());
+        }
+    }
+    if inserts.is_empty() {
+        return lines.join("\n");
+    }
+    let mut out: Vec<String> = Vec::with_capacity(lines.len() + inserts.len());
+    for (i, l) in lines.iter().enumerate() {
+        if let Some(&k) = inserts.get(&i) {
+            let indent = " ".repeat(l.len() - l.trim_start().len());
+            for _ in 0..k {
+                out.push(format!("{indent}}}"));
+            }
+        }
+        out.push(l.clone());
+    }
+    out.join("\n")
+}
+
+fn apply_condition_paren_repair(text: &str) -> String {
+    let out: Vec<String> = text
+        .lines()
+        .map(|l| {
+            let t = l.trim();
+            let Some((kw, rest)) = ["if ", "while ", "for ", "switch ", "synchronized "]
+                .iter()
+                .find_map(|kw| t.strip_prefix(kw).map(|r| (*kw, r)))
+            else {
+                return l.to_string();
+            };
+            if !rest.ends_with(") {") || !rest.starts_with('(') || rest.len() < 5 {
+                return l.to_string();
+            }
+            let cond = &rest[1..rest.len() - 3];
+            let mut depth = 0i32;
+            let mut repaired = String::with_capacity(cond.len());
+            let mut in_str = false;
+            let mut esc = false;
+            for c in cond.chars() {
+                if in_str {
+                    repaired.push(c);
+                    if esc {
+                        esc = false;
+                    } else if c == '\\' {
+                        esc = true;
+                    } else if c == '"' {
+                        in_str = false;
+                    }
+                    continue;
+                }
+                match c {
+                    '"' => {
+                        in_str = true;
+                        repaired.push(c);
+                    }
+                    '(' => {
+                        depth += 1;
+                        repaired.push(c);
+                    }
+                    ')' => {
+                        if depth == 0 {
+                            continue;
+                        }
+                        depth -= 1;
+                        repaired.push(c);
+                    }
+                    _ => repaired.push(c),
+                }
+            }
+            for _ in 0..depth {
+                repaired.push(')');
+            }
+            if repaired == cond {
+                return l.to_string();
+            }
+            let indent = " ".repeat(l.len() - l.trim_start().len());
+            format!("{indent}{kw}({repaired}) {{")
+        })
+        .collect();
+    out.join("\n")
+}
+
+fn apply_brace_repair(text: &str) -> String {
+    let lines: Vec<String> = text.lines().map(|l| l.to_string()).collect();
+    let lead_closes = |t: &str| t.chars().take_while(|&c| c == '}').count() as i32;
+    let mut keep = vec![true; lines.len()];
+    let mut depth = 0i32;
+    for (i, l) in lines.iter().enumerate() {
+        let t = l.trim();
+        if t.is_empty() || t.starts_with("//") {
+            continue;
+        }
+        let c = lead_closes(t);
+        let o = i32::from(t.ends_with('{'));
+        let mut unmatched = false;
+        for _ in 0..c {
+            if depth == 0 {
+                unmatched = true;
+                break;
+            }
+            depth -= 1;
+        }
+        if unmatched {
+            keep[i] = false;
+        } else {
+            depth += o;
+        }
+    }
+    let mut depth2 = 0i32;
+    for i in (0..lines.len()).rev() {
+        if !keep[i] {
+            continue;
+        }
+        let t = lines[i].trim();
+        if t.is_empty() || t.starts_with("//") {
+            continue;
+        }
+        depth2 += lead_closes(t);
+        if t.ends_with('{') {
+            if depth2 == 0 {
+                keep[i] = false;
+            } else {
+                depth2 -= 1;
+            }
+        }
+    }
+    lines
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| keep[*i])
+        .map(|(_, l)| l.clone())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn apply_reindent(text: &str) -> String {
+    let mut out: Vec<String> = Vec::new();
+    let mut depth = 1i32;
+    let mut prev_blank = false;
+    for l in text.lines() {
+        let t = l.trim();
+        if t.is_empty() {
+            if !prev_blank && !out.is_empty() {
+                out.push(String::new());
+                prev_blank = true;
+            }
+            continue;
+        }
+        prev_blank = false;
+        let closes = t.chars().take_while(|&c| c == '}').count() as i32;
+        depth = (depth - closes).max(0);
+        out.push(format!("{}{}", "    ".repeat(depth as usize), t));
+        if t.ends_with('{') {
+            depth += 1;
+        }
+    }
+    while out.last().is_some_and(|l| l.is_empty()) {
+        out.pop();
+    }
+    out.join("\n")
+}
+
 fn apply_small_block_inline(text: &str) -> String {
     let mut lines: Vec<String> = text.lines().map(|l| l.to_string()).collect();
-    // Map label -> line index
     let mut label_pos: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     for (idx, line) in lines.iter().enumerate() {
         let t = line.trim();
@@ -1750,19 +2087,25 @@ pub fn build_try_info(dex: &DexFile, tries: &[crate::TryItem]) -> TryInfo {
     let mut catch_all_addrs = Vec::new();
     let mut try_regions = Vec::new();
     for t in tries {
-        try_regions.push((t.start_addr, t.start_addr + t.insn_count as u32));
+        let region = (t.start_addr, t.start_addr + t.insn_count as u32);
+        if !try_regions.contains(&region) {
+            try_regions.push(region);
+        }
         for h in &t.handlers {
             let type_desc = dex
                 .types
                 .get(h.type_idx as usize)
                 .cloned()
                 .unwrap_or_default();
-            handler_types
-                .entry(h.addr)
-                .or_default()
-                .push(crate::types::java_type(&type_desc));
+            let jt = crate::types::java_type(&type_desc);
+            let entry = handler_types.entry(h.addr).or_default();
+            if !entry.contains(&jt) {
+                entry.push(jt);
+            }
         }
-        if let Some(addr) = t.catch_all_addr {
+        if let Some(addr) = t.catch_all_addr
+            && !catch_all_addrs.contains(&addr)
+        {
             catch_all_addrs.push(addr);
         }
     }
@@ -1787,7 +2130,17 @@ pub fn render_method_pseudocode_full(
     let catch_all_addrs = &try_info.catch_all_addrs;
     let try_regions = &try_info.try_regions;
 
-    let order = reverse_post_order(func);
+    let mut order = reverse_post_order(func);
+    let reachable: std::collections::HashSet<BlockId> = order.iter().copied().collect();
+    let mut orphans: Vec<BlockId> = func
+        .cfg
+        .blocks
+        .iter()
+        .map(|b| b.id)
+        .filter(|id| !reachable.contains(id))
+        .collect();
+    orphans.sort_by_key(|id| func.cfg.blocks[id.0 as usize].start_addr);
+    order.extend(orphans);
     let mut block_renders: HashMap<BlockId, crate::structure::BlockRender> = HashMap::new();
     for &bid in &order {
         let block = &func.cfg.blocks[bid.0 as usize];
@@ -1858,17 +2211,19 @@ pub fn render_method_pseudocode_full(
         let block_addr = block.start_addr as u32;
         let mut prefix: Vec<String> = Vec::new();
         if let Some(types) = handler_types.get(&block_addr) {
-            for ty in types {
-                prefix.push(format!("catch ({ty} e) {{"));
+            let mut all: Vec<String> = types.clone();
+            if catch_all_addrs.contains(&block_addr) && !all.iter().any(|t| t == "Throwable") {
+                all.push("Throwable".to_string());
             }
-        }
-        if catch_all_addrs.contains(&block_addr) {
-            prefix.push("catch (Throwable e) {".to_string());
+            prefix.push(format!("// catch ({} e)", all.join(" | ")));
+        } else if catch_all_addrs.contains(&block_addr) {
+            prefix.push("// catch (Throwable e)".to_string());
         }
         if try_regions.iter().any(|(s, _)| block_addr == *s) {
-            prefix.push("try {".to_string());
+            prefix.push("// try".to_string());
+        } else if try_regions.iter().any(|(_, e)| block_addr == *e) {
+            prefix.push("// end try".to_string());
         }
-        let _ = &try_regions;
         let mut all_lines = prefix;
         all_lines.extend(lines);
         block_renders.insert(
@@ -1901,6 +2256,7 @@ pub fn render_method_pseudocode_full(
     let text = apply_semantic_names(&text);
     let text = apply_cast_paren_cleanup(&text);
     let text = apply_loop_recovery(&text);
+    let text = apply_loop_wrap(&text);
     let text = apply_switch_break(&text);
     let text = apply_small_block_inline(&text);
     let text = apply_dead_assign(&text);
@@ -1909,7 +2265,12 @@ pub fn render_method_pseudocode_full(
         .iter()
         .map(|(id, name)| (name.clone(), *id))
         .collect();
-    apply_typed_declarations(&text, value_types, &name_to_id)
+    let text = apply_typed_declarations(&text, value_types, &name_to_id);
+    let text = apply_unused_label_cleanup(&text);
+    let text = apply_control_kind_repair(&text);
+    let text = apply_condition_paren_repair(&text);
+    let text = apply_brace_repair(&text);
+    apply_reindent(&text)
 }
 
 pub fn decompile_dex(

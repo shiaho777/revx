@@ -589,7 +589,7 @@ impl DexFile {
         };
         let mut handlers = Vec::new();
         let mut catch_all = None;
-        let typed = if size <= 0 { size + 1 } else { size };
+        let typed = size.abs();
         for _ in 0..typed.max(0) {
             let Ok((type_idx, np)) = r.uleb128_at(p) else {
                 break;

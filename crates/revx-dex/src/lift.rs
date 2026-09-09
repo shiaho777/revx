@@ -948,6 +948,16 @@ pub fn build_basic_blocks(
 ) -> BTreeMap<u32, DexBasicBlock> {
     let mut leaders: BTreeSet<u32> = BTreeSet::new();
     leaders.insert(0);
+    for t in &code.tries {
+        leaders.insert(t.start_addr);
+        leaders.insert(t.start_addr + t.insn_count as u32);
+        for h in &t.handlers {
+            leaders.insert(h.addr);
+        }
+        if let Some(a) = t.catch_all_addr {
+            leaders.insert(a);
+        }
+    }
     for (&off, (insn, size)) in insns {
         let next = off + *size as u32;
         match insn {
@@ -1281,7 +1291,14 @@ impl<'a> DexMethodLifter<'a> {
                 .insert(reg, id);
         }
 
-        let order = self.reverse_post_order();
+        let mut order = self.reverse_post_order();
+        let reachable: BTreeSet<BlockId> = order.iter().copied().collect();
+        let mut orphans: Vec<BlockId> = (0..self.func.cfg.blocks.len() as u32)
+            .map(BlockId)
+            .filter(|id| !reachable.contains(id))
+            .collect();
+        orphans.sort_by_key(|id| self.func.cfg.blocks[id.0 as usize].start_addr);
+        order.extend(orphans);
         let mut visited = BTreeSet::new();
         for &bid in &order {
             if !visited.insert(bid) {
