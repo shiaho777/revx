@@ -1,12 +1,14 @@
 //! DEX file format parser: header, string/type/proto/field/method tables,
 //! class definitions, class data, and code items.
 
+pub mod annotations;
 pub mod classgen;
 pub mod insns;
 pub mod jni;
 pub mod kotlin;
 pub mod lift;
 pub mod render;
+pub mod signature;
 pub mod structure;
 pub mod types;
 
@@ -78,6 +80,7 @@ pub struct DexHeader {
     pub class_defs_off: u32,
     pub data_size: u32,
     pub data_off: u32,
+    pub map_off: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -158,6 +161,20 @@ pub struct CatchHandler {
     pub addr: u32,
 }
 
+#[derive(Debug, Clone)]
+pub struct MethodHandleEntry {
+    pub handle_type: u16,
+    pub id: u16,
+}
+
+#[derive(Debug, Clone)]
+pub struct CallSiteEntry {
+    pub name: String,
+    pub proto_idx: u32,
+    pub bootstrap_method_idx: u32,
+    pub impl_method_idx: Option<u32>,
+}
+
 pub struct DexFile {
     pub data: Vec<u8>,
     pub header: DexHeader,
@@ -167,6 +184,8 @@ pub struct DexFile {
     pub fields: Vec<FieldId>,
     pub methods: Vec<MethodId>,
     pub classes: Vec<ClassDef>,
+    pub method_handles: Vec<MethodHandleEntry>,
+    pub call_sites: Vec<CallSiteEntry>,
 }
 
 struct Reader<'a> {
@@ -296,6 +315,7 @@ impl DexFile {
             class_defs_off: r.u32_at(0x64)?,
             data_size: r.u32_at(0x68)?,
             data_off: r.u32_at(0x6c)?,
+            map_off: r.u32_at(0x34)?,
         };
         if header.file_size as usize > data.len() {
             return err(0x20, "declared file size exceeds actual size");
@@ -424,6 +444,8 @@ impl DexFile {
             });
         }
 
+        let (method_handles, call_sites) = Self::parse_call_tables(&r, header.map_off, &strings);
+
         Ok(DexFile {
             data,
             header,
@@ -433,6 +455,8 @@ impl DexFile {
             fields,
             methods,
             classes,
+            method_handles,
+            call_sites,
         })
     }
 
@@ -583,6 +607,106 @@ impl DexFile {
             catch_all = Some(addr);
         }
         Ok((handlers, catch_all))
+    }
+
+    fn read_indexed_value(r: &Reader, pos: usize) -> Option<(u8, u32, usize)> {
+        let head = *r.data.get(pos)?;
+        let ty = head & 0x1f;
+        let arg = ((head >> 5) as usize) + 1;
+        let mut idx = 0u32;
+        for k in 0..arg {
+            let b = *r.data.get(pos + 1 + k)?;
+            idx |= (b as u32) << (k * 8);
+        }
+        Some((ty, idx, pos + 1 + arg))
+    }
+
+    fn parse_call_tables(
+        r: &Reader,
+        map_off: u32,
+        strings: &[String],
+    ) -> (Vec<MethodHandleEntry>, Vec<CallSiteEntry>) {
+        let mut handles = Vec::new();
+        let mut sites = Vec::new();
+        if map_off == 0 {
+            return (handles, sites);
+        }
+        let mo = map_off as usize;
+        let Ok(map_size) = r.u32_at(mo) else {
+            return (handles, sites);
+        };
+        let mut mh_off = 0u32;
+        let mut mh_size = 0u32;
+        let mut cs_off = 0u32;
+        let mut cs_size = 0u32;
+        for i in 0..map_size.min(64) {
+            let base = mo + 4 + i as usize * 12;
+            let ty = r.u16_at(base).unwrap_or(0);
+            let cnt = r.u32_at(base + 4).unwrap_or(0);
+            let off = r.u32_at(base + 8).unwrap_or(0);
+            match ty {
+                0x2008 => {
+                    mh_off = off;
+                    mh_size = cnt;
+                }
+                0x2007 => {
+                    cs_off = off;
+                    cs_size = cnt;
+                }
+                _ => {}
+            }
+        }
+        for i in 0..mh_size.min(8192) {
+            let base = mh_off as usize + i as usize * 8;
+            let handle_type = r.u16_at(base).unwrap_or(0);
+            let id = r.u16_at(base + 4).unwrap_or(0);
+            handles.push(MethodHandleEntry { handle_type, id });
+        }
+        for i in 0..cs_size.min(8192) {
+            let Ok(item_off) = r.u32_at(cs_off as usize + i as usize * 4) else {
+                continue;
+            };
+            let Ok((n, mut p)) = r.uleb128_at(item_off as usize) else {
+                continue;
+            };
+            let mut vals: Vec<(u8, u32)> = Vec::new();
+            for _ in 0..n.min(16) {
+                let Some((ty, idx, np)) = Self::read_indexed_value(r, p) else {
+                    break;
+                };
+                p = np;
+                vals.push((ty, idx));
+            }
+            let bootstrap_method_idx = vals
+                .first()
+                .filter(|(t, _)| *t == 0x16)
+                .map(|(_, i)| *i)
+                .unwrap_or(0);
+            let name = vals
+                .get(1)
+                .filter(|(t, _)| *t == 0x17)
+                .and_then(|(_, i)| strings.get(*i as usize).cloned())
+                .unwrap_or_default();
+            let proto_idx = vals
+                .get(2)
+                .filter(|(t, _)| *t == 0x15)
+                .map(|(_, i)| *i)
+                .unwrap_or(0);
+            let impl_method_idx = vals
+                .iter()
+                .skip(3)
+                .find(|(t, _)| *t == 0x16)
+                .and_then(|(_, h)| handles.get(*h as usize))
+                .filter(|h| h.handle_type < 5)
+                .map(|h| h.id as u32);
+            sites.push(CallSiteEntry {
+                name,
+                proto_idx,
+                bootstrap_method_idx,
+                impl_method_idx,
+            });
+        }
+        (handles, sites)
     }
 
     pub fn method_proto(&self, method_idx: u32) -> Option<&ProtoId> {

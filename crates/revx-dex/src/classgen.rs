@@ -133,10 +133,57 @@ pub fn render_class_header(dex: &DexFile, class: &ClassDef) -> ClassHeader {
     }
 }
 
-pub fn java_method_signature(dex: &DexFile, method_idx: u32, access_flags: u32) -> String {
+pub fn java_method_signature(
+    dex: &DexFile,
+    method_idx: u32,
+    access_flags: u32,
+    ann: &crate::annotations::ClassAnnotations,
+) -> String {
     let Some(m) = dex.methods.get(method_idx as usize) else {
         return format!("method@{method_idx}");
     };
+    if let Some(sig_str) = ann.method_signatures.get(&method_idx)
+        && let Some(g) = crate::signature::parse_method_sig(sig_str)
+    {
+        let mods = access_flags_to_java(access_flags, false);
+        let name = if m.name == "<init>" {
+            m.class
+                .trim_start_matches('L')
+                .trim_end_matches(';')
+                .rsplit('/')
+                .next()
+                .unwrap_or(&m.class)
+                .to_string()
+        } else {
+            m.name.clone()
+        };
+        let params: Vec<String> = g
+            .params
+            .iter()
+            .enumerate()
+            .map(|(i, ty)| format!("{ty} p{i}"))
+            .collect();
+        let throws = if g.throws.is_empty() {
+            String::new()
+        } else {
+            format!(" throws {}", g.throws.join(", "))
+        };
+        let prefix = if mods.is_empty() {
+            String::new()
+        } else {
+            format!("{mods} ")
+        };
+        let tp = if g.type_params.is_empty() {
+            String::new()
+        } else {
+            format!("{} ", g.type_params)
+        };
+        return format!(
+            "{prefix}{tp}{} {name}({}){throws}",
+            g.ret,
+            params.join(", ")
+        );
+    }
     let Some(p) = dex.protos.get(m.proto as usize) else {
         return format!("{}->{}", m.class, m.name);
     };
@@ -179,10 +226,11 @@ pub fn render_java_class(
             out.push_str(&format!("    {f}\n"));
         }
     }
+    let ann = crate::annotations::scan_class_annotations(dex, class);
     let mut method_idx = 0;
     if let Some(cd) = &class.class_data {
         for m in cd.direct_methods.iter().chain(cd.virtual_methods.iter()) {
-            let sig = java_method_signature(dex, m.method_idx, m.access_flags);
+            let sig = java_method_signature(dex, m.method_idx, m.access_flags, &ann);
             out.push('\n');
             out.push_str(&format!("    {sig} {{\n"));
             if method_idx < method_bodies.len() {
