@@ -1024,6 +1024,98 @@ fn apply_loop_recovery(text: &str) -> String {
     lines.join("\n")
 }
 
+fn apply_small_block_inline(text: &str) -> String {
+    let mut lines: Vec<String> = text.lines().map(|l| l.to_string()).collect();
+    // Map label -> line index
+    let mut label_pos: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for (idx, line) in lines.iter().enumerate() {
+        let t = line.trim();
+        if t.len() > 2 && t.starts_with('L') && t.ends_with(':') {
+            label_pos.insert(t[1..t.len() - 1].to_string(), idx);
+        }
+    }
+    let mut inlined_labels: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut i = 0usize;
+    while i < lines.len() {
+        let t = lines[i].trim().to_string();
+        let Some(target) = t.strip_prefix("goto L").and_then(|r| r.strip_suffix(';')) else {
+            i += 1;
+            continue;
+        };
+        let Some(&lpos) = label_pos.get(target) else {
+            i += 1;
+            continue;
+        };
+        if inlined_labels.contains(target) {
+            i += 1;
+            continue;
+        }
+        // Collect flat statements after the label until terminal or control structure
+        let goto_indent = lines[i].len() - lines[i].trim_start().len();
+        let mut stmts: Vec<String> = Vec::new();
+        let mut terminal: Option<String> = None;
+        let mut ok = true;
+        let mut j = lpos + 1;
+        while j < lines.len() {
+            let lj = lines[j].trim().to_string();
+            if lj.is_empty() {
+                j += 1;
+                continue;
+            }
+            // Stop at next label
+            if lj.starts_with('L') && lj.ends_with(':') {
+                break;
+            }
+            // Stop at control structures (too complex to inline)
+            if lj.starts_with("if ")
+                || lj.starts_with("while ")
+                || lj.starts_with("switch ")
+                || lj.starts_with("for ")
+                || lj == "}"
+                || lj == "} else {"
+            {
+                ok = false;
+                break;
+            }
+            if lj.starts_with("return") || lj.starts_with("throw") {
+                terminal = Some(lj.clone());
+                break;
+            }
+            stmts.push(lj.clone());
+            if stmts.len() > 3 {
+                ok = false;
+                break;
+            }
+            j += 1;
+        }
+        if !ok || terminal.is_none() {
+            i += 1;
+            continue;
+        }
+        // Inline: replace goto with statements + terminal at goto's indent
+        let indent = " ".repeat(goto_indent);
+        let mut replacement: Vec<String> = stmts.iter().map(|s| format!("{indent}{s}")).collect();
+        replacement.push(format!("{indent}{}", terminal.unwrap()));
+        lines[i] = replacement.join("\n");
+        inlined_labels.insert(target.to_string());
+        i += 1;
+    }
+    // Remove labels that no longer have any goto references
+    let text = lines.join("\n");
+    let mut out: Vec<String> = Vec::new();
+    for line in text.lines() {
+        let t = line.trim();
+        if t.len() > 2 && t.starts_with('L') && t.ends_with(':') {
+            let label_num = &t[1..t.len() - 1];
+            if inlined_labels.contains(label_num) && !text.contains(&format!("goto {t}")) {
+                continue;
+            }
+        }
+        out.push(line.to_string());
+    }
+    out.join("\n")
+}
+
 fn apply_switch_break(text: &str) -> String {
     let mut lines: Vec<String> = text.lines().map(|l| l.to_string()).collect();
     let mut i = 0usize;
@@ -1564,7 +1656,7 @@ fn apply_arm_tail_goto_cleanup(text: &str) -> String {
     for (idx, line) in lines.iter().enumerate() {
         let t = line.trim();
         if t.len() > 2 && t.starts_with('L') && t.ends_with(':') {
-            label_pos.insert(t[..t.len() - 1].to_string(), idx);
+            label_pos.insert(t[1..t.len() - 1].to_string(), idx);
         }
     }
     let mut i = 0usize;
@@ -1803,6 +1895,7 @@ pub fn render_method_pseudocode_full(
     let text = apply_cast_paren_cleanup(&text);
     let text = apply_loop_recovery(&text);
     let text = apply_switch_break(&text);
+    let text = apply_small_block_inline(&text);
     let text = apply_dead_assign(&text);
     let name_to_id: HashMap<String, SsaValueId> = ctx
         .value_names
