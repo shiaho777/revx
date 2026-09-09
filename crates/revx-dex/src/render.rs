@@ -911,6 +911,192 @@ fn apply_boxing_cleanup(text: &str) -> String {
     out.join("\n")
 }
 
+#[allow(clippy::mut_range_bound)]
+fn apply_loop_recovery(text: &str) -> String {
+    let mut lines: Vec<String> = text.lines().map(|l| l.to_string()).collect();
+    // Build label -> line index map
+    let mut labels: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for (i, line) in lines.iter().enumerate() {
+        let t = line.trim();
+        if t.len() > 2 && t.starts_with('L') && t.ends_with(':') {
+            labels.insert(t[..t.len() - 1].to_string(), i);
+        }
+    }
+    if labels.is_empty() {
+        return lines.join("\n");
+    }
+    // Find backward gotos: "goto L{N};" where L{N} label appears earlier
+    let mut i = 0usize;
+    while i < lines.len() {
+        let t = lines[i].trim().to_string();
+        let Some(goto_target) = t
+            .strip_prefix("goto ")
+            .and_then(|r| r.strip_suffix(';'))
+            .map(|s| s.to_string())
+        else {
+            i += 1;
+            continue;
+        };
+        let Some(&label_line) = labels.get(&goto_target) else {
+            i += 1;
+            continue;
+        };
+        if label_line >= i {
+            i += 1;
+            continue;
+        }
+        // Backward goto found. Check if the label line is followed by an if/while
+        let mut if_line = label_line + 1;
+        while if_line < lines.len() && lines[if_line].trim().is_empty() {
+            if_line += 1;
+        }
+        if if_line >= lines.len() || !lines[if_line].trim().starts_with("if (") {
+            i += 1;
+            continue;
+        }
+        // The goto must be inside a simple if (no else clause).
+        // Find the closing } after the goto, then check it's not followed by else {
+        let mut close = i + 1;
+        while close < lines.len() && lines[close].trim().is_empty() {
+            close += 1;
+        }
+        if close >= lines.len() {
+            i += 1;
+            continue;
+        }
+        let after_close = lines[close].trim();
+        if after_close == "} else {" || after_close == "else {" || after_close.starts_with("else ")
+        {
+            i += 1;
+            continue;
+        }
+        // The if line must not already have an else in the condition area
+        // (between the if and the goto, at the same indent, no "} else {")
+        let if_indent = lines[if_line].len() - lines[if_line].trim_start().len();
+        for (j, line_ref) in lines.iter().enumerate().take(i).skip(if_line + 1) {
+            let lt = line_ref.trim().to_string();
+            let li = line_ref.len() - line_ref.trim_start().len();
+            if lt == "} else {" && li == if_indent {
+                let goto_i = lines[i].len() - lines[i].trim_start().len();
+                if goto_i > li {
+                    continue;
+                }
+                let mut not_loop = true;
+                for k2 in lines.iter().take(i).skip(j) {
+                    let lk = k2.len() - k2.trim_start().len();
+                    if lk <= if_indent && k2.trim() == "}" {
+                        not_loop = false;
+                        break;
+                    }
+                }
+                if not_loop {
+                    i += 1;
+                    continue;
+                }
+            }
+        }
+        // Convert: label → remove, if → while (with proper condition), goto → remove
+        let indent = lines[if_line].len() - lines[if_line].trim_start().len();
+        let cond = lines[if_line]
+            .trim()
+            .strip_prefix("if (")
+            .and_then(|r| r.strip_suffix(") {"))
+            .unwrap_or("")
+            .to_string();
+        // If the condition is a negation (from empty-then inversion), unwrap it for while
+        let while_cond =
+            if let Some(inner) = cond.strip_prefix("!(").and_then(|s| s.strip_suffix(')')) {
+                inner.to_string()
+            } else {
+                cond.clone()
+            };
+        lines[if_line] = format!("{}while ({while_cond}) {{", " ".repeat(indent));
+        lines[label_line] = String::new();
+        lines[i] = String::new();
+        // Remove any remaining goto to the same label within the while body
+        for line_ref in lines.iter_mut().take(i).skip(if_line + 1) {
+            if line_ref.trim() == format!("goto {goto_target};") {
+                *line_ref = String::new();
+            }
+        }
+        i += 1;
+    }
+    lines.join("\n")
+}
+
+fn apply_switch_break(text: &str) -> String {
+    let mut lines: Vec<String> = text.lines().map(|l| l.to_string()).collect();
+    // Find "goto L{N};" that appears right before "}" inside switch cases
+    // and the target L{N} is AFTER the switch. These should be break;
+    let mut i = 0usize;
+    while i < lines.len() {
+        let t = lines[i].trim().to_string();
+        let Some(_target) = t.strip_prefix("goto L").and_then(|r| r.strip_suffix(';')) else {
+            i += 1;
+            continue;
+        };
+        // Check if next non-empty line is "}" (end of case)
+        let mut j = i + 1;
+        while j < lines.len() && lines[j].trim().is_empty() {
+            j += 1;
+        }
+        if j >= lines.len() || lines[j].trim() != "}" {
+            i += 1;
+            continue;
+        }
+        // Check if we're inside a switch (look back for "case " or "switch (")
+        let mut in_switch = false;
+        for k in (0..i).rev() {
+            let lt = lines[k].trim();
+            if lt.starts_with("case ") || lt.starts_with("switch (") {
+                in_switch = true;
+                break;
+            }
+            if lt == "}" && !lt.starts_with("case") {
+                break;
+            }
+        }
+        if in_switch {
+            lines[i] = "break;".to_string();
+        }
+        i += 1;
+    }
+    lines.join("\n")
+}
+
+fn apply_dead_assign(text: &str) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut out: Vec<String> = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        let t = line.trim();
+        // Check for assignments to vN variables
+        let Some((lhs, _)) = t.strip_suffix(';').and_then(|l| l.split_once(" = ")) else {
+            out.push(line.to_string());
+            continue;
+        };
+        let var = lhs.split_whitespace().last().unwrap_or(lhs).trim();
+        if !(var.starts_with('v') && var[1..].chars().all(|c| c.is_ascii_digit())) {
+            out.push(line.to_string());
+            continue;
+        }
+        // Check if var appears in any subsequent line (within 100 lines)
+        let mut used = false;
+        for line_ref in lines.iter().take(lines.len().min(i + 100)).skip(i + 1) {
+            if contains_token(line_ref, var) {
+                used = true;
+                break;
+            }
+        }
+        if !used {
+            // Also check if var is used in the same line (after =)
+            // (already excluded by the split)
+            continue;
+        }
+        out.push(line.to_string());
+    }
+    out.join("\n")
+}
+
 fn apply_empty_then_inversion(text: &str) -> String {
     let mut lines: Vec<String> = text.lines().map(|l| l.to_string()).collect();
     let mut i = 0usize;
@@ -1525,6 +1711,9 @@ pub fn render_method_pseudocode_full(
     let text = apply_boolean_condition_simplify(&text);
     let text = apply_semantic_names(&text);
     let text = apply_cast_paren_cleanup(&text);
+    let text = apply_loop_recovery(&text);
+    let text = apply_switch_break(&text);
+    let text = apply_dead_assign(&text);
     let name_to_id: HashMap<String, SsaValueId> = ctx
         .value_names
         .iter()
