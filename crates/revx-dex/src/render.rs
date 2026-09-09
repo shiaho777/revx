@@ -1360,6 +1360,122 @@ fn apply_stmt_paren_repair(text: &str) -> String {
     out.join("\n")
 }
 
+fn apply_dead_goto_after_else(text: &str) -> String {
+    #[derive(Clone, Copy, PartialEq)]
+    enum FrameKind {
+        If,
+        ElseIf,
+        Else,
+        Plain,
+        Loopish,
+    }
+    struct Frame {
+        kind: FrameKind,
+        last_term: bool,
+        then_term: bool,
+    }
+    let is_terminal = |t: &str| -> bool {
+        t.starts_with("return")
+            || t.starts_with("throw ")
+            || t.starts_with("goto L")
+            || t == "break;"
+            || t == "continue;"
+    };
+    let opener_kind = |s: &str| -> FrameKind {
+        if s.starts_with("if ") {
+            FrameKind::If
+        } else if s.starts_with("while ")
+            || s.starts_with("for ")
+            || s.starts_with("switch ")
+            || s.starts_with("try")
+            || s.starts_with("catch ")
+        {
+            FrameKind::Loopish
+        } else {
+            FrameKind::Plain
+        }
+    };
+    let lines: Vec<&str> = text.lines().collect();
+    let mut stack: Vec<Frame> = Vec::new();
+    let mut dead: Vec<usize> = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        let t = line.trim();
+        if t.is_empty() || t.starts_with("//") || (t.starts_with('L') && t.ends_with(':')) {
+            continue;
+        }
+        let closes = t.chars().take_while(|&c| c == '}').count();
+        let rest = t[closes..].trim_start();
+        let mut popped_then: Option<bool> = None;
+        for _ in 0..closes {
+            let Some(f) = stack.pop() else {
+                continue;
+            };
+            let term = match f.kind {
+                FrameKind::If | FrameKind::ElseIf | FrameKind::Loopish => false,
+                FrameKind::Else => f.then_term && f.last_term,
+                FrameKind::Plain => f.last_term,
+            };
+            match f.kind {
+                FrameKind::If => popped_then = Some(f.last_term),
+                FrameKind::ElseIf => popped_then = Some(f.then_term && f.last_term),
+                _ => {}
+            }
+            if term && f.kind == FrameKind::Else {
+                dead.push(i);
+            }
+            if let Some(parent) = stack.last_mut() {
+                parent.last_term = term;
+            }
+        }
+        if rest.ends_with('{') {
+            let (kind, then_term) = if rest.starts_with("else if ") || rest.starts_with("else if(")
+            {
+                (FrameKind::ElseIf, popped_then.unwrap_or(false))
+            } else if rest.starts_with("else") {
+                (FrameKind::Else, popped_then.unwrap_or(false))
+            } else {
+                (opener_kind(rest), false)
+            };
+            stack.push(Frame {
+                kind,
+                last_term: false,
+                then_term,
+            });
+        } else if closes == 0
+            && let Some(top) = stack.last_mut()
+        {
+            top.last_term = is_terminal(t);
+        }
+    }
+    if dead.is_empty() {
+        return text.to_string();
+    }
+    let mut remove: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    for &p in &dead {
+        let mut j = p + 1;
+        while j < lines.len() {
+            let t = lines[j].trim();
+            if t.is_empty() || t.starts_with("//") {
+                j += 1;
+                continue;
+            }
+            if t.starts_with("goto L") && t.ends_with(';') {
+                remove.insert(j);
+                j += 1;
+            } else {
+                break;
+            }
+        }
+    }
+    lines
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !remove.contains(i))
+        .map(|(_, l)| l.to_string())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn apply_brace_repair(text: &str) -> String {
     let lines: Vec<String> = text.lines().map(|l| l.to_string()).collect();
     let lead_closes = |t: &str| t.chars().take_while(|&c| c == '}').count() as i32;
@@ -2419,6 +2535,7 @@ pub fn render_method_pseudocode_full(
     let text = apply_semantic_names(&text);
     let text = apply_cast_paren_cleanup(&text);
     let text = apply_loop_recovery(&text);
+    let text = apply_dead_goto_after_else(&text);
     let text = apply_loop_wrap(&text);
     let text = apply_switch_break(&text);
     let text = apply_small_block_inline(&text);
