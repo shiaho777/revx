@@ -911,6 +911,255 @@ fn apply_boxing_cleanup(text: &str) -> String {
     out.join("\n")
 }
 
+fn apply_empty_then_inversion(text: &str) -> String {
+    let mut lines: Vec<String> = text.lines().map(|l| l.to_string()).collect();
+    let mut i = 0usize;
+    while i < lines.len() {
+        let t = lines[i].trim().to_string();
+        let Some(cond) = t
+            .strip_prefix("if (")
+            .and_then(|r| r.strip_suffix(") {"))
+            .map(|c| c.to_string())
+        else {
+            i += 1;
+            continue;
+        };
+        // Next non-empty line must be "}" (empty then arm)
+        let mut j = i + 1;
+        while j < lines.len() && lines[j].trim().is_empty() {
+            j += 1;
+        }
+        if j >= lines.len() || lines[j].trim() != "}" {
+            i += 1;
+            continue;
+        }
+        // Next non-empty line must be "else {"
+        let mut k = j + 1;
+        while k < lines.len() && lines[k].trim().is_empty() {
+            k += 1;
+        }
+        if k >= lines.len() || lines[k].trim() != "else {" {
+            i += 1;
+            continue;
+        }
+        // Invert: replace if-line, remove } and else {
+        let indent = lines[i].len() - lines[i].trim_start().len();
+        let negated = negate_condition_text(&cond);
+        lines[i] = format!("{}if ({negated}) {{", " ".repeat(indent));
+        lines[j] = String::new();
+        lines[k] = String::new();
+        i = k + 1;
+    }
+    lines.join("\n")
+}
+
+fn negate_condition_text(cond: &str) -> String {
+    let c = cond.trim();
+    if let Some(inner) = c.strip_prefix("!(").and_then(|s| s.strip_suffix(')')) {
+        return inner.to_string();
+    }
+    for (op, neg) in [
+        (" == 0", " != 0"),
+        (" != 0", " == 0"),
+        (" == null", " != null"),
+        (" != null", " == null"),
+    ] {
+        if c.ends_with(op) {
+            let base = c.strip_suffix(op).unwrap_or(c);
+            return format!("{base}{neg}");
+        }
+    }
+    for (op, neg) in [
+        (" == ", " != "),
+        (" != ", " == "),
+        (" < ", " >= "),
+        (" >= ", " < "),
+        (" > ", " <= "),
+        (" <= ", " > "),
+    ] {
+        if let Some(pos) = c.rfind(op) {
+            let lhs = &c[..pos];
+            let rhs = &c[pos + op.len()..];
+            return format!("{lhs}{neg}{rhs}");
+        }
+    }
+    format!("!({c})")
+}
+
+fn apply_boolean_condition_simplify(text: &str) -> String {
+    let mut out: Vec<String> = Vec::new();
+    for line in text.lines() {
+        out.push(simplify_condition_line(line));
+    }
+    out.join("\n")
+}
+
+fn simplify_condition_line(line: &str) -> String {
+    let trimmed = line.trim();
+    if !trimmed.starts_with("if (") && !trimmed.starts_with("while (") {
+        return line.to_string();
+    }
+    // Extract the condition: everything between the first ( and the last ) before {
+    let open = match line.find('(') {
+        Some(p) => p,
+        None => return line.to_string(),
+    };
+    let close = match line.rfind(") {") {
+        Some(p) => p,
+        None => return line.to_string(),
+    };
+    if close <= open {
+        return line.to_string();
+    }
+    let cond = &line[open + 1..close];
+    let indent = line.len() - line.trim_start().len();
+    let prefix = &line[..open];
+    let _suffix = &line[close + 2..];
+
+    if let Some(expr) = cond.strip_suffix(" == 0") {
+        let expr = expr.trim();
+        let expr = strip_outer_parens_pair(expr);
+        if is_boolean_call(expr) {
+            return format!(
+                "{}{} (!({})) {{",
+                " ".repeat(indent),
+                prefix.trim_end(),
+                expr
+            );
+        }
+        return line.to_string();
+    }
+    if let Some(expr) = cond.strip_suffix(" != 0") {
+        let expr = expr.trim();
+        let expr = strip_outer_parens_pair(expr);
+        if is_boolean_call(expr) {
+            return format!("{}{} ({}) {{", " ".repeat(indent), prefix.trim_end(), expr);
+        }
+        return line.to_string();
+    }
+    line.to_string()
+}
+
+fn is_boolean_call(expr: &str) -> bool {
+    if !expr.contains('(') || !expr.contains(')') {
+        return false;
+    }
+    !expr.contains(" & ") && !expr.contains(" | ") && !expr.contains(" ^ ")
+}
+
+fn strip_outer_parens_pair(s: &str) -> &str {
+    s.strip_prefix('(')
+        .and_then(|inner| inner.strip_suffix(')'))
+        .unwrap_or(s)
+}
+
+fn apply_semantic_names(text: &str) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut name_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut type_counts: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    for line in &lines {
+        let t = line.trim();
+        let Some((lhs, rhs)) = t.strip_suffix(';').and_then(|l| l.split_once(" = ")) else {
+            continue;
+        };
+        let var = lhs.split_whitespace().last().unwrap_or(lhs).trim();
+        if !(var.starts_with('v') && var[1..].chars().all(|c| c.is_ascii_digit())) {
+            continue;
+        }
+        let rhs_t = rhs.trim();
+        let semantic = if let Some(t) = rhs_t
+            .strip_prefix('(')
+            .and_then(|r| r.split_once(')'))
+            .map(|(t, _)| t.to_string())
+            .filter(|t| looks_like_java_type(t))
+        {
+            let short = t.rsplit('.').next().unwrap_or(&t);
+            camel_case(short)
+        } else if rhs_t.ends_with(".iterator()") {
+            "it".to_string()
+        } else if rhs_t.ends_with(".size()") || rhs_t.ends_with(".length()") {
+            "size".to_string()
+        } else if rhs_t.ends_with(".toString()") {
+            "str".to_string()
+        } else {
+            continue;
+        };
+        let count = type_counts.entry(semantic.clone()).or_insert(0);
+        *count += 1;
+        let final_name = if *count == 1 {
+            semantic
+        } else {
+            format!("{semantic}{count}")
+        };
+        name_map.insert(var.to_string(), final_name);
+    }
+    if name_map.is_empty() {
+        return text.to_string();
+    }
+    let mut out: Vec<String> = Vec::new();
+    for line in &lines {
+        let mut l = line.to_string();
+        for (old, new) in &name_map {
+            l = replace_token(&l, old, new);
+        }
+        out.push(l);
+    }
+    out.join("\n")
+}
+
+fn looks_like_java_type(s: &str) -> bool {
+    if s.is_empty() || s.contains(' ') || s.contains('(') || s.contains(')') {
+        return false;
+    }
+    let first = s.chars().next().unwrap();
+    if !first.is_uppercase() {
+        return false;
+    }
+    s.chars()
+        .all(|c| c.is_alphanumeric() || c == '.' || c == '_' || c == '$')
+}
+
+fn camel_case(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut first = true;
+    for c in s.chars() {
+        if first {
+            out.extend(c.to_lowercase());
+            first = false;
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+fn apply_cast_paren_cleanup(text: &str) -> String {
+    let mut out = text.to_string();
+    // ((Type) (expr)) → (Type) expr
+    loop {
+        let before = out.clone();
+        if let Some(pos) = out.find("((")
+            && let Some(mid) = out[pos..].find(") (")
+        {
+            let inner_start = pos + 2;
+            let cast_end = pos + mid + 1;
+            let expr_start = cast_end + 2;
+            if let Some(close) = out[expr_start..].find(')') {
+                let expr_end = expr_start + close;
+                let cast_type = &out[inner_start..cast_end - 1];
+                let expr = &out[expr_start..expr_end];
+                let replacement = format!("({cast_type}) {expr}");
+                out = format!("{}{}{}", &out[..pos], replacement, &out[expr_end + 1..]);
+            }
+        }
+        if out == before {
+            break;
+        }
+    }
+    out
+}
+
 fn apply_enhanced_for(text: &str) -> String {
     let mut lines: Vec<String> = text.lines().map(|l| l.to_string()).collect();
     let mut i = 0usize;
@@ -1272,6 +1521,10 @@ pub fn render_method_pseudocode_full(
     let text = apply_arm_tail_goto_cleanup(&text);
     let text = apply_boxing_cleanup(&text);
     let text = apply_enhanced_for(&text);
+    let text = apply_empty_then_inversion(&text);
+    let text = apply_boolean_condition_simplify(&text);
+    let text = apply_semantic_names(&text);
+    let text = apply_cast_paren_cleanup(&text);
     let name_to_id: HashMap<String, SsaValueId> = ctx
         .value_names
         .iter()
