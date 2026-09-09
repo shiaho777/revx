@@ -1431,6 +1431,13 @@ fn apply_semantic_names(text: &str) -> String {
             "size".to_string()
         } else if rhs_t.ends_with(".toString()") {
             "str".to_string()
+        } else if let Some(ty) = rhs_t.strip_prefix("new ") {
+            let ty_name = ty.split('(').next().unwrap_or(ty).trim();
+            let short = ty_name.rsplit('.').next().unwrap_or(ty_name);
+            if short.is_empty() || !short.chars().next().is_some_and(|c| c.is_uppercase()) {
+                continue;
+            }
+            camel_case(short)
         } else if let Some(field) = extract_field_name(rhs_t) {
             field
         } else if let Some(getter) = extract_getter_name(rhs_t) {
