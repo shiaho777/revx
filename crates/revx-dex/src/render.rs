@@ -277,6 +277,15 @@ impl<'a> RenderCtx<'a> {
                     )
                 } else if t == "__exception" {
                     "// exception handler".to_string()
+                } else if let Some(rest) = t.strip_prefix("@lcs:") {
+                    let (iface, impl_sig) = rest.split_once(':').unwrap_or((rest, ""));
+                    let mr = crate::lift::format_method_ref(impl_sig);
+                    let name = self.name_of(id);
+                    if arg_texts.is_empty() {
+                        format!("{name} = ({iface}) {mr};")
+                    } else {
+                        format!("{name} = ({iface}) ({}) -> {mr};", arg_texts.join(", "))
+                    }
                 } else if t.starts_with("@cs:") {
                     let cs = t.strip_prefix("@cs:").unwrap_or("");
                     let name = self.name_of(id);
@@ -902,6 +911,142 @@ fn apply_boxing_cleanup(text: &str) -> String {
     out.join("\n")
 }
 
+fn apply_enhanced_for(text: &str) -> String {
+    let mut lines: Vec<String> = text.lines().map(|l| l.to_string()).collect();
+    let mut i = 0usize;
+    while i < lines.len() {
+        let t = lines[i].trim().to_string();
+        let Some((lhs, rhs)) = t.strip_suffix(';').and_then(|l| l.split_once(" = ")) else {
+            i += 1;
+            continue;
+        };
+        let iter = lhs.split_whitespace().last().unwrap_or(lhs).trim();
+        let recv = rhs.trim();
+        let Some(coll) = recv.strip_suffix(".iterator()") else {
+            i += 1;
+            continue;
+        };
+        if iter.is_empty()
+            || coll.is_empty()
+            || !iter.chars().all(|c| c.is_alphanumeric() || c == '_')
+        {
+            i += 1;
+            continue;
+        }
+        let has_call = format!("{iter}.hasNext(");
+        let next_call = format!("{iter}.next(");
+        // Scan forward (up to 5 non-empty lines) for the hasNext check
+        let mut j = i + 1;
+        let mut non_empty = 0;
+        while j < lines.len() && non_empty < 5 {
+            if lines[j].trim().is_empty() {
+                j += 1;
+                continue;
+            }
+            non_empty += 1;
+            let w = lines[j].trim();
+            if !(w.contains(&has_call) && w.ends_with('{')) {
+                j += 1;
+                continue;
+            }
+            // Found hasNext — check if while or inverted if
+            let is_while = w.starts_with("while (");
+            let is_inverted = w.starts_with("if (");
+            if !is_while && !is_inverted {
+                j += 1;
+                continue;
+            }
+            let if_line = j;
+            if is_inverted {
+                let mut j2 = j + 1;
+                while j2 < lines.len() && lines[j2].trim().is_empty() {
+                    j2 += 1;
+                }
+                if j2 >= lines.len() || lines[j2].trim() != "} else {" {
+                    j = j2;
+                    continue;
+                }
+                j = j2;
+            }
+            // Scan forward for the .next() assignment
+            let mut k = j + 1;
+            let mut next_found = false;
+            let mut elem_type = String::new();
+            let mut elem_name = String::new();
+            while k < lines.len() && k < j + 10 {
+                let n = lines[k].trim();
+                if n.is_empty() {
+                    k += 1;
+                    continue;
+                }
+                if n == "}" {
+                    break;
+                }
+                if let Some((nlhs, nrhs)) = n.strip_suffix(';').and_then(|l| l.split_once(" = "))
+                    && nrhs.contains(&next_call)
+                {
+                    let decl = nlhs.trim();
+                    let name = decl.split_whitespace().last().unwrap_or(decl);
+                    if decl.contains(' ') {
+                        let (ty, _) = decl.rsplit_once(' ').unwrap();
+                        elem_type = ty.to_string();
+                    } else {
+                        let cast_type = nrhs
+                            .trim()
+                            .strip_prefix('(')
+                            .and_then(|r| r.split_once(')'))
+                            .map(|(t, _)| t.to_string());
+                        if let Some(ct) = cast_type {
+                            elem_type = ct;
+                        }
+                    }
+                    elem_name = name.to_string();
+                    next_found = true;
+                    break;
+                }
+                k += 1;
+            }
+            if !next_found || elem_type.is_empty() || elem_name.is_empty() {
+                break;
+            }
+            let elem_type = elem_type
+                .trim_start_matches('(')
+                .trim_end_matches(')')
+                .to_string();
+            let indent = lines[j].len() - lines[j].trim_start().len();
+            let coll_clean = coll
+                .strip_prefix('(')
+                .and_then(|c| c.strip_suffix(')'))
+                .unwrap_or(coll);
+            lines[j] = format!(
+                "{}for ({} {} : {}) {{",
+                " ".repeat(indent),
+                elem_type,
+                elem_name,
+                coll_clean
+            );
+            lines[i] = String::new();
+            lines[k] = String::new();
+            if is_inverted {
+                let orig_if = if_line;
+                if orig_if < lines.len() {
+                    lines[orig_if] = String::new();
+                }
+            }
+            // For inverted: remove the "} else {" line
+            if is_inverted {
+                let mut j3 = j;
+                while j3 > 0 && lines[j3].trim().is_empty() {
+                    j3 -= 1;
+                }
+            }
+            break;
+        }
+        i += 1;
+    }
+    lines.join("\n")
+}
+
 fn apply_arm_tail_goto_cleanup(text: &str) -> String {
     let mut lines: Vec<String> = text.lines().map(|l| l.to_string()).collect();
     let mut i = 0usize;
@@ -1126,6 +1271,7 @@ pub fn render_method_pseudocode_full(
     let text = apply_dead_allocation_cleanup(&text);
     let text = apply_arm_tail_goto_cleanup(&text);
     let text = apply_boxing_cleanup(&text);
+    let text = apply_enhanced_for(&text);
     let name_to_id: HashMap<String, SsaValueId> = ctx
         .value_names
         .iter()

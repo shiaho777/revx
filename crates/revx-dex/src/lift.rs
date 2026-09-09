@@ -1455,11 +1455,12 @@ impl<'a> DexMethodLifter<'a> {
             }
             Insn::ConstMethodHandle { dst, idx } => {
                 let sig = self.ctx.dex.method_signature(*idx);
+                let mr = format_method_ref(&sig);
                 self.define(
                     *dst,
                     block,
                     SsaOp::Copy {
-                        src: Operand::Symbol(format!("{sig}::handle")),
+                        src: Operand::Symbol(mr),
                     },
                 );
             }
@@ -2088,6 +2089,19 @@ pub struct LiftOutput {
 pub fn lift_method_to_ssa(dex: &DexFile, code: &CodeItem, method_idx: u32) -> LiftOutput {
     let ctx = DexLiftContext::new(dex, code, method_idx);
     DexMethodLifter::new(ctx).lift()
+}
+
+pub fn format_method_ref(sig: &str) -> String {
+    let Some((class, rest)) = sig.split_once("->") else {
+        return sig.to_string();
+    };
+    let method = rest.split('(').next().unwrap_or(rest);
+    let class_short = crate::types::simple_name(&crate::types::java_type(class));
+    if method.is_empty() {
+        sig.to_string()
+    } else {
+        format!("{class_short}::{method}")
+    }
 }
 
 fn invoke_target(kind: InvokeKind, sig: &str) -> String {
