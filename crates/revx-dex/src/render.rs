@@ -2146,7 +2146,10 @@ fn apply_try_catch_syntax(text: &str) -> String {
         let indent = " ".repeat(lines[a].len() - lines[a].trim_start().len());
         replaces.insert(a, format!("{indent}try {{"));
         replaces.insert(b, format!("{indent}}} catch ({types} e) {{"));
-        let mut ins = cbody;
+        let mut ins: Vec<String> = cbody
+            .into_iter()
+            .filter(|l| l.trim() != "// exception handler")
+            .collect();
         ins.push(format!("{indent}}}"));
         insert_after.insert(b, ins);
         for x in *c..=e {
