@@ -869,10 +869,17 @@ fn apply_for_loop_recovery(text: &str) -> String {
         };
         // transform: remove init line, rewrite while line, remove increment line
         let indent = " ".repeat(open_indent);
-        lines[i] = format!(
-            "{indent}for ({} {} = {}; {}; {}) {{",
-            init_info.0, var, init_info.1, cond, inc_text
-        );
+        lines[i] = if init_info.0.is_empty() {
+            format!(
+                "{indent}for ({var} = {}; {cond}; {inc_text}) {{",
+                init_info.1
+            )
+        } else {
+            format!(
+                "{indent}for ({} {} = {}; {}; {}) {{",
+                init_info.0, var, init_info.1, cond, inc_text
+            )
+        };
         lines[last_body] = String::new();
         lines[i - 1] = String::new();
         i = j;
@@ -899,11 +906,12 @@ fn parse_init(line: &str, var: &str) -> Option<(String, String)> {
     if name != var {
         return None;
     }
-    let ty = decl.split_whitespace().next()?;
-    if ty == name {
-        return None;
+    let words: Vec<&str> = decl.split_whitespace().collect();
+    if words.len() >= 2 {
+        Some((words[0].to_string(), init.to_string()))
+    } else {
+        Some((String::new(), init.to_string()))
     }
-    Some((ty.to_string(), init.to_string()))
 }
 
 fn parse_increment(line: &str, var: &str) -> Option<String> {
@@ -3674,8 +3682,8 @@ pub fn render_method_pseudocode_full(
     let text = fuse_new_init(&text);
     let text = apply_copy_chain_collapse(&text);
     let text = apply_string_concat_fold(&text);
-    let text = apply_for_loop_recovery(&text);
     let text = apply_latch_continue_cleanup(&text);
+    let text = apply_for_loop_recovery(&text);
     let text = apply_dead_allocation_cleanup(&text);
     let text = apply_arm_tail_goto_cleanup(&text);
     let text = apply_boxing_cleanup(&text);
