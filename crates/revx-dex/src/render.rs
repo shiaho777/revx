@@ -2114,6 +2114,143 @@ fn apply_reindent(text: &str) -> String {
     out.join("\n")
 }
 
+fn chunk_terminates(chunk: &[String]) -> bool {
+    #[derive(Clone, Copy, PartialEq)]
+    enum K {
+        If,
+        ElseIf,
+        Else,
+        Plain,
+    }
+    let mut stack: Vec<(K, bool, bool)> = Vec::new();
+    let mut root_term = false;
+    let is_term =
+        |t: &str| t.starts_with("return") || t.starts_with("throw ") || t.starts_with("goto L");
+    for l in chunk {
+        let t = l.trim();
+        if t.is_empty() || t.starts_with("//") {
+            continue;
+        }
+        if (t.starts_with('L') && t.ends_with(':'))
+            || t.starts_with("break")
+            || t.starts_with("continue")
+            || t.starts_with("while ")
+            || t.starts_with("for ")
+            || t.starts_with("switch ")
+            || t.starts_with("synchronized ")
+            || t.starts_with("try")
+            || t.starts_with("case ")
+            || t.starts_with("default:")
+        {
+            return false;
+        }
+        let closes = t.chars().take_while(|&c| c == '}').count();
+        let rest = t[closes..].trim_start();
+        let mut popped_then: Option<bool> = None;
+        for _ in 0..closes {
+            let Some((kind, last_term, then_term)) = stack.pop() else {
+                return false;
+            };
+            let term = match kind {
+                K::If | K::ElseIf => false,
+                K::Else => then_term && last_term,
+                K::Plain => last_term,
+            };
+            match kind {
+                K::If => popped_then = Some(last_term),
+                K::ElseIf => popped_then = Some(then_term && last_term),
+                _ => {}
+            }
+            if let Some(top) = stack.last_mut() {
+                top.1 = term;
+            } else {
+                root_term = term;
+            }
+        }
+        if rest.ends_with('{') {
+            let kind = if rest.starts_with("else if ") || rest.starts_with("else if(") {
+                K::ElseIf
+            } else if rest.starts_with("else") {
+                K::Else
+            } else if rest.starts_with("if ") {
+                K::If
+            } else {
+                K::Plain
+            };
+            let then_term = match kind {
+                K::Else | K::ElseIf => popped_then.unwrap_or(false),
+                _ => false,
+            };
+            stack.push((kind, false, then_term));
+        } else if closes == 0 {
+            let term = is_term(t);
+            if let Some(top) = stack.last_mut() {
+                top.1 = term;
+            } else {
+                root_term = term;
+            }
+        }
+    }
+    stack.is_empty() && root_term
+}
+
+fn try_chunk_inline(
+    lines: &[String],
+    lpos: usize,
+    goto_indent: usize,
+    sites: usize,
+) -> Option<String> {
+    let net = |l: &str| -> i32 {
+        let t = l.trim();
+        let closes = t.chars().take_while(|&c| c == '}').count() as i32;
+        i32::from(t.ends_with('{')) - closes
+    };
+    let mut depth = 0i32;
+    let mut saw_open = false;
+    let mut end = None;
+    for (j, line) in lines.iter().enumerate().skip(lpos + 1) {
+        let t = line.trim();
+        if t.is_empty() {
+            continue;
+        }
+        depth += net(line);
+        if depth > 0 {
+            saw_open = true;
+        }
+        if depth < 0 {
+            return None;
+        }
+        if saw_open && depth == 0 {
+            end = Some(j);
+            break;
+        }
+    }
+    let end = end?;
+    let chunk: Vec<String> = lines[lpos + 1..=end]
+        .iter()
+        .filter(|l| !l.trim().is_empty())
+        .cloned()
+        .collect();
+    if chunk.is_empty() || chunk.len() > 14 || chunk.len() * sites > 80 {
+        return None;
+    }
+    if !chunk_terminates(&chunk) {
+        return None;
+    }
+    let min_ind = chunk
+        .iter()
+        .map(|l| l.len() - l.trim_start().len())
+        .min()
+        .unwrap_or(0);
+    let mut out: Vec<String> = Vec::new();
+    for l in &chunk {
+        let ind = l.len() - l.trim_start().len();
+        let shift = goto_indent + ind.saturating_sub(min_ind);
+        out.push(format!("{}{}", " ".repeat(shift), l.trim()));
+    }
+    Some(out.join("\n"))
+}
+
 fn apply_small_block_inline(text: &str) -> String {
     let mut lines: Vec<String> = text.lines().map(|l| l.to_string()).collect();
     let mut label_pos: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
@@ -2174,6 +2311,12 @@ fn apply_small_block_inline(text: &str) -> String {
             j += 1;
         }
         if !ok || terminal.is_none() {
+            let goto_stmt = format!("goto L{target};");
+            let sites = lines.iter().filter(|l| l.trim() == goto_stmt).count();
+            if let Some(replacement) = try_chunk_inline(&lines, lpos, goto_indent, sites) {
+                lines[i] = replacement;
+                inlined_labels.insert(target.to_string());
+            }
             i += 1;
             continue;
         }
