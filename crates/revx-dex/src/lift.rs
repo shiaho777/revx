@@ -1708,11 +1708,11 @@ impl<'a> DexMethodLifter<'a> {
                 type_idx,
             } => {
                 let size_val = self.value(*size);
-                let t = self.ctx.dex.type_name(*type_idx);
+                let t = crate::types::java_type(&self.ctx.dex.type_name(*type_idx));
                 let id = self.push_inst(
                     block,
                     SsaOp::Call {
-                        target: Operand::Symbol(format!("new {t}[]")),
+                        target: Operand::Symbol(format!("new {t}")),
                         args: vec![size_val],
                     },
                 );
@@ -1727,12 +1727,12 @@ impl<'a> DexMethodLifter<'a> {
                 self.set_type(copy_id, &t);
             }
             Insn::FilledNewArray { regs, type_idx } => {
-                let t = self.ctx.dex.type_name(*type_idx);
+                let t = crate::types::java_type(&self.ctx.dex.type_name(*type_idx));
                 let args: Vec<Operand> = regs.iter().map(|&r| self.value(r)).collect();
                 let id = self.push_inst(
                     block,
                     SsaOp::Call {
-                        target: Operand::Symbol(format!("new {t}[]")),
+                        target: Operand::Symbol(format!("new {t}")),
                         args,
                     },
                 );

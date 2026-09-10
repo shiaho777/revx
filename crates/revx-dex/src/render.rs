@@ -280,7 +280,14 @@ impl<'a> RenderCtx<'a> {
                     let ty_desc = t.strip_prefix("new ").unwrap_or("");
                     let name = self.name_of(id);
                     let class_name = clean_type_name(ty_desc);
-                    if args.is_empty() {
+                    if class_name.ends_with("[]") {
+                        let elem = &class_name[..class_name.len() - 2];
+                        if arg_texts.len() == 1 {
+                            format!("{name} = new {elem}[{}];", arg_texts[0])
+                        } else {
+                            format!("{name} = new {elem}[] {{{}}};", arg_texts.join(", "))
+                        }
+                    } else if args.is_empty() {
                         format!("{name} = new {class_name}();")
                     } else {
                         format!("{name} = new {class_name}({});", arg_texts.join(", "))
@@ -3017,9 +3024,14 @@ fn apply_semantic_names(text: &str) -> String {
         } else if rhs_t.ends_with(".toString()") {
             "str".to_string()
         } else if let Some(ty) = rhs_t.strip_prefix("new ") {
-            let ty_name = ty.split('(').next().unwrap_or(ty).trim();
+            let ty_name = ty.split(['(', '{', ' ']).next().unwrap_or(ty).trim();
             let short = ty_name.rsplit('.').next().unwrap_or(ty_name);
-            if short.is_empty() || !short.chars().next().is_some_and(|c| c.is_uppercase()) {
+            if short.is_empty()
+                || !short.chars().next().is_some_and(|c| c.is_uppercase())
+                || !short
+                    .chars()
+                    .all(|c| c.is_alphanumeric() || c == '.' || c == '_' || c == '$')
+            {
                 continue;
             }
             camel_case(short)
@@ -3797,9 +3809,6 @@ pub fn render_method_pseudocode_full(
 
     let (text, bailed) = crate::structure::render_structured(func, &block_renders);
     let text = text.trim_end().to_string();
-    if std::env::var("REVX_M_DBG").is_ok() && text.contains("new [I[]") {
-        eprintln!("===== RAW =====\n{text}\n===== END RAW =====");
-    }
     let text = if bailed {
         degrade_try_markers(&text)
     } else {
