@@ -2391,27 +2391,35 @@ impl DominatorTree {
         let mut finger1 = b1;
         let mut finger2 = b2;
         for _ in 0..4096 {
-            let mut guard = 0;
-            while po(finger1) < po(finger2) {
-                let n = next(finger1);
-                if n == finger1 {
-                    break;
+            loop {
+                let mut moved = false;
+                let mut guard = 0;
+                while po(finger1) < po(finger2) {
+                    let n = next(finger1);
+                    if n == finger1 {
+                        break;
+                    }
+                    finger1 = n;
+                    moved = true;
+                    guard += 1;
+                    if guard > 4096 {
+                        break;
+                    }
                 }
-                finger1 = n;
-                guard += 1;
-                if guard > 4096 {
-                    break;
+                guard = 0;
+                while po(finger2) < po(finger1) {
+                    let n = next(finger2);
+                    if n == finger2 {
+                        break;
+                    }
+                    finger2 = n;
+                    moved = true;
+                    guard += 1;
+                    if guard > 4096 {
+                        break;
+                    }
                 }
-            }
-            guard = 0;
-            while po(finger2) < po(finger1) {
-                let n = next(finger2);
-                if n == finger2 {
-                    break;
-                }
-                finger2 = n;
-                guard += 1;
-                if guard > 4096 {
+                if !moved {
                     break;
                 }
             }
@@ -14042,5 +14050,91 @@ mod string_call_tests {
             text.contains("_getopt_long(") && text.contains("+@1ABCD"),
             "expected optstring recovery:\n{text}"
         );
+    }
+}
+
+#[cfg(test)]
+mod postdom_intersect_tests {
+    use super::*;
+
+    #[test]
+    fn intersect_meets_below_root_on_diamond() {
+        // rev-graph shape mirroring the parser method: exit=6;
+        // 6 -> {1, 5}; 5 -> 4; 4 -> {2, 3}; 2 -> 0; 3 -> 0; 1 -> 0
+        let n = 7;
+        let mut cfg = Cfg {
+            blocks: (0..n)
+                .map(|i| CfgBlock {
+                    id: BlockId(i as u32),
+                    ..Default::default()
+                })
+                .collect(),
+            preds: vec![Vec::new(); n],
+            succs: vec![Vec::new(); n],
+            entry: BlockId(6),
+        };
+        let edges = [(6, 1), (6, 5), (5, 4), (4, 2), (4, 3), (2, 0), (3, 0)];
+        for (a, b) in edges {
+            cfg.succs[a].push(BlockId(b as u32));
+            cfg.preds[b].push(BlockId(a as u32));
+        }
+        let dt = DominatorTree::compute(&cfg);
+        // 2 and 3 share only the path through 4 -> NCD must be 4, not the root
+        let i2 = dt.idom_of(BlockId(2));
+        let i3 = dt.idom_of(BlockId(3));
+        assert_eq!(i2, Some(BlockId(4)), "idom(2)");
+        assert_eq!(i3, Some(BlockId(4)), "idom(3)");
+        let i0 = dt.idom_of(BlockId(0));
+        assert_eq!(i0, Some(BlockId(4)), "idom(0) = intersect(2,3) must be 4");
+        let i1 = dt.idom_of(BlockId(1));
+        assert_eq!(i1, Some(BlockId(6)), "idom(1) = root");
+    }
+}
+
+#[cfg(test)]
+mod loop_dom_tests {
+    use super::*;
+
+    fn graph(n: usize, entry: u32, edges: &[(u32, u32)]) -> Cfg {
+        let mut cfg = Cfg {
+            blocks: (0..n)
+                .map(|i| CfgBlock {
+                    id: BlockId(i as u32),
+                    ..Default::default()
+                })
+                .collect(),
+            preds: vec![Vec::new(); n],
+            succs: vec![Vec::new(); n],
+            entry: BlockId(entry),
+        };
+        for &(a, b) in edges {
+            cfg.succs[a as usize].push(BlockId(b));
+            cfg.preds[b as usize].push(BlockId(a));
+        }
+        cfg
+    }
+
+    #[test]
+    fn forward_dom_detects_loop_head() {
+        // 0 entry -> 1 head; 1 -> 2 body, 1 -> 3 exit; 2 -> 1 (back edge)
+        let cfg = graph(4, 0, &[(0, 1), (1, 2), (1, 3), (2, 1)]);
+        let dt = DominatorTree::compute(&cfg);
+        assert!(dt.dominates(BlockId(1), BlockId(2)), "head dominates body");
+        assert_eq!(dt.idom_of(BlockId(2)), Some(BlockId(1)));
+        assert_eq!(dt.idom_of(BlockId(1)), Some(BlockId(0)));
+    }
+
+    #[test]
+    fn forward_dom_nested_diamond() {
+        // 0 -> 1; 1 -> {2,3}; 2 -> 4; 3 -> 4; 4 -> 5
+        let cfg = graph(6, 0, &[(0, 1), (1, 2), (1, 3), (2, 4), (3, 4), (4, 5)]);
+        let dt = DominatorTree::compute(&cfg);
+        assert_eq!(
+            dt.idom_of(BlockId(4)),
+            Some(BlockId(1)),
+            "diamond join idom"
+        );
+        assert!(dt.dominates(BlockId(1), BlockId(4)));
+        assert!(!dt.dominates(BlockId(2), BlockId(4)));
     }
 }

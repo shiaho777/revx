@@ -6,7 +6,7 @@
 //! text, and emits `if/else` and `while` constructs, falling back to a
 //! labeled `goto` per construct when the shape resists structuring.
 
-use revx_analysis::ssa::{BlockId, CfgBlock, DominatorTree, SsaFunction};
+use revx_analysis::ssa::{BlockId, Cfg, CfgBlock, DominatorTree, SsaFunction};
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 pub struct BlockRender {
@@ -19,6 +19,9 @@ pub struct BlockRender {
 pub struct StructuredRenderer<'a> {
     func: &'a SsaFunction,
     dom: DominatorTree,
+    postdom: DominatorTree,
+    exit_id: BlockId,
+    loop_heads: HashSet<BlockId>,
     visited: HashSet<BlockId>,
     goto_targets: BTreeSet<BlockId>,
     block_starts: HashMap<BlockId, usize>,
@@ -91,9 +94,45 @@ pub fn render_structured(func: &SsaFunction, blocks: &HashMap<BlockId, BlockRend
 impl<'a> StructuredRenderer<'a> {
     pub fn new(func: &'a SsaFunction) -> Self {
         let dom = DominatorTree::compute(&func.cfg);
+        let n = func.cfg.blocks.len();
+        let exit_id = BlockId(n as u32);
+        let mut rev = Cfg {
+            blocks: (0..=n)
+                .map(|i| CfgBlock {
+                    id: BlockId(i as u32),
+                    ..Default::default()
+                })
+                .collect(),
+            preds: vec![Vec::new(); n + 1],
+            succs: vec![Vec::new(); n + 1],
+            entry: exit_id,
+        };
+        for (i, _) in func.cfg.blocks.iter().enumerate() {
+            if func.cfg.succs.get(i).is_none_or(|s| s.is_empty()) {
+                rev.succs[n].push(BlockId(i as u32));
+                rev.preds[i].push(exit_id);
+            }
+            if let Some(preds) = func.cfg.preds.get(i) {
+                for &p in preds {
+                    rev.succs[i].push(p);
+                    rev.preds[p.0 as usize].push(BlockId(i as u32));
+                }
+            }
+        }
+        let postdom = DominatorTree::compute(&rev);
+        let mut loop_heads = HashSet::new();
+        for (i, preds) in func.cfg.preds.iter().enumerate() {
+            let head = BlockId(i as u32);
+            if preds.iter().any(|&u| u != head && dom.dominates(head, u)) {
+                loop_heads.insert(head);
+            }
+        }
         Self {
             func,
             dom,
+            postdom,
+            exit_id,
+            loop_heads,
             visited: HashSet::new(),
             goto_targets: BTreeSet::new(),
             block_starts: HashMap::new(),
@@ -133,6 +172,52 @@ impl<'a> StructuredRenderer<'a> {
         self.push(format!("goto L{};", target.0));
     }
 
+    fn loop_members(&self, head: BlockId) -> HashSet<BlockId> {
+        let mut members = HashSet::new();
+        members.insert(head);
+        let mut stack: Vec<BlockId> = Vec::new();
+        if let Some(preds) = self.func.cfg.preds.get(head.0 as usize) {
+            for &u in preds {
+                if u != head && self.dom.dominates(head, u) {
+                    stack.push(u);
+                }
+            }
+        }
+        while let Some(b) = stack.pop() {
+            if !members.insert(b) {
+                continue;
+            }
+            if let Some(preds) = self.func.cfg.preds.get(b.0 as usize) {
+                for &p in preds {
+                    if p != head {
+                        stack.push(p);
+                    }
+                }
+            }
+        }
+        members
+    }
+
+    fn loop_exit(&self, members: &HashSet<BlockId>) -> Option<BlockId> {
+        let mut exit: Option<BlockId> = None;
+        for &m in members {
+            let Some(succs) = self.func.cfg.succs.get(m.0 as usize) else {
+                continue;
+            };
+            for &s in succs {
+                if members.contains(&s) {
+                    continue;
+                }
+                match exit {
+                    None => exit = Some(s),
+                    Some(e) if e == s => {}
+                    Some(_) => return None,
+                }
+            }
+        }
+        exit
+    }
+
     fn walk(
         &mut self,
         block: BlockId,
@@ -155,6 +240,24 @@ impl<'a> StructuredRenderer<'a> {
         if self.visited.contains(&block) {
             self.emit_goto(block);
             return;
+        }
+        if self.loop_heads.contains(&block) && !self.loop_stack.iter().any(|(h, _)| *h == block) {
+            let pretty = blocks
+                .get(&block)
+                .and_then(|r| r.cond.as_ref())
+                .is_some_and(|(_, t, f)| self.while_shape(block, *t, *f).is_some());
+            if !pretty {
+                let members = self.loop_members(block);
+                if let Some(exit) = self.loop_exit(&members) {
+                    self.push("while (true) {");
+                    self.loop_stack.push((block, exit));
+                    self.walk(block, blocks, Some(exit));
+                    self.loop_stack.pop();
+                    self.push("}");
+                    self.walk(exit, blocks, stop_at);
+                    return;
+                }
+            }
         }
         self.visited.insert(block);
         self.depth += 1;
@@ -206,30 +309,29 @@ impl<'a> StructuredRenderer<'a> {
             return;
         }
         let join = self.join_of(t, f);
-        if t == join && f == join {
+        let is_virtual = join == self.exit_id;
+        let stop = if is_virtual { None } else { Some(join) };
+        if !is_virtual && t == join && f == join {
             self.walk(join, blocks, outer_stop);
             return;
         }
-        if t == join {
+        if !is_virtual && t == join {
             let negated = negate(cond_text);
             self.push(format!("if ({negated}) {{"));
-            self.walk(f, blocks, Some(join));
+            self.walk(f, blocks, stop);
             self.push("}");
-        } else if f == join {
+        } else if !is_virtual && f == join {
             self.push(format!("if ({cond_text}) {{"));
-            self.walk(t, blocks, Some(join));
+            self.walk(t, blocks, stop);
             self.push("}");
         } else {
             self.push(format!("if ({cond_text}) {{"));
-            self.walk(t, blocks, Some(join));
+            self.walk(t, blocks, stop);
             self.push("} else {");
-            self.walk(f, blocks, Some(join));
+            self.walk(f, blocks, stop);
             self.push("}");
         }
-        // If both arms terminate (return/throw), there is no continuation to walk
-        let t_terminates = self.func.cfg.succs[t.0 as usize].is_empty();
-        let f_terminates = self.func.cfg.succs[f.0 as usize].is_empty();
-        if !(t_terminates && f_terminates) {
+        if !is_virtual && Some(join) != outer_stop {
             self.walk(join, blocks, outer_stop);
         }
     }
@@ -309,24 +411,25 @@ impl<'a> StructuredRenderer<'a> {
     }
 
     fn join_of(&self, t: BlockId, f: BlockId) -> BlockId {
+        let limit = self.func.cfg.blocks.len() + 2;
         let mut chain_t = vec![t];
         let mut cur = t;
-        for _ in 0..self.func.cfg.blocks.len() {
-            let Some(dom) = self.dom.idom_of(cur) else {
+        for _ in 0..limit {
+            let Some(dom) = self.postdom.idom_of(cur) else {
                 break;
             };
             chain_t.push(dom);
-            if dom == cur {
+            if dom == cur || dom == self.exit_id {
                 break;
             }
             cur = dom;
         }
         cur = f;
-        for _ in 0..=self.func.cfg.blocks.len() {
-            if let Some(pos) = chain_t.iter().position(|&b| b == cur) {
-                return chain_t[pos];
+        for _ in 0..limit {
+            if chain_t.contains(&cur) {
+                return cur;
             }
-            let Some(dom) = self.dom.idom_of(cur) else {
+            let Some(dom) = self.postdom.idom_of(cur) else {
                 break;
             };
             if dom == cur {
@@ -334,7 +437,7 @@ impl<'a> StructuredRenderer<'a> {
             }
             cur = dom;
         }
-        f
+        self.exit_id
     }
 }
 

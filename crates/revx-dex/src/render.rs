@@ -3097,6 +3097,14 @@ pub fn render_method_pseudocode_full(
         } else {
             None
         };
+        if cond.is_none()
+            && jump.is_none()
+            && switch.is_none()
+            && let Some(succs) = func.cfg.succs.get(bid.0 as usize)
+            && succs.len() == 1
+        {
+            jump = Some(succs[0]);
+        }
         let block_addr = block.start_addr as u32;
         let mut prefix: Vec<String> = Vec::new();
         if let Some(types) = handler_types.get(&block_addr) {
