@@ -28,6 +28,7 @@ pub struct StructuredRenderer<'a> {
     loop_stack: Vec<(BlockId, BlockId)>,
     lines: Vec<String>,
     depth: usize,
+    hop: usize,
 }
 
 const MAX_DEPTH: usize = 48;
@@ -139,6 +140,7 @@ impl<'a> StructuredRenderer<'a> {
             loop_stack: Vec::new(),
             lines: Vec::new(),
             depth: 0,
+            hop: 0,
         }
     }
 
@@ -238,6 +240,22 @@ impl<'a> StructuredRenderer<'a> {
             return;
         }
         if self.visited.contains(&block) {
+            if self.hop < 16
+                && let Some(render) = blocks.get(&block)
+                && render.cond.is_none()
+                && render.switch.is_none()
+                && render
+                    .lines
+                    .iter()
+                    .all(|l| l.trim().is_empty() || l.trim().starts_with("//"))
+                && let Some(next) = render.jump
+                && next != block
+            {
+                self.hop += 1;
+                self.walk(next, blocks, stop_at);
+                self.hop -= 1;
+                return;
+            }
             self.emit_goto(block);
             return;
         }
