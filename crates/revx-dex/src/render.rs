@@ -47,6 +47,46 @@ impl<'a> RenderCtx<'a> {
         }
     }
 
+    fn resolve_cmp(&mut self, op: &Operand) -> Option<(String, String)> {
+        enum Step {
+            Cmp(Vec<Operand>),
+            Follow(SsaValueId),
+            Stop,
+        }
+        let Operand::Value(mut id) = *op else {
+            return None;
+        };
+        for _ in 0..4 {
+            let step = {
+                let inst = self.func.values.get(id.0 as usize)?;
+                match &inst.op {
+                    SsaOp::Call {
+                        target: Operand::Symbol(s),
+                        args,
+                    } if (s.starts_with("cmpl_") || s.starts_with("cmpg_") || s == "cmp_long")
+                        && args.len() == 2 =>
+                    {
+                        Step::Cmp(args.clone())
+                    }
+                    SsaOp::Copy {
+                        src: Operand::Value(v),
+                    } => Step::Follow(*v),
+                    _ => Step::Stop,
+                }
+            };
+            match step {
+                Step::Cmp(args) => {
+                    let a = self.operand_text(&args[0]);
+                    let b = self.operand_text(&args[1]);
+                    return Some((a, b));
+                }
+                Step::Follow(v) => id = v,
+                Step::Stop => return None,
+            }
+        }
+        None
+    }
+
     fn cond_text(&mut self, cond: &Operand) -> String {
         let Operand::Value(id) = cond else {
             return self.operand_text(cond);
@@ -65,8 +105,13 @@ impl<'a> RenderCtx<'a> {
                     revx_analysis::ssa::BinOpKind::Ge => ">=",
                     _ => "?",
                 };
-                let l = self.operand_text(lhs);
                 let r = self.operand_text(rhs);
+                if r == "0"
+                    && let Some((a, b)) = self.resolve_cmp(lhs)
+                {
+                    return format!("{a} {op} {b}");
+                }
+                let l = self.operand_text(lhs);
                 format!("{l} {op} {r}")
             }
             _ => self.value_text(*id),
@@ -1476,6 +1521,227 @@ fn apply_dead_goto_after_else(text: &str) -> String {
         .join("\n")
 }
 
+fn apply_guard_flatten(text: &str) -> String {
+    #[derive(Clone, Copy, PartialEq)]
+    enum FrameKind {
+        If,
+        ElseIf,
+        Else,
+        Plain,
+        Loopish,
+    }
+    struct Frame {
+        kind: FrameKind,
+        last_term: bool,
+        then_term: bool,
+    }
+    let is_terminal = |t: &str| -> bool {
+        t.starts_with("return")
+            || t.starts_with("throw ")
+            || t.starts_with("goto L")
+            || t == "break;"
+            || t == "continue;"
+    };
+    let opener_kind = |s: &str| -> FrameKind {
+        if s.starts_with("if ") {
+            FrameKind::If
+        } else if s.starts_with("while ")
+            || s.starts_with("for ")
+            || s.starts_with("switch ")
+            || s.starts_with("try")
+            || s.starts_with("catch ")
+        {
+            FrameKind::Loopish
+        } else {
+            FrameKind::Plain
+        }
+    };
+    let net = |l: &str| -> i32 {
+        let t = l.trim();
+        let closes = t.chars().take_while(|&c| c == '}').count() as i32;
+        let opens = i32::from(t.ends_with('{'));
+        opens - closes
+    };
+    let mut lines: Vec<String> = text.lines().map(|l| l.to_string()).collect();
+    for _round in 0..128 {
+        let mut stack: Vec<Frame> = Vec::new();
+        let mut hit: Option<(usize, bool)> = None;
+        for (i, line) in lines.iter().enumerate() {
+            let t = line.trim();
+            if t.is_empty() || t.starts_with("//") || (t.starts_with('L') && t.ends_with(':')) {
+                continue;
+            }
+            let closes = t.chars().take_while(|&c| c == '}').count();
+            let rest = t[closes..].trim_start();
+            let mut popped_then: Option<bool> = None;
+            for _ in 0..closes {
+                let Some(f) = stack.pop() else {
+                    continue;
+                };
+                let term = match f.kind {
+                    FrameKind::If | FrameKind::ElseIf | FrameKind::Loopish => false,
+                    FrameKind::Else => f.then_term && f.last_term,
+                    FrameKind::Plain => f.last_term,
+                };
+                match f.kind {
+                    FrameKind::If => popped_then = Some(f.last_term),
+                    FrameKind::ElseIf => popped_then = Some(f.then_term && f.last_term),
+                    _ => {}
+                }
+                if let Some(parent) = stack.last_mut() {
+                    parent.last_term = term;
+                }
+            }
+            if rest.ends_with('{') {
+                if rest.starts_with("else") && popped_then == Some(true) {
+                    hit = Some((
+                        i,
+                        rest.starts_with("else if ") || rest.starts_with("else if("),
+                    ));
+                    break;
+                }
+                let (kind, then_term) =
+                    if rest.starts_with("else if ") || rest.starts_with("else if(") {
+                        (FrameKind::ElseIf, popped_then.unwrap_or(false))
+                    } else if rest.starts_with("else") {
+                        (FrameKind::Else, popped_then.unwrap_or(false))
+                    } else {
+                        (opener_kind(rest), false)
+                    };
+                stack.push(Frame {
+                    kind,
+                    last_term: false,
+                    then_term,
+                });
+            } else if closes == 0
+                && let Some(top) = stack.last_mut()
+            {
+                top.last_term = is_terminal(t);
+            }
+        }
+        let Some((i, is_else_if)) = hit else {
+            break;
+        };
+        let indent = " ".repeat(lines[i].len() - lines[i].trim_start().len());
+        if is_else_if {
+            let t = lines[i].trim();
+            let cond_part = t
+                .trim_start_matches('}')
+                .trim_start()
+                .strip_prefix("else ")
+                .unwrap_or("")
+                .to_string();
+            lines[i] = format!("{indent}}}");
+            lines.insert(i + 1, format!("{indent}{cond_part}"));
+        } else {
+            let mut depth = net(&lines[i]);
+            let mut close_at = None;
+            for (j, line) in lines.iter().enumerate().skip(i + 1) {
+                depth += net(line);
+                if depth <= 0 {
+                    let tj = lines[j].trim();
+                    if tj == "}" && !tj.ends_with('{') {
+                        close_at = Some(j);
+                    }
+                    break;
+                }
+            }
+            let Some(close_at) = close_at else {
+                break;
+            };
+            lines[i] = format!("{indent}}}");
+            lines.remove(close_at);
+        }
+    }
+    lines.join("\n")
+}
+
+fn apply_else_if_collapse(text: &str) -> String {
+    let net = |l: &str| -> i32 {
+        let t = l.trim();
+        let closes = t.chars().take_while(|&c| c == '}').count() as i32;
+        i32::from(t.ends_with('{')) - closes
+    };
+    let mut lines: Vec<String> = text.lines().map(|l| l.to_string()).collect();
+    for _round in 0..8 {
+        let mut changed = false;
+        let mut i = 0usize;
+        while i < lines.len() {
+            if lines[i].trim() != "} else {" {
+                i += 1;
+                continue;
+            }
+            let e_indent = lines[i].len() - lines[i].trim_start().len();
+            let mut depth = 1i32;
+            let mut e_close = None;
+            for (j, line) in lines.iter().enumerate().skip(i + 1) {
+                depth += net(line);
+                if depth <= 0 {
+                    if depth == 0 {
+                        e_close = Some(j);
+                    }
+                    break;
+                }
+            }
+            let Some(e_close) = e_close else {
+                i += 1;
+                continue;
+            };
+            if lines[e_close].trim() != "}" {
+                i += 1;
+                continue;
+            }
+            let mut k = i + 1;
+            while k < e_close && (lines[k].trim().is_empty() || lines[k].trim().starts_with("//")) {
+                k += 1;
+            }
+            if k >= e_close {
+                i += 1;
+                continue;
+            }
+            let bt = lines[k].trim().to_string();
+            if !bt.starts_with("if ") || !bt.ends_with('{') {
+                i += 1;
+                continue;
+            }
+            let mut depth2 = 1i32;
+            let mut if_close = None;
+            for (j, line) in lines.iter().enumerate().skip(k + 1).take(e_close - k - 1) {
+                depth2 += net(line);
+                if depth2 <= 0 {
+                    if depth2 == 0 {
+                        if_close = Some(j);
+                    }
+                    break;
+                }
+            }
+            let Some(if_close) = if_close else {
+                i += 1;
+                continue;
+            };
+            let tail_clean = lines
+                .iter()
+                .take(e_close)
+                .skip(if_close + 1)
+                .all(|l| l.trim().is_empty() || l.trim().starts_with("//"));
+            if !tail_clean {
+                i += 1;
+                continue;
+            }
+            let indent = " ".repeat(e_indent);
+            lines[i] = format!("{indent}}} else {bt}");
+            lines.remove(e_close);
+            lines.remove(k);
+            changed = true;
+            i += 1;
+        }
+        if !changed {
+            break;
+        }
+    }
+    lines.join("\n")
+}
+
 fn apply_brace_repair(text: &str) -> String {
     let lines: Vec<String> = text.lines().map(|l| l.to_string()).collect();
     let lead_closes = |t: &str| t.chars().take_while(|&c| c == '}').count() as i32;
@@ -2588,10 +2854,14 @@ pub fn render_method_pseudocode_full(
     let text = apply_cast_paren_cleanup(&text);
     let text = apply_loop_recovery(&text);
     let text = apply_dead_goto_after_else(&text);
+    let text = apply_guard_flatten(&text);
+    let text = apply_else_if_collapse(&text);
     let text = apply_loop_wrap(&text);
     let text = apply_switch_break(&text);
     let text = apply_small_block_inline(&text);
     let text = apply_dead_assign(&text);
+    let text = apply_guard_flatten(&text);
+    let text = apply_else_if_collapse(&text);
     let name_to_id: HashMap<String, SsaValueId> = ctx
         .value_names
         .iter()
