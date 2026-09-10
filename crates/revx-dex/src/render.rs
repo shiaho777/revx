@@ -2200,7 +2200,11 @@ fn apply_try_catch_syntax(text: &str) -> String {
                 ok = false;
                 break;
             }
-            let cbody: Vec<String> = lines[c + 1..e].to_vec();
+            let cbody: Vec<String> = lines[c + 1..e]
+                .iter()
+                .filter(|l| l.trim() != "// exception handler")
+                .cloned()
+                .collect();
             if !balanced(&cbody) || has_marker(&cbody) {
                 ok = false;
                 break;
@@ -2257,6 +2261,131 @@ fn apply_try_catch_syntax(text: &str) -> String {
         }
     }
     out.join("\n")
+}
+
+fn apply_catch_var_naming(text: &str) -> String {
+    let net = |l: &str| -> i32 {
+        let t = l.trim();
+        let closes = t.chars().take_while(|&c| c == '}').count() as i32;
+        i32::from(t.ends_with('{')) - closes
+    };
+    let mut lines: Vec<String> = text.lines().map(|l| l.to_string()).collect();
+    let mut taken: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for l in &lines {
+        let chars: Vec<char> = l.chars().collect();
+        let mut k = 0usize;
+        while k < chars.len() {
+            if chars[k].is_alphabetic() || chars[k] == '_' {
+                let s = k;
+                while k < chars.len() && (chars[k].is_alphanumeric() || chars[k] == '_') {
+                    k += 1;
+                }
+                let tok: String = chars[s..k].iter().collect();
+                taken.insert(tok);
+            } else {
+                k += 1;
+            }
+        }
+    }
+    let mut counter = 0u32;
+    let mut i = 0usize;
+    while i < lines.len() {
+        let t = lines[i].trim().to_string();
+        let Some(rest) = t
+            .strip_prefix("} catch (")
+            .and_then(|r| r.strip_suffix(") {"))
+            .map(|r| r.to_string())
+        else {
+            i += 1;
+            continue;
+        };
+        let Some(old_var) = rest.split_whitespace().last().map(|s| s.to_string()) else {
+            i += 1;
+            continue;
+        };
+        if old_var.is_empty() || !old_var.chars().all(|c| c.is_alphanumeric() || c == '_') {
+            i += 1;
+            continue;
+        }
+        let mut depth = 1i32;
+        let mut j = i + 1;
+        let mut end = None;
+        while j < lines.len() {
+            if lines[j].trim().starts_with("} catch") {
+                end = Some(j);
+                break;
+            }
+            depth += net(&lines[j]);
+            if depth <= 0 {
+                end = Some(j);
+                break;
+            }
+            j += 1;
+        }
+        let Some(end) = end else {
+            i += 1;
+            continue;
+        };
+        let mut k = i + 1;
+        while k < end && lines[k].trim().is_empty() {
+            k += 1;
+        }
+        if k >= end {
+            i += 1;
+            continue;
+        }
+        let first = lines[k].trim().to_string();
+        let Some((lhs_full, rhs)) = first.strip_suffix(';').and_then(|l| l.split_once(" = "))
+        else {
+            i += 1;
+            continue;
+        };
+        let lhs = lhs_full
+            .split_whitespace()
+            .last()
+            .unwrap_or(lhs_full)
+            .trim();
+        let rhs = rhs.trim();
+        let is_v = |s: &str| {
+            s.len() > 1 && s.starts_with('v') && s[1..].chars().all(|c| c.is_ascii_digit())
+        };
+        if !is_v(lhs) || !is_v(rhs) {
+            i += 1;
+            continue;
+        }
+        if lines[k + 1..end].iter().any(|l| contains_token(l, rhs)) {
+            i += 1;
+            continue;
+        }
+        let name = loop {
+            counter += 1;
+            let cand = if counter == 1 {
+                "e".to_string()
+            } else {
+                format!("e{counter}")
+            };
+            if !taken.contains(&cand) {
+                taken.insert(cand.clone());
+                break cand;
+            }
+            if counter > 32 {
+                break String::new();
+            }
+        };
+        if name.is_empty() {
+            i = end + 1;
+            continue;
+        }
+        let types_part = rest.trim_end_matches(&old_var).trim_end();
+        let pad = " ".repeat(lines[i].len() - lines[i].trim_start().len());
+        lines[i] = format!("{pad}}} catch ({types_part} {name}) {{");
+        for l in lines[k + 1..end].iter_mut() {
+            *l = replace_var_token(l, lhs, &name);
+        }
+        lines[k] = String::new();
+        i = end;
+    }
+    lines.join("\n")
 }
 
 fn apply_brace_repair(text: &str) -> String {
@@ -3718,6 +3847,7 @@ pub fn render_method_pseudocode_full(
     let text = apply_brace_repair(&text);
     let text = apply_labeled_continue(&text);
     let text = apply_try_catch_syntax(&text);
+    let text = apply_catch_var_naming(&text);
     apply_reindent(&text)
 }
 
