@@ -1971,6 +1971,69 @@ fn apply_empty_else_removal(text: &str) -> String {
     lines.join("\n")
 }
 
+fn apply_labeled_continue(text: &str) -> String {
+    let net = |l: &str| -> i32 {
+        let t = l.trim();
+        let closes = t.chars().take_while(|&c| c == '}').count() as i32;
+        i32::from(t.ends_with('{')) - closes
+    };
+    let mut lines: Vec<String> = text.lines().map(|l| l.to_string()).collect();
+    let mut i = 0usize;
+    while i < lines.len() {
+        if lines[i].trim() != "while (true) {" {
+            i += 1;
+            continue;
+        }
+        let w = i;
+        let mut j = w + 1;
+        while j < lines.len() && lines[j].trim().is_empty() {
+            j += 1;
+        }
+        let label = {
+            let t = lines[j].trim().to_string();
+            if j < lines.len() && t.len() > 2 && t.starts_with('L') && t.ends_with(':') {
+                t[..t.len() - 1].to_string()
+            } else {
+                i += 1;
+                continue;
+            }
+        };
+        let label_line = j;
+        let mut depth = net(&lines[w]);
+        let mut close = None;
+        for (k, line) in lines.iter().enumerate().skip(w + 1) {
+            depth += net(line);
+            if depth <= 0 {
+                if depth == 0 {
+                    close = Some(k);
+                }
+                break;
+            }
+        }
+        let Some(close) = close else {
+            i += 1;
+            continue;
+        };
+        let goto_stmt = format!("goto {label};");
+        let inside: Vec<usize> = (w..close)
+            .filter(|&k| lines[k].trim() == goto_stmt)
+            .collect();
+        if inside.is_empty() {
+            i = close + 1;
+            continue;
+        }
+        let indent = " ".repeat(lines[w].len() - lines[w].trim_start().len());
+        lines[w] = format!("{indent}{label}: while (true) {{");
+        for &k in &inside {
+            let ind = " ".repeat(lines[k].len() - lines[k].trim_start().len());
+            lines[k] = format!("{ind}continue {label};");
+        }
+        lines[label_line] = String::new();
+        i = close + 1;
+    }
+    lines.join("\n")
+}
+
 fn apply_brace_repair(text: &str) -> String {
     let lines: Vec<String> = text.lines().map(|l| l.to_string()).collect();
     let lead_closes = |t: &str| t.chars().take_while(|&c| c == '}').count() as i32;
@@ -3105,6 +3168,7 @@ pub fn render_method_pseudocode_full(
     let text = apply_stmt_paren_repair(&text);
     let text = apply_cast_paren_cleanup(&text);
     let text = apply_brace_repair(&text);
+    let text = apply_labeled_continue(&text);
     apply_reindent(&text)
 }
 
