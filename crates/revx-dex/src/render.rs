@@ -1742,6 +1742,235 @@ fn apply_else_if_collapse(text: &str) -> String {
     lines.join("\n")
 }
 
+fn replace_var_token(line: &str, tok: &str, rep: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let chars: Vec<char> = line.chars().collect();
+    let tc: Vec<char> = tok.chars().collect();
+    let mut i = 0usize;
+    let mut in_str = false;
+    let mut esc = false;
+    while i < chars.len() {
+        let c = chars[i];
+        if in_str {
+            out.push(c);
+            if esc {
+                esc = false;
+            } else if c == '\\' {
+                esc = true;
+            } else if c == '"' {
+                in_str = false;
+            }
+            i += 1;
+            continue;
+        }
+        if c == '"' {
+            in_str = true;
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        if i + tc.len() <= chars.len() && chars[i..i + tc.len()] == tc[..] {
+            let before_ok = i == 0
+                || !(chars[i - 1].is_alphanumeric() || chars[i - 1] == '_' || chars[i - 1] == '.');
+            let after = i + tc.len();
+            let after_ok =
+                after >= chars.len() || !(chars[after].is_alphanumeric() || chars[after] == '_');
+            if before_ok && after_ok {
+                out.push_str(rep);
+                i = after;
+                continue;
+            }
+        }
+        out.push(c);
+        i += 1;
+    }
+    out
+}
+
+fn name_from_type(ty: &str) -> String {
+    let t = ty.trim();
+    if let Some(elem) = t.strip_suffix("[]") {
+        return format!("{}Arr", name_from_type(elem));
+    }
+    match t {
+        "int" => return "i".to_string(),
+        "long" => return "j".to_string(),
+        "float" => return "f".to_string(),
+        "double" => return "d".to_string(),
+        "boolean" => return "z".to_string(),
+        "byte" => return "b".to_string(),
+        "char" => return "c".to_string(),
+        "short" => return "s".to_string(),
+        "java.lang.String" | "String" => return "str".to_string(),
+        "java.lang.Object" | "Object" => return "obj".to_string(),
+        _ => {}
+    }
+    let simple = t.rsplit('.').next().unwrap_or(t);
+    let simple = simple.split('<').next().unwrap_or(simple);
+    if simple.is_empty() || !simple.chars().next().is_some_and(|c| c.is_uppercase()) {
+        return String::new();
+    }
+    camel_case(simple)
+}
+
+fn apply_type_based_names(text: &str) -> String {
+    let mut lines: Vec<String> = text.lines().map(|l| l.to_string()).collect();
+    let mut var_types: std::collections::HashMap<String, Option<String>> =
+        std::collections::HashMap::new();
+    let mut order: Vec<String> = Vec::new();
+    for l in &lines {
+        let t = l.trim();
+        if t.is_empty() || t.starts_with("//") {
+            continue;
+        }
+        let Some((lhs, _)) = t.split_once(" = ") else {
+            continue;
+        };
+        let Some(sp) = lhs.rfind(' ') else {
+            continue;
+        };
+        let ty = &lhs[..sp];
+        let var = &lhs[sp + 1..];
+        if var.len() < 2 || !var.starts_with('v') || !var[1..].chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        if ty.is_empty() || ty.contains('(') || ty.contains(';') || ty.contains(',') {
+            continue;
+        }
+        let name = name_from_type(ty);
+        if name.is_empty() {
+            continue;
+        }
+        let entry = var_types.entry(var.to_string()).or_insert_with(|| {
+            order.push(var.to_string());
+            Some(name.clone())
+        });
+        if let Some(existing) = entry
+            && *existing != name
+        {
+            *entry = None;
+        }
+    }
+    let mut taken: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for l in &lines {
+        if l.trim_start().starts_with("//") {
+            continue;
+        }
+        let chars: Vec<char> = l.chars().collect();
+        let mut i = 0usize;
+        let mut in_str = false;
+        while i < chars.len() {
+            let c = chars[i];
+            if in_str {
+                if c == '"' {
+                    in_str = false;
+                }
+                i += 1;
+                continue;
+            }
+            if c == '"' {
+                in_str = true;
+                i += 1;
+                continue;
+            }
+            if c.is_alphabetic() || c == '_' {
+                let start = i;
+                while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
+                    i += 1;
+                }
+                let tok: String = chars[start..i].iter().collect();
+                let mut p = start;
+                while p > 0 && chars[p - 1].is_whitespace() {
+                    p -= 1;
+                }
+                let after_dot = p > 0 && chars[p - 1] == '.';
+                let is_v = tok.starts_with('v')
+                    && tok.len() > 1
+                    && tok[1..].chars().all(|ch| ch.is_ascii_digit());
+                if !after_dot && !is_v {
+                    taken.insert(tok);
+                }
+            } else {
+                i += 1;
+            }
+        }
+    }
+    let mut renames: Vec<(String, String)> = Vec::new();
+    for var in order {
+        let Some(Some(name)) = var_types.get(&var) else {
+            continue;
+        };
+        let mut n = 1u32;
+        let mut chosen: Option<String> = None;
+        while n <= 50 {
+            let cand = if n == 1 {
+                name.clone()
+            } else {
+                format!("{name}{n}")
+            };
+            if !taken.contains(&cand) {
+                taken.insert(cand.clone());
+                chosen = Some(cand);
+                break;
+            }
+            n += 1;
+        }
+        if let Some(c) = chosen {
+            renames.push((var, c));
+        }
+    }
+    for (var, name) in renames {
+        for l in lines.iter_mut() {
+            if l.trim_start().starts_with("//") {
+                continue;
+            }
+            if l.contains(&var) {
+                *l = replace_var_token(l, &var, &name);
+            }
+        }
+    }
+    lines.join("\n")
+}
+
+fn apply_empty_else_removal(text: &str) -> String {
+    let net = |l: &str| -> i32 {
+        let t = l.trim();
+        let closes = t.chars().take_while(|&c| c == '}').count() as i32;
+        i32::from(t.ends_with('{')) - closes
+    };
+    let mut lines: Vec<String> = text.lines().map(|l| l.to_string()).collect();
+    let mut changed = true;
+    while changed {
+        changed = false;
+        let mut i = 0usize;
+        while i < lines.len() {
+            if lines[i].trim() == "} else {" {
+                let mut depth = 1i32;
+                let mut j = i + 1;
+                let mut only_blank = true;
+                while j < lines.len() {
+                    depth += net(&lines[j]);
+                    if depth <= 0 {
+                        break;
+                    }
+                    if !lines[j].trim().is_empty() {
+                        only_blank = false;
+                    }
+                    j += 1;
+                }
+                if j < lines.len() && depth == 0 && only_blank && lines[j].trim() == "}" {
+                    let indent = lines[i].len() - lines[i].trim_start().len();
+                    lines[i] = format!("{}}}", " ".repeat(indent));
+                    lines.remove(j);
+                    changed = true;
+                }
+            }
+            i += 1;
+        }
+    }
+    lines.join("\n")
+}
+
 fn apply_brace_repair(text: &str) -> String {
     let lines: Vec<String> = text.lines().map(|l| l.to_string()).collect();
     let lead_closes = |t: &str| t.chars().take_while(|&c| c == '}').count() as i32;
@@ -2862,12 +3091,14 @@ pub fn render_method_pseudocode_full(
     let text = apply_dead_assign(&text);
     let text = apply_guard_flatten(&text);
     let text = apply_else_if_collapse(&text);
+    let text = apply_empty_else_removal(&text);
     let name_to_id: HashMap<String, SsaValueId> = ctx
         .value_names
         .iter()
         .map(|(id, name)| (name.clone(), *id))
         .collect();
     let text = apply_typed_declarations(&text, value_types, &name_to_id);
+    let text = apply_type_based_names(&text);
     let text = apply_unused_label_cleanup(&text);
     let text = apply_control_kind_repair(&text);
     let text = apply_condition_paren_repair(&text);
