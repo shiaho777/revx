@@ -2034,6 +2034,157 @@ fn apply_labeled_continue(text: &str) -> String {
     lines.join("\n")
 }
 
+fn apply_try_catch_syntax(text: &str) -> String {
+    let net = |l: &str| -> i32 {
+        let t = l.trim();
+        let closes = t.chars().take_while(|&c| c == '}').count() as i32;
+        i32::from(t.ends_with('{')) - closes
+    };
+    let lines: Vec<String> = text.lines().map(|l| l.to_string()).collect();
+    let mut try_open: HashMap<usize, usize> = HashMap::new();
+    let mut try_close: HashMap<usize, usize> = HashMap::new();
+    let mut catch_open: HashMap<usize, (usize, String)> = HashMap::new();
+    let mut catch_close: HashMap<usize, usize> = HashMap::new();
+    for (i, l) in lines.iter().enumerate() {
+        let t = l.trim();
+        if let Some(ks) = t.strip_prefix("// try@")
+            && let Ok(k) = ks.parse::<usize>()
+        {
+            let poisoned = try_open.insert(k, i).is_some();
+            if poisoned {
+                try_open.insert(k, usize::MAX);
+            }
+        } else if let Some(ks) = t.strip_prefix("// endtry@")
+            && let Ok(k) = ks.parse::<usize>()
+        {
+            let poisoned = try_close.insert(k, i).is_some();
+            if poisoned {
+                try_close.insert(k, usize::MAX);
+            }
+        } else if let Some(rest) = t.strip_prefix("// catch@") {
+            if let Some((ks, types_part)) = rest.split_once(" (")
+                && let Ok(k) = ks.parse::<usize>()
+            {
+                let types = types_part.strip_suffix(" e)").unwrap_or("").to_string();
+                if types.is_empty() {
+                    continue;
+                }
+                let poisoned = catch_open.insert(k, (i, types)).is_some();
+                if poisoned {
+                    catch_open.insert(k, (usize::MAX, String::new()));
+                }
+            }
+        } else if let Some(ks) = t.strip_prefix("// endcatch@")
+            && let Ok(k) = ks.parse::<usize>()
+        {
+            let poisoned = catch_close.insert(k, i).is_some();
+            if poisoned {
+                catch_close.insert(k, usize::MAX);
+            }
+        }
+    }
+    let mut replaces: HashMap<usize, String> = HashMap::new();
+    let mut deletes: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let mut insert_after: HashMap<usize, Vec<String>> = HashMap::new();
+    let mut ks: Vec<usize> = catch_open.keys().copied().collect();
+    ks.sort_by_key(|k| {
+        let span = match (try_open.get(k), try_close.get(k)) {
+            (Some(&a), Some(&b)) if a < b && a != usize::MAX && b != usize::MAX => b - a,
+            _ => usize::MAX,
+        };
+        (span, *k)
+    });
+    let has_marker = |v: &[String]| -> bool {
+        v.iter().any(|l| {
+            let t = l.trim();
+            t.starts_with("// try@")
+                || t.starts_with("// endtry@")
+                || t.starts_with("// catch@")
+                || t.starts_with("// endcatch@")
+        })
+    };
+    let balanced = |v: &[String]| -> bool {
+        let mut d = 0i32;
+        for l in v {
+            d += net(l);
+            if d < 0 {
+                return false;
+            }
+        }
+        d == 0
+    };
+    for k in ks {
+        let (Some(&a), Some(&b)) = (try_open.get(&k), try_close.get(&k)) else {
+            continue;
+        };
+        let (Some((c, types)), Some(&e)) = (catch_open.get(&k), catch_close.get(&k)) else {
+            continue;
+        };
+        if a == usize::MAX || b == usize::MAX || *c == usize::MAX || e == usize::MAX {
+            continue;
+        }
+        if !(a < b) || !(*c < e) {
+            continue;
+        }
+        if (*c >= a && *c <= b) || (e >= a && e <= b) {
+            continue;
+        }
+        if replaces.contains_key(&a) || replaces.contains_key(&b) {
+            continue;
+        }
+        if (*c..=e).any(|x| deletes.contains(&x) || replaces.contains_key(&x)) {
+            continue;
+        }
+        let region: Vec<String> = lines[a + 1..b].to_vec();
+        let cbody: Vec<String> = lines[c + 1..e].to_vec();
+        if !balanced(&region) || !balanced(&cbody) {
+            continue;
+        }
+        if has_marker(&region) || has_marker(&cbody) {
+            continue;
+        }
+        let indent = " ".repeat(lines[a].len() - lines[a].trim_start().len());
+        replaces.insert(a, format!("{indent}try {{"));
+        replaces.insert(b, format!("{indent}}} catch ({types} e) {{"));
+        let mut ins = cbody;
+        ins.push(format!("{indent}}}"));
+        insert_after.insert(b, ins);
+        for x in *c..=e {
+            deletes.insert(x);
+        }
+    }
+    let mut out: Vec<String> = Vec::with_capacity(lines.len());
+    for (i, l) in lines.iter().enumerate() {
+        if deletes.contains(&i) {
+            continue;
+        }
+        if let Some(rep) = replaces.get(&i) {
+            out.push(rep.clone());
+        } else {
+            let t = l.trim();
+            let indent = &l[..l.len() - t.len()];
+            if t.starts_with("// try@") {
+                out.push(format!("{indent}// try"));
+            } else if t.starts_with("// endtry@") {
+                out.push(format!("{indent}// end try"));
+            } else if let Some(rest) = t.strip_prefix("// catch@") {
+                match rest.split_once(" (") {
+                    Some((_, tp)) => out.push(format!("{indent}// catch ({tp}")),
+                    None => out.push(format!("{indent}// catch")),
+                }
+            } else if t.starts_with("// endcatch@") {
+                continue;
+            } else {
+                out.push(l.clone());
+            }
+        }
+        if let Some(ins) = insert_after.get(&i) {
+            out.extend(ins.iter().cloned());
+        }
+    }
+    out.join("\n")
+}
+
 fn apply_brace_repair(text: &str) -> String {
     let lines: Vec<String> = text.lines().map(|l| l.to_string()).collect();
     let lead_closes = |t: &str| t.chars().take_while(|&c| c == '}').count() as i32;
@@ -3112,17 +3263,29 @@ pub struct TryInfo {
     pub handler_types: HashMap<u32, Vec<String>>,
     pub catch_all_addrs: Vec<u32>,
     pub try_regions: Vec<(u32, u32)>,
+    pub entries: Vec<TryEntry>,
+    pub shared_handlers: std::collections::HashSet<u32>,
+}
+
+pub struct TryEntry {
+    pub k: usize,
+    pub start: u32,
+    pub end: u32,
+    pub handlers: Vec<(u32, Vec<String>)>,
 }
 
 pub fn build_try_info(dex: &DexFile, tries: &[crate::TryItem]) -> TryInfo {
     let mut handler_types: HashMap<u32, Vec<String>> = HashMap::new();
     let mut catch_all_addrs = Vec::new();
     let mut try_regions = Vec::new();
-    for t in tries {
+    let mut entries: Vec<TryEntry> = Vec::new();
+    let mut handler_ref_count: HashMap<u32, usize> = HashMap::new();
+    for (k, t) in tries.iter().enumerate() {
         let region = (t.start_addr, t.start_addr + t.insn_count as u32);
         if !try_regions.contains(&region) {
             try_regions.push(region);
         }
+        let mut entry_handlers: Vec<(u32, Vec<String>)> = Vec::new();
         for h in &t.handlers {
             let type_desc = dex
                 .types
@@ -3132,19 +3295,49 @@ pub fn build_try_info(dex: &DexFile, tries: &[crate::TryItem]) -> TryInfo {
             let jt = crate::types::java_type(&type_desc);
             let entry = handler_types.entry(h.addr).or_default();
             if !entry.contains(&jt) {
-                entry.push(jt);
+                entry.push(jt.clone());
+            }
+            *handler_ref_count.entry(h.addr).or_default() += 1;
+            if let Some((_, types)) = entry_handlers.iter_mut().find(|(a, _)| *a == h.addr) {
+                if !types.contains(&jt) {
+                    types.push(jt);
+                }
+            } else {
+                entry_handlers.push((h.addr, vec![jt]));
             }
         }
-        if let Some(addr) = t.catch_all_addr
-            && !catch_all_addrs.contains(&addr)
-        {
-            catch_all_addrs.push(addr);
+        if let Some(addr) = t.catch_all_addr {
+            if !catch_all_addrs.contains(&addr) {
+                catch_all_addrs.push(addr);
+            }
+            *handler_ref_count.entry(addr).or_default() += 1;
+            let throwable = "Throwable".to_string();
+            if let Some((_, types)) = entry_handlers.iter_mut().find(|(a, _)| *a == addr) {
+                if !types.contains(&throwable) {
+                    types.push(throwable);
+                }
+            } else {
+                entry_handlers.push((addr, vec![throwable]));
+            }
         }
+        entries.push(TryEntry {
+            k,
+            start: t.start_addr,
+            end: t.start_addr + t.insn_count as u32,
+            handlers: entry_handlers,
+        });
     }
+    let shared_handlers = handler_ref_count
+        .into_iter()
+        .filter(|(_, c)| *c > 1)
+        .map(|(a, _)| a)
+        .collect();
     TryInfo {
         handler_types,
         catch_all_addrs,
         try_regions,
+        entries,
+        shared_handlers,
     }
 }
 
@@ -3157,10 +3350,6 @@ pub fn render_method_pseudocode_full(
     let switch_cases = &output.switch_cases;
     let mut ctx = RenderCtx::new(func);
     ctx.value_types = value_types.clone();
-
-    let handler_types = &try_info.handler_types;
-    let catch_all_addrs = &try_info.catch_all_addrs;
-    let try_regions = &try_info.try_regions;
 
     let mut order = reverse_post_order(func);
     let reachable: std::collections::HashSet<BlockId> = order.iter().copied().collect();
@@ -3250,22 +3439,53 @@ pub fn render_method_pseudocode_full(
         }
         let block_addr = block.start_addr as u32;
         let mut prefix: Vec<String> = Vec::new();
-        if let Some(types) = handler_types.get(&block_addr) {
-            let mut all: Vec<String> = types.clone();
-            if catch_all_addrs.contains(&block_addr) && !all.iter().any(|t| t == "Throwable") {
-                all.push("Throwable".to_string());
+        let suffix: Vec<String> = Vec::new();
+        for e in &try_info.entries {
+            if e.end == block_addr {
+                prefix.push(format!("// endtry@{}", e.k));
             }
-            prefix.push(format!("// catch ({} e)", all.join(" | ")));
-        } else if catch_all_addrs.contains(&block_addr) {
-            prefix.push("// catch (Throwable e)".to_string());
         }
-        if try_regions.iter().any(|(s, _)| block_addr == *s) {
-            prefix.push("// try".to_string());
-        } else if try_regions.iter().any(|(_, e)| block_addr == *e) {
-            prefix.push("// end try".to_string());
+        for e in &try_info.entries {
+            if e.start == block_addr {
+                prefix.push(format!("// try@{}", e.k));
+            }
         }
+        let mut catch_ks: Vec<(usize, String)> = Vec::new();
+        for e in &try_info.entries {
+            if let Some((_, types)) = e.handlers.iter().find(|(a, _)| *a == block_addr) {
+                catch_ks.push((e.k, types.join(" | ")));
+            }
+        }
+        let terminates = lines
+            .iter()
+            .rev()
+            .map(|l| l.trim())
+            .find(|t| !t.is_empty() && !t.starts_with("//"))
+            .is_some_and(|t| {
+                t.starts_with("return") || t.starts_with("throw ") || t.starts_with("goto L")
+            });
         let mut all_lines = prefix;
-        all_lines.extend(lines);
+        if !catch_ks.is_empty() && terminates {
+            for (k, types) in &catch_ks {
+                all_lines.push(format!("// catch@{k} ({types} e)"));
+                all_lines.extend(lines.iter().cloned());
+                all_lines.push(format!("// endcatch@{k}"));
+            }
+        } else {
+            if !catch_ks.is_empty() {
+                let mut all: Vec<String> = Vec::new();
+                for (_, types) in &catch_ks {
+                    for t in types.split(" | ") {
+                        if !all.iter().any(|x| x == t) {
+                            all.push(t.to_string());
+                        }
+                    }
+                }
+                all_lines.push(format!("// catch ({} e)", all.join(" | ")));
+            }
+            all_lines.extend(lines);
+        }
+        all_lines.extend(suffix);
         block_renders.insert(
             bid,
             crate::structure::BlockRender {
@@ -3320,6 +3540,7 @@ pub fn render_method_pseudocode_full(
     let text = apply_cast_paren_cleanup(&text);
     let text = apply_brace_repair(&text);
     let text = apply_labeled_continue(&text);
+    let text = apply_try_catch_syntax(&text);
     apply_reindent(&text)
 }
 
