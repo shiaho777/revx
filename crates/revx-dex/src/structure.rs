@@ -29,17 +29,21 @@ pub struct StructuredRenderer<'a> {
     lines: Vec<String>,
     depth: usize,
     hop: usize,
+    bailed: bool,
 }
 
 const MAX_DEPTH: usize = 48;
 const MAX_LINES: usize = 6000;
 const MAX_LOOP_MEMBERS: usize = 128;
 
-pub fn render_structured(func: &SsaFunction, blocks: &HashMap<BlockId, BlockRender>) -> String {
+pub fn render_structured(
+    func: &SsaFunction,
+    blocks: &HashMap<BlockId, BlockRender>,
+) -> (String, bool) {
     let mut r = StructuredRenderer::new(func);
     r.walk(func.cfg.entry, blocks, None);
     if r.lines.is_empty() {
-        return "    <empty>".to_string();
+        return ("    <empty>".to_string(), r.bailed);
     }
     let mut insertions: Vec<(usize, String)> = Vec::new();
     let existing_labels: HashSet<String> = r
@@ -89,7 +93,7 @@ pub fn render_structured(func: &SsaFunction, blocks: &HashMap<BlockId, BlockRend
         out.push_str(line);
         out.push('\n');
     }
-    out
+    (out, r.bailed)
 }
 
 impl<'a> StructuredRenderer<'a> {
@@ -141,6 +145,7 @@ impl<'a> StructuredRenderer<'a> {
             lines: Vec::new(),
             depth: 0,
             hop: 0,
+            bailed: false,
         }
     }
 
@@ -237,6 +242,7 @@ impl<'a> StructuredRenderer<'a> {
             return;
         }
         if self.depth > MAX_DEPTH || self.lines.len() > MAX_LINES {
+            self.bailed = true;
             return;
         }
         if self.visited.contains(&block) {
