@@ -2096,7 +2096,7 @@ fn apply_try_catch_syntax(text: &str) -> String {
             }
         } else if let Some(rest) = t.strip_prefix("// catch@") {
             if let Some((ks, types_part)) = rest.split_once(" (") {
-let kj = parse_kj(ks).or_else(|| ks.parse::<usize>().ok().map(|k| (k, 0)));
+                let kj = parse_kj(ks).or_else(|| ks.parse::<usize>().ok().map(|k| (k, 0)));
                 if let Some((k, j)) = kj {
                     let types = types_part.strip_suffix(" e)").unwrap_or("").to_string();
                     if types.is_empty() {
@@ -2628,9 +2628,11 @@ fn apply_dead_assign(text: &str) -> String {
             out.push(line.to_string());
             continue;
         }
-        // Check if var appears in any subsequent line (within 100 lines)
         let mut used = false;
-        for line_ref in lines.iter().take(lines.len().min(i + 100)).skip(i + 1) {
+        for (j, line_ref) in lines.iter().enumerate() {
+            if j == i {
+                continue;
+            }
             if contains_token(line_ref, var) {
                 used = true;
                 break;
@@ -3558,6 +3560,30 @@ pub fn render_method_pseudocode_full(
         {
             jump = Some(succs[0]);
         }
+        if let Some(succs) = func.cfg.succs.get(bid.0 as usize) {
+            let mut seen: Vec<(u32, u32)> = Vec::new();
+            for &s in succs {
+                let Some(succ_block) = func.cfg.blocks.get(s.0 as usize) else {
+                    continue;
+                };
+                for &pid in &succ_block.phis {
+                    let Some(inst) = func.values.get(pid.0 as usize) else {
+                        continue;
+                    };
+                    let SsaOp::Phi { incoming } = &inst.op else {
+                        continue;
+                    };
+                    for (pred, val) in incoming {
+                        if *pred == bid && val.0 != u32::MAX && !seen.contains(&(pid.0, val.0)) {
+                            seen.push((pid.0, val.0));
+                            let lhs = ctx.name_of(pid);
+                            let rhs = ctx.operand_text(&Operand::Value(*val));
+                            lines.push(format!("{lhs} = {rhs};"));
+                        }
+                    }
+                }
+            }
+        }
         let block_addr = block.start_addr as u32;
         let mut prefix: Vec<String> = Vec::new();
         let mut suffix: Vec<String> = Vec::new();
@@ -3634,6 +3660,9 @@ pub fn render_method_pseudocode_full(
 
     let (text, bailed) = crate::structure::render_structured(func, &block_renders);
     let text = text.trim_end().to_string();
+    if std::env::var("REVX_M_DBG").is_ok() && text.contains("new [I[]") {
+        eprintln!("===== RAW =====\n{text}\n===== END RAW =====");
+    }
     let text = if bailed {
         degrade_try_markers(&text)
     } else {
