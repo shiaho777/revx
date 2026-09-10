@@ -1577,10 +1577,6 @@ fn apply_small_block_inline(text: &str) -> String {
             i += 1;
             continue;
         };
-        if inlined_labels.contains(target) {
-            i += 1;
-            continue;
-        }
         // Collect flat statements after the label until terminal or control structure
         let goto_indent = lines[i].len() - lines[i].trim_start().len();
         let mut stmts: Vec<String> = Vec::new();
@@ -1638,7 +1634,8 @@ fn apply_small_block_inline(text: &str) -> String {
         let t = line.trim();
         if t.len() > 2 && t.starts_with('L') && t.ends_with(':') {
             let label_num = &t[1..t.len() - 1];
-            if inlined_labels.contains(label_num) && !text.contains(&format!("goto {t}")) {
+            if inlined_labels.contains(label_num) && !text.contains(&format!("goto L{label_num};"))
+            {
                 continue;
             }
         }
