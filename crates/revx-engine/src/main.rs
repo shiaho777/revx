@@ -104,6 +104,23 @@ struct DexGotoCensusArgs {
     json: bool,
     #[arg(long)]
     limit: Option<usize>,
+    #[arg(long, value_enum, default_value_t = StructuringModeValue::Auto)]
+    mode: StructuringModeValue,
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum StructuringModeValue {
+    Auto,
+    Legacy,
+}
+
+impl From<StructuringModeValue> for revx_dex::region::StructuringMode {
+    fn from(v: StructuringModeValue) -> Self {
+        match v {
+            StructuringModeValue::Auto => revx_dex::region::StructuringMode::Auto,
+            StructuringModeValue::Legacy => revx_dex::region::StructuringMode::Legacy,
+        }
+    }
 }
 
 #[derive(Args)]
@@ -900,7 +917,7 @@ fn cmd_dex_goto_census(args: DexGotoCensusArgs) -> Result<()> {
         fs::read(&args.path).with_context(|| format!("failed to read {}", args.path.display()))?;
     let dex =
         revx_dex::DexFile::parse(data).map_err(|e| anyhow::anyhow!("DEX parse failed: {e}"))?;
-    let census = revx_dex::census::census_dex(&dex, args.limit);
+    let census = revx_dex::census::census_dex_with_mode(&dex, args.limit, args.mode.into());
     if args.json {
         println!(
             "{}",
@@ -932,6 +949,13 @@ fn cmd_dex_goto_census(args: DexGotoCensusArgs) -> Result<()> {
                     },
                     "bailed_methods": census.totals.bailed_methods,
                 },
+                "structuring": {
+                    "mode": if matches!(args.mode, StructuringModeValue::Auto) { "auto" } else { "legacy" },
+                    "region_methods": census.totals.region_methods,
+                    "legacy_methods": census.totals.legacy_methods,
+                    "structured_try_count": census.totals.structured_try_count,
+                    "fallback_by_reason": census.totals.fallback_by_reason,
+                },
                 "exception_totals": exception_counts_json(&census.exception_totals),
                 "exception_flow_meaning": revx_dex::exception::EXCEPTION_FLOW_MEANING,
                 "final_provenance": "unknown",
@@ -942,6 +966,11 @@ fn cmd_dex_goto_census(args: DexGotoCensusArgs) -> Result<()> {
                     "code_off": m.code_off,
                     "status": m.status,
                     "error": m.error,
+                    "region": m.region.as_ref().map(|r| serde_json::json!({
+                        "used": r.used,
+                        "structured_try_count": r.structured_try_count,
+                        "fallback_reason": r.fallback_reason.map(|reason| reason.as_str()),
+                    })),
                     "final_goto_count": m.counts.as_ref().map(|c| c.final_goto_count).unwrap_or(0),
                     "final_goto_line_count": m.counts.as_ref().map(|c| c.final_goto_line_count).unwrap_or(0),
                     "by_reason": {

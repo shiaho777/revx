@@ -709,7 +709,13 @@ pub fn decompile_method(dex: &DexFile, code: &CodeItem, method_idx: u32) -> Meth
     let output = lift_method_to_ssa(dex, code, method_idx);
     let sig = dex.method_signature(method_idx);
     let try_info = build_try_info(dex, &code.tries);
-    let text = render_method_pseudocode_full(&output, &try_info);
+    let (result, _) = crate::region::structure_lifted(
+        dex,
+        &try_info,
+        &output,
+        crate::region::StructuringMode::Auto,
+    );
+    let text = result.pseudocode;
     MethodPseudocode {
         signature: sig,
         pseudocode: text,
@@ -738,7 +744,13 @@ pub fn decompile_method_with_exception_flow(
 ) {
     let output = lift_method_to_ssa(dex, code, method_idx);
     let try_info = build_try_info(dex, &code.tries);
-    let (pseudocode, diagnostics) = render_method_pseudocode_with_diagnostics(&output, &try_info);
+    let (result, diagnostics) = crate::region::structure_lifted(
+        dex,
+        &try_info,
+        &output,
+        crate::region::StructuringMode::Auto,
+    );
+    let pseudocode = result.pseudocode;
     (
         MethodPseudocode {
             signature: dex.method_signature(method_idx),
@@ -3996,7 +4008,7 @@ fn clean_type_name(t: &str) -> String {
         .replace("java.util.", "")
 }
 
-fn render_invoke_call(
+pub(crate) fn render_invoke_call(
     kind_char: char,
     sig: &str,
     arg_texts: &[String],

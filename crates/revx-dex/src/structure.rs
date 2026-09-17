@@ -429,7 +429,11 @@ impl<'a> StructuredRenderer<'a> {
     ) {
         self.push(format!("switch ({switch_val}) {{"));
         for (key, target) in cases {
-            self.push(format!("case {key}:"));
+            self.push(if key == "default" {
+                "default:".into()
+            } else {
+                format!("case {key}:")
+            });
             self.walk(*target, blocks, stop_at);
         }
         self.push("}");

@@ -2,7 +2,7 @@ use crate::DexFile;
 use crate::structure::{GotoReason, StructuringDiagnostics};
 use std::collections::{BTreeMap, BTreeSet};
 
-pub const CENSUS_SCHEMA_VERSION: u32 = 2;
+pub const CENSUS_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FinalGotoSite {
@@ -178,6 +178,10 @@ pub struct CensusCounts {
     pub raw_emission_count: usize,
     pub raw_by_reason: ReasonCounts,
     pub bailed_methods: usize,
+    pub region_methods: usize,
+    pub legacy_methods: usize,
+    pub structured_try_count: usize,
+    pub fallback_by_reason: BTreeMap<String, usize>,
 }
 
 impl CensusCounts {
@@ -207,6 +211,12 @@ impl CensusCounts {
         self.final_goto_line_count += other.final_goto_line_count;
         self.raw_emission_count += other.raw_emission_count;
         self.bailed_methods += other.bailed_methods;
+        self.region_methods += other.region_methods;
+        self.legacy_methods += other.legacy_methods;
+        self.structured_try_count += other.structured_try_count;
+        for (reason, count) in &other.fallback_by_reason {
+            *self.fallback_by_reason.entry(reason.clone()).or_default() += count;
+        }
         self.by_reason.add(&other.by_reason);
         self.raw_by_reason.add(&other.raw_by_reason);
     }
@@ -225,6 +235,7 @@ pub struct MethodCensus {
     pub raw_diagnostics: Option<StructuringDiagnostics>,
     pub exception_counts: Option<crate::exception::ExceptionFlowCounts>,
     pub exception_flow: Option<crate::exception::ExceptionFlow>,
+    pub region: Option<crate::region::RegionPathInfo>,
 }
 
 #[derive(Debug)]
@@ -249,6 +260,14 @@ pub struct GotoCensus {
 }
 
 pub fn census_dex(dex: &DexFile, limit: Option<usize>) -> GotoCensus {
+    census_dex_with_mode(dex, limit, crate::region::StructuringMode::Auto)
+}
+
+pub fn census_dex_with_mode(
+    dex: &DexFile,
+    limit: Option<usize>,
+    mode: crate::region::StructuringMode,
+) -> GotoCensus {
     let total_defined_methods = dex.defined_methods().count();
     let selected_methods = limit
         .unwrap_or(total_defined_methods)
@@ -282,6 +301,7 @@ pub fn census_dex(dex: &DexFile, limit: Option<usize>) -> GotoCensus {
             raw_diagnostics: None,
             exception_counts: None,
             exception_flow: None,
+            region: None,
         };
         if method.code_off == 0 {
             report.selection.skipped_codeless_methods += 1;
@@ -294,18 +314,29 @@ pub fn census_dex(dex: &DexFile, limit: Option<usize>) -> GotoCensus {
                         return Err("invalid method or prototype index".into());
                     }
                     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        crate::render::decompile_method_with_exception_flow(
-                            dex,
-                            &code,
-                            method.method_idx,
-                        )
+                        let lifted = crate::lift::lift_method_to_ssa(dex, &code, method.method_idx);
+                        let info = crate::render::build_try_info(dex, &code.tries);
+                        let (result, diagnostics) =
+                            crate::region::structure_lifted(dex, &info, &lifted, mode);
+                        (result, diagnostics, lifted.exception_flow)
                     }))
                     .map_err(|_| "decompilation panicked".into())
                 });
             match result {
                 Ok((output, diagnostics, flow)) => {
                     let scan = count_final_gotos(&output.pseudocode);
-                    let counts = CensusCounts::from_scan(&scan, &diagnostics);
+                    let mut counts = CensusCounts::from_scan(&scan, &diagnostics);
+                    counts.region_methods = usize::from(output.used_region_path);
+                    counts.legacy_methods = usize::from(!output.used_region_path);
+                    counts.structured_try_count = output.structured_try_count;
+                    if let Some(reason) = output.fallback_reason {
+                        counts.fallback_by_reason.insert(reason.as_str().into(), 1);
+                    }
+                    row.region = Some(crate::region::RegionPathInfo {
+                        used: output.used_region_path,
+                        fallback_reason: output.fallback_reason,
+                        structured_try_count: output.structured_try_count,
+                    });
                     let exception_counts = flow.counts();
                     report.exception_totals.add(&exception_counts);
                     report.totals.add(&counts);
