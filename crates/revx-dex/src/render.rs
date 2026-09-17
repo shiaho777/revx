@@ -718,6 +718,25 @@ pub fn decompile_method(dex: &DexFile, code: &CodeItem, method_idx: u32) -> Meth
     }
 }
 
+pub fn decompile_method_with_diagnostics(
+    dex: &DexFile,
+    code: &CodeItem,
+    method_idx: u32,
+) -> (MethodPseudocode, crate::structure::StructuringDiagnostics) {
+    let output = lift_method_to_ssa(dex, code, method_idx);
+    let try_info = build_try_info(dex, &code.tries);
+    let (pseudocode, diagnostics) = render_method_pseudocode_with_diagnostics(&output, &try_info);
+    (
+        MethodPseudocode {
+            signature: dex.method_signature(method_idx),
+            pseudocode,
+            registers: code.registers_size,
+            insn_units: code.insns.len(),
+        },
+        diagnostics,
+    )
+}
+
 fn apply_string_concat_fold(text: &str) -> String {
     let mut out_lines: Vec<String> = Vec::new();
     for line in text.lines() {
@@ -3562,6 +3581,23 @@ pub fn render_method_pseudocode_full(
     output: &crate::lift::LiftOutput,
     try_info: &TryInfo,
 ) -> String {
+    render_method_pseudocode_impl(output, try_info, None)
+}
+
+pub fn render_method_pseudocode_with_diagnostics(
+    output: &crate::lift::LiftOutput,
+    try_info: &TryInfo,
+) -> (String, crate::structure::StructuringDiagnostics) {
+    let mut diagnostics = crate::structure::StructuringDiagnostics::default();
+    let text = render_method_pseudocode_impl(output, try_info, Some(&mut diagnostics));
+    (text, diagnostics)
+}
+
+fn render_method_pseudocode_impl(
+    output: &crate::lift::LiftOutput,
+    try_info: &TryInfo,
+    diagnostics: Option<&mut crate::structure::StructuringDiagnostics>,
+) -> String {
     let func = &output.func;
     let value_types = &output.value_types;
     let switch_cases = &output.switch_cases;
@@ -3807,7 +3843,15 @@ pub fn render_method_pseudocode_full(
         );
     }
 
-    let (text, bailed) = crate::structure::render_structured(func, &block_renders);
+    let (text, bailed) = if let Some(diagnostics) = diagnostics {
+        let (text, collected) =
+            crate::structure::render_structured_with_diagnostics(func, &block_renders);
+        let bailed = collected.bailed;
+        *diagnostics = collected;
+        (text, bailed)
+    } else {
+        crate::structure::render_structured(func, &block_renders)
+    };
     let text = text.trim_end().to_string();
     let text = if bailed {
         degrade_try_markers(&text)
