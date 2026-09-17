@@ -950,7 +950,9 @@ pub fn build_basic_blocks(
     leaders.insert(0);
     for t in &code.tries {
         leaders.insert(t.start_addr);
-        leaders.insert(t.start_addr + t.insn_count as u32);
+        if let Some(end) = t.start_addr.checked_add(u32::from(t.insn_count)) {
+            leaders.insert(end);
+        }
         for h in &t.handlers {
             leaders.insert(h.addr);
         }
@@ -1216,6 +1218,8 @@ impl<'a> DexMethodLifter<'a> {
         let insns = decode_all(self.ctx.code);
         let blocks = build_basic_blocks(self.ctx.code, &insns);
         self.build_cfg(&blocks);
+        let exception_flow =
+            crate::exception::ExceptionFlow::new(self.ctx.code, &insns, &self.func.cfg);
 
         // Parameter types from the method's proto (instance methods: p0 is the receiver).
         let is_static = {
@@ -1306,6 +1310,7 @@ impl<'a> DexMethodLifter<'a> {
             func: self.func,
             value_types: self.value_types,
             switch_cases: self.switch_cases,
+            exception_flow,
         }
     }
 
@@ -2212,6 +2217,7 @@ pub struct LiftOutput {
     pub func: SsaFunction,
     pub value_types: crate::types::ValueTypes,
     pub switch_cases: HashMap<BlockId, Vec<(String, BlockId)>>,
+    pub exception_flow: crate::exception::ExceptionFlow,
 }
 
 pub fn lift_method_to_ssa(dex: &DexFile, code: &CodeItem, method_idx: u32) -> LiftOutput {

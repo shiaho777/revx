@@ -1,8 +1,7 @@
 use revx_dex::DexFile;
 use revx_dex::census;
-use revx_dex::lift::{build_basic_blocks, decode_all, lift_method_to_ssa};
-use revx_dex::render::build_try_info;
-use revx_dex::structure::{GotoReason, render_structured_with_diagnostics};
+use revx_dex::lift::lift_method_to_ssa;
+use revx_dex::structure::render_structured_with_diagnostics;
 use std::collections::HashMap;
 
 fn put_u16(out: &mut [u8], off: usize, v: u16) {
@@ -251,10 +250,6 @@ fn structuring_diagnostics_record_emissions() {
     let cd = dex.classes[0].class_data.as_ref().expect("class data");
     let code = dex.code_item(cd.virtual_methods[0].code_off).expect("code");
     let lift = lift_method_to_ssa(&dex, &code, cd.virtual_methods[0].method_idx);
-    let insns_map = decode_all(&code);
-    let _ = build_basic_blocks(&code, &insns_map);
-    let try_info = build_try_info(&dex, &code.tries);
-    let _ = try_info;
     let mut blocks: HashMap<revx_analysis::ssa::BlockId, revx_dex::structure::BlockRender> =
         HashMap::new();
     for b in &lift.func.cfg.blocks {
@@ -275,16 +270,11 @@ fn structuring_diagnostics_record_emissions() {
     }
     let (_, diagnostics) = render_structured_with_diagnostics(&lift.func, &blocks);
     assert!(!diagnostics.bailed);
-    for e in &diagnostics.goto_emissions {
-        assert!(matches!(
-            e.reason,
-            GotoReason::Revisit | GotoReason::ForwardRevisit
-        ));
-    }
+    assert!(diagnostics.goto_emissions.is_empty());
 }
 
 #[test]
-fn raw_emissions_are_not_final_counts() {
+fn self_loop_fixture_has_one_raw_emission_and_no_final_goto() {
     let back_edge: [u16; 6] = [0x1070u16, 0x0000, 0x0000, goto8(0)[0], 0x0000, 0x000e];
     let spec = MethodSpec {
         name: "m0",
@@ -295,11 +285,41 @@ fn raw_emissions_are_not_final_counts() {
     let census = census::census_dex(&dex, None);
     let m = &census.methods[0];
     let counts = m.counts.as_ref().expect("counts");
-    assert!(
-        counts.raw_emission_count >= counts.final_goto_count,
-        "raw emissions include gotos later removed or converted; final count is the honest floor"
-    );
+    assert_eq!(counts.raw_emission_count, 1);
+    assert_eq!(counts.final_goto_count, 0);
     assert_eq!(census.totals.raw_emission_count, counts.raw_emission_count);
+}
+
+#[test]
+fn census_aggregates_the_rendered_methods_exception_flow() {
+    let mut dex = DexFile::parse(build_dex(&[MethodSpec {
+        name: "m0",
+        insns: &[0x0e],
+    }]))
+    .unwrap();
+    let offset = dex.data.len() as u32;
+    for word in [1u16, 0, 0, 1] {
+        dex.data.extend_from_slice(&word.to_le_bytes());
+    }
+    dex.data.extend_from_slice(&0u32.to_le_bytes());
+    dex.data.extend_from_slice(&2u32.to_le_bytes());
+    for word in [0x0eu16, 0x0e] {
+        dex.data.extend_from_slice(&word.to_le_bytes());
+    }
+    dex.data.extend_from_slice(&0u32.to_le_bytes());
+    dex.data.extend_from_slice(&1u16.to_le_bytes());
+    dex.data.extend_from_slice(&1u16.to_le_bytes());
+    dex.data.extend_from_slice(&[1, 0, 1]);
+    dex.classes[0].class_data.as_mut().unwrap().virtual_methods[0].code_off = offset;
+    let report = census::census_dex(&dex, None);
+    assert_eq!(report.schema_version, 2);
+    assert_eq!(report.selection.completed_methods, 1);
+    let method = &report.methods[0];
+    let flow = method.exception_flow.as_ref().unwrap();
+    assert_eq!(method.exception_counts.as_ref().unwrap(), &flow.counts());
+    assert_eq!(report.exception_totals, flow.counts());
+    assert_eq!(report.exception_totals.catch_all_handler_refs, 1);
+    assert_eq!(report.exception_totals.conservative_edges, 1);
 }
 
 #[test]

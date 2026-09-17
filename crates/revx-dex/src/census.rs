@@ -2,7 +2,7 @@ use crate::DexFile;
 use crate::structure::{GotoReason, StructuringDiagnostics};
 use std::collections::{BTreeMap, BTreeSet};
 
-pub const CENSUS_SCHEMA_VERSION: u32 = 1;
+pub const CENSUS_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FinalGotoSite {
@@ -223,6 +223,8 @@ pub struct MethodCensus {
     pub counts: Option<CensusCounts>,
     pub final_scan: Option<FinalGotoScan>,
     pub raw_diagnostics: Option<StructuringDiagnostics>,
+    pub exception_counts: Option<crate::exception::ExceptionFlowCounts>,
+    pub exception_flow: Option<crate::exception::ExceptionFlow>,
 }
 
 #[derive(Debug)]
@@ -243,6 +245,7 @@ pub struct GotoCensus {
     pub methods: Vec<MethodCensus>,
     pub totals: CensusCounts,
     pub selection: CensusSelection,
+    pub exception_totals: crate::exception::ExceptionFlowCounts,
 }
 
 pub fn census_dex(dex: &DexFile, limit: Option<usize>) -> GotoCensus {
@@ -264,6 +267,7 @@ pub fn census_dex(dex: &DexFile, limit: Option<usize>) -> GotoCensus {
             failed_methods: 0,
             completed_methods: 0,
         },
+        exception_totals: crate::exception::ExceptionFlowCounts::default(),
     };
     for (class, method) in dex.defined_methods().take(selected_methods) {
         let mut row = MethodCensus {
@@ -276,6 +280,8 @@ pub fn census_dex(dex: &DexFile, limit: Option<usize>) -> GotoCensus {
             counts: None,
             final_scan: None,
             raw_diagnostics: None,
+            exception_counts: None,
+            exception_flow: None,
         };
         if method.code_off == 0 {
             report.selection.skipped_codeless_methods += 1;
@@ -288,7 +294,7 @@ pub fn census_dex(dex: &DexFile, limit: Option<usize>) -> GotoCensus {
                         return Err("invalid method or prototype index".into());
                     }
                     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        crate::render::decompile_method_with_diagnostics(
+                        crate::render::decompile_method_with_exception_flow(
                             dex,
                             &code,
                             method.method_idx,
@@ -297,15 +303,19 @@ pub fn census_dex(dex: &DexFile, limit: Option<usize>) -> GotoCensus {
                     .map_err(|_| "decompilation panicked".into())
                 });
             match result {
-                Ok((output, diagnostics)) => {
+                Ok((output, diagnostics, flow)) => {
                     let scan = count_final_gotos(&output.pseudocode);
                     let counts = CensusCounts::from_scan(&scan, &diagnostics);
+                    let exception_counts = flow.counts();
+                    report.exception_totals.add(&exception_counts);
                     report.totals.add(&counts);
                     report.selection.completed_methods += 1;
                     row.status = "completed";
                     row.counts = Some(counts);
                     row.final_scan = Some(scan);
                     row.raw_diagnostics = Some(diagnostics);
+                    row.exception_counts = Some(exception_counts);
+                    row.exception_flow = Some(flow);
                 }
                 Err(error) => {
                     row.status = "failed";

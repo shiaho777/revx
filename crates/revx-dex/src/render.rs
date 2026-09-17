@@ -723,6 +723,19 @@ pub fn decompile_method_with_diagnostics(
     code: &CodeItem,
     method_idx: u32,
 ) -> (MethodPseudocode, crate::structure::StructuringDiagnostics) {
+    let (pseudocode, diagnostics, _) = decompile_method_with_exception_flow(dex, code, method_idx);
+    (pseudocode, diagnostics)
+}
+
+pub fn decompile_method_with_exception_flow(
+    dex: &DexFile,
+    code: &CodeItem,
+    method_idx: u32,
+) -> (
+    MethodPseudocode,
+    crate::structure::StructuringDiagnostics,
+    crate::exception::ExceptionFlow,
+) {
     let output = lift_method_to_ssa(dex, code, method_idx);
     let try_info = build_try_info(dex, &code.tries);
     let (pseudocode, diagnostics) = render_method_pseudocode_with_diagnostics(&output, &try_info);
@@ -734,6 +747,7 @@ pub fn decompile_method_with_diagnostics(
             insn_units: code.insns.len(),
         },
         diagnostics,
+        output.exception_flow,
     )
 }
 

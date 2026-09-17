@@ -814,6 +814,87 @@ async fn main() -> Result<()> {
     }
 }
 
+fn exception_counts_json(c: &revx_dex::exception::ExceptionFlowCounts) -> serde_json::Value {
+    serde_json::json!({
+        "try_regions": c.try_regions,
+        "valid_try_regions": c.valid_try_regions,
+        "typed_handler_refs": c.typed_handler_refs,
+        "catch_all_handler_refs": c.catch_all_handler_refs,
+        "protected_blocks": c.protected_blocks,
+        "handler_blocks": c.handler_blocks,
+        "ordinary_entry_reachable_handler_blocks": c.ordinary_entry_reachable_handler_blocks,
+        "shared_handler_addresses": c.shared_handler_addresses,
+        "conservative_edges": c.conservative_edges,
+        "diagnostics": c.diagnostics,
+    })
+}
+
+fn exception_flow_json(flow: &revx_dex::exception::ExceptionFlow) -> serde_json::Value {
+    serde_json::json!({
+        "meaning": revx_dex::exception::EXCEPTION_FLOW_MEANING,
+        "address_unit": "16-bit code unit",
+        "range_convention": "half-open",
+        "counts": exception_counts_json(&flow.counts()),
+        "regions": flow.regions.iter().map(|r| serde_json::json!({
+            "try_index": r.try_index,
+            "start": r.start,
+            "insn_count": r.insn_count,
+            "end": r.end,
+            "valid_range": r.valid_range,
+            "protected_blocks": r.protected_blocks.iter().map(|b| b.0).collect::<Vec<_>>(),
+            "handlers": r.handlers.iter().enumerate().map(|(index, h)| {
+                let (kind, type_idx) = match h.kind {
+                    revx_dex::exception::HandlerKind::Typed { type_idx } => ("typed", Some(type_idx)),
+                    revx_dex::exception::HandlerKind::CatchAll => ("catch_all", None),
+                };
+                serde_json::json!({
+                    "handler_index": index,
+                    "kind": kind,
+                    "type_idx": type_idx,
+                    "addr": h.addr,
+                    "block": h.block.map(|b| b.0),
+                    "ordinary_entry_reachable": h.ordinary_entry_reachable,
+                })
+            }).collect::<Vec<_>>(),
+        })).collect::<Vec<_>>(),
+        "shared_handlers": flow.shared_handlers.iter().map(|h| serde_json::json!({
+            "addr": h.addr,
+            "block": h.block.map(|b| b.0),
+            "references": h.references.iter().map(|r| serde_json::json!({
+                "try_index": r.try_index,
+                "handler_index": r.handler_index,
+            })).collect::<Vec<_>>(),
+        })).collect::<Vec<_>>(),
+        "edges": flow.edges.iter().map(|e| serde_json::json!({
+            "from": e.from.0,
+            "to": e.to.0,
+            "try_index": e.try_index,
+            "handler_index": e.handler_index,
+        })).collect::<Vec<_>>(),
+        "diagnostics": flow.diagnostics.iter().map(|d| serde_json::json!({
+            "try_index": d.try_index,
+            "handler_index": d.handler_index,
+            "code": d.code,
+        })).collect::<Vec<_>>(),
+    })
+}
+
+fn exception_summary(c: &revx_dex::exception::ExceptionFlowCounts) -> String {
+    format!(
+        "exception_flow: tries={}/{} typed_refs={} catch_all_refs={} protected_blocks={} handler_blocks={} ordinary_reachable_handlers={} shared_addresses={} conservative_edges={} diagnostics={}",
+        c.valid_try_regions,
+        c.try_regions,
+        c.typed_handler_refs,
+        c.catch_all_handler_refs,
+        c.protected_blocks,
+        c.handler_blocks,
+        c.ordinary_entry_reachable_handler_blocks,
+        c.shared_handler_addresses,
+        c.conservative_edges,
+        c.diagnostics,
+    )
+}
+
 fn cmd_dex_goto_census(args: DexGotoCensusArgs) -> Result<()> {
     let data =
         fs::read(&args.path).with_context(|| format!("failed to read {}", args.path.display()))?;
@@ -851,6 +932,8 @@ fn cmd_dex_goto_census(args: DexGotoCensusArgs) -> Result<()> {
                     },
                     "bailed_methods": census.totals.bailed_methods,
                 },
+                "exception_totals": exception_counts_json(&census.exception_totals),
+                "exception_flow_meaning": revx_dex::exception::EXCEPTION_FLOW_MEANING,
                 "final_provenance": "unknown",
                 "methods": census.methods.iter().map(|m| serde_json::json!({
                     "class": m.class,
@@ -881,6 +964,8 @@ fn cmd_dex_goto_census(args: DexGotoCensusArgs) -> Result<()> {
                         "unknown": 0,
                     },
                     "structured_bailed": m.counts.as_ref().map(|c| c.bailed_methods > 0).unwrap_or(false),
+                    "exception_counts": m.exception_counts.as_ref().map(exception_counts_json).unwrap_or_else(|| serde_json::json!(null)),
+                    "exception_flow": m.exception_flow.as_ref().map(exception_flow_json).unwrap_or_else(|| serde_json::json!(null)),
                 })).collect::<Vec<_>>(),
             })
         );
@@ -895,6 +980,10 @@ fn cmd_dex_goto_census(args: DexGotoCensusArgs) -> Result<()> {
         census.selection.total_defined_methods,
         census.selection.skipped_codeless_methods,
         census.selection.failed_methods
+    );
+    println!("// {}", exception_summary(&census.exception_totals));
+    println!(
+        "// exception flow is conservative: metadata-derived block-to-handler edges, not proven runtime dispatch; final goto provenance unknown"
     );
     if census.selection.truncated {
         eprintln!(
@@ -928,6 +1017,11 @@ fn cmd_dex_goto_census(args: DexGotoCensusArgs) -> Result<()> {
                 m.signature,
                 m.error.as_deref().unwrap_or("unknown")
             ),
+        }
+    }
+    for m in &census.methods {
+        if let Some(counts) = &m.exception_counts {
+            println!("{}\t{}", m.signature, exception_summary(counts));
         }
     }
     eprintln!("// final goto provenance: unknown; raw emission counts are not final counts");
