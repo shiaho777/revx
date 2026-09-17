@@ -47,6 +47,46 @@ impl<'a> RenderCtx<'a> {
         }
     }
 
+    fn resolve_cmp(&mut self, op: &Operand) -> Option<(String, String)> {
+        enum Step {
+            Cmp(Vec<Operand>),
+            Follow(SsaValueId),
+            Stop,
+        }
+        let Operand::Value(mut id) = *op else {
+            return None;
+        };
+        for _ in 0..4 {
+            let step = {
+                let inst = self.func.values.get(id.0 as usize)?;
+                match &inst.op {
+                    SsaOp::Call {
+                        target: Operand::Symbol(s),
+                        args,
+                    } if (s.starts_with("cmpl_") || s.starts_with("cmpg_") || s == "cmp_long")
+                        && args.len() == 2 =>
+                    {
+                        Step::Cmp(args.clone())
+                    }
+                    SsaOp::Copy {
+                        src: Operand::Value(v),
+                    } => Step::Follow(*v),
+                    _ => Step::Stop,
+                }
+            };
+            match step {
+                Step::Cmp(args) => {
+                    let a = self.operand_text(&args[0]);
+                    let b = self.operand_text(&args[1]);
+                    return Some((a, b));
+                }
+                Step::Follow(v) => id = v,
+                Step::Stop => return None,
+            }
+        }
+        None
+    }
+
     fn cond_text(&mut self, cond: &Operand) -> String {
         let Operand::Value(id) = cond else {
             return self.operand_text(cond);
@@ -65,8 +105,13 @@ impl<'a> RenderCtx<'a> {
                     revx_analysis::ssa::BinOpKind::Ge => ">=",
                     _ => "?",
                 };
-                let l = self.operand_text(lhs);
                 let r = self.operand_text(rhs);
+                if r == "0"
+                    && let Some((a, b)) = self.resolve_cmp(lhs)
+                {
+                    return format!("{a} {op} {b}");
+                }
+                let l = self.operand_text(lhs);
                 format!("{l} {op} {r}")
             }
             _ => self.value_text(*id),
@@ -235,7 +280,14 @@ impl<'a> RenderCtx<'a> {
                     let ty_desc = t.strip_prefix("new ").unwrap_or("");
                     let name = self.name_of(id);
                     let class_name = clean_type_name(ty_desc);
-                    if args.is_empty() {
+                    if class_name.ends_with("[]") {
+                        let elem = &class_name[..class_name.len() - 2];
+                        if arg_texts.len() == 1 {
+                            format!("{name} = new {elem}[{}];", arg_texts[0])
+                        } else {
+                            format!("{name} = new {elem}[] {{{}}};", arg_texts.join(", "))
+                        }
+                    } else if args.is_empty() {
                         format!("{name} = new {class_name}();")
                     } else {
                         format!("{name} = new {class_name}({});", arg_texts.join(", "))
@@ -444,7 +496,10 @@ fn fuse_new_init(text: &str) -> String {
             i += 1;
             continue;
         }
-        let class_part = expr.trim_start_matches("new ").trim_end_matches("()");
+        let Some(class_part) = expr.strip_prefix("new ").and_then(|r| r.strip_suffix("()")) else {
+            i += 1;
+            continue;
+        };
         let mut fused = false;
         for j in (i + 1)..lines.len().min(i + 40) {
             let l = lines[j].trim().to_string();
@@ -457,15 +512,23 @@ fn fuse_new_init(text: &str) -> String {
                 break;
             }
             if let Some((_m_var, m_expr)) = l.strip_suffix(';').and_then(|x| x.split_once(" = "))
-                && m_expr.starts_with("new ")
-                && m_expr.contains(class_part)
+                && let Some(after_new) = m_expr.strip_prefix("new ")
             {
-                let args = m_expr
-                    .trim_start_matches("new ")
-                    .trim_start_matches(class_part)
-                    .trim_start_matches('(')
-                    .trim_end_matches(')')
-                    .to_string();
+                let chars: Vec<char> = after_new.chars().collect();
+                let Some(open) = chars.iter().position(|&c| c == '(') else {
+                    continue;
+                };
+                let m_class: String = chars[..open].iter().collect();
+                if m_class != class_part {
+                    continue;
+                }
+                let Some(close) = paren_match(&chars, open) else {
+                    continue;
+                };
+                if close != chars.len() - 1 {
+                    continue;
+                }
+                let args: String = chars[open + 1..close].iter().collect();
                 let indent_len = lines[i].len() - lines[i].trim_start().len();
                 lines[i] = format!(
                     "{}{var} = new {class_part}({args});",
@@ -813,10 +876,17 @@ fn apply_for_loop_recovery(text: &str) -> String {
         };
         // transform: remove init line, rewrite while line, remove increment line
         let indent = " ".repeat(open_indent);
-        lines[i] = format!(
-            "{indent}for ({} {} = {}; {}; {}) {{",
-            init_info.0, var, init_info.1, cond, inc_text
-        );
+        lines[i] = if init_info.0.is_empty() {
+            format!(
+                "{indent}for ({var} = {}; {cond}; {inc_text}) {{",
+                init_info.1
+            )
+        } else {
+            format!(
+                "{indent}for ({} {} = {}; {}; {}) {{",
+                init_info.0, var, init_info.1, cond, inc_text
+            )
+        };
         lines[last_body] = String::new();
         lines[i - 1] = String::new();
         i = j;
@@ -843,11 +913,12 @@ fn parse_init(line: &str, var: &str) -> Option<(String, String)> {
     if name != var {
         return None;
     }
-    let ty = decl.split_whitespace().next()?;
-    if ty == name {
-        return None;
+    let words: Vec<&str> = decl.split_whitespace().collect();
+    if words.len() >= 2 {
+        Some((words[0].to_string(), init.to_string()))
+    } else {
+        Some((String::new(), init.to_string()))
     }
-    Some((ty.to_string(), init.to_string()))
 }
 
 fn parse_increment(line: &str, var: &str) -> Option<String> {
@@ -1282,6 +1353,1048 @@ fn apply_condition_paren_repair(text: &str) -> String {
     out.join("\n")
 }
 
+fn apply_stmt_paren_repair(text: &str) -> String {
+    let out: Vec<String> = text
+        .lines()
+        .map(|l| {
+            let t = l.trim();
+            if t.is_empty() || t.starts_with("//") || !t.ends_with(';') {
+                return l.to_string();
+            }
+            if t.starts_with("case ") || t.starts_with("default:") {
+                return l.to_string();
+            }
+            let chars: Vec<char> = t.chars().collect();
+            let mut repaired: Vec<char> = Vec::with_capacity(chars.len() + 4);
+            let mut depth = 0i32;
+            let mut in_str = false;
+            let mut in_chr = false;
+            let mut esc = false;
+            for &c in &chars {
+                if in_str || in_chr {
+                    repaired.push(c);
+                    if esc {
+                        esc = false;
+                    } else if c == '\\' {
+                        esc = true;
+                    } else if (c == '"' && in_str) || (c == '\'' && in_chr) {
+                        in_str = false;
+                        in_chr = false;
+                    }
+                    continue;
+                }
+                match c {
+                    '"' => {
+                        in_str = true;
+                        repaired.push(c);
+                    }
+                    '\'' => {
+                        in_chr = true;
+                        repaired.push(c);
+                    }
+                    '(' => {
+                        depth += 1;
+                        repaired.push(c);
+                    }
+                    ')' => {
+                        if depth == 0 {
+                            continue;
+                        }
+                        depth -= 1;
+                        repaired.push(c);
+                    }
+                    _ => repaired.push(c),
+                }
+            }
+            if depth == 0 && repaired.len() == chars.len() {
+                return l.to_string();
+            }
+            repaired.pop();
+            repaired.extend(")".repeat(depth as usize).chars());
+            repaired.push(';');
+            let indent = " ".repeat(l.len() - l.trim_start().len());
+            let body: String = repaired.into_iter().collect();
+            format!("{indent}{body}")
+        })
+        .collect();
+    out.join("\n")
+}
+
+fn apply_dead_goto_after_else(text: &str) -> String {
+    #[derive(Clone, Copy, PartialEq)]
+    enum FrameKind {
+        If,
+        ElseIf,
+        Else,
+        Plain,
+        Loopish,
+    }
+    struct Frame {
+        kind: FrameKind,
+        last_term: bool,
+        then_term: bool,
+    }
+    let is_terminal = |t: &str| -> bool {
+        t.starts_with("return")
+            || t.starts_with("throw ")
+            || t.starts_with("goto L")
+            || t == "break;"
+            || t == "continue;"
+    };
+    let opener_kind = |s: &str| -> FrameKind {
+        if s.starts_with("if ") {
+            FrameKind::If
+        } else if s.starts_with("while ")
+            || s.starts_with("for ")
+            || s.starts_with("switch ")
+            || s.starts_with("try")
+            || s.starts_with("catch ")
+        {
+            FrameKind::Loopish
+        } else {
+            FrameKind::Plain
+        }
+    };
+    let lines: Vec<&str> = text.lines().collect();
+    let mut stack: Vec<Frame> = Vec::new();
+    let mut dead: Vec<usize> = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        let t = line.trim();
+        if t.is_empty() || t.starts_with("//") || (t.starts_with('L') && t.ends_with(':')) {
+            continue;
+        }
+        let closes = t.chars().take_while(|&c| c == '}').count();
+        let rest = t[closes..].trim_start();
+        let mut popped_then: Option<bool> = None;
+        for _ in 0..closes {
+            let Some(f) = stack.pop() else {
+                continue;
+            };
+            let term = match f.kind {
+                FrameKind::If | FrameKind::ElseIf | FrameKind::Loopish => false,
+                FrameKind::Else => f.then_term && f.last_term,
+                FrameKind::Plain => f.last_term,
+            };
+            match f.kind {
+                FrameKind::If => popped_then = Some(f.last_term),
+                FrameKind::ElseIf => popped_then = Some(f.then_term && f.last_term),
+                _ => {}
+            }
+            if term && f.kind == FrameKind::Else {
+                dead.push(i);
+            }
+            if let Some(parent) = stack.last_mut() {
+                parent.last_term = term;
+            }
+        }
+        if rest.ends_with('{') {
+            let (kind, then_term) = if rest.starts_with("else if ") || rest.starts_with("else if(")
+            {
+                (FrameKind::ElseIf, popped_then.unwrap_or(false))
+            } else if rest.starts_with("else") {
+                (FrameKind::Else, popped_then.unwrap_or(false))
+            } else {
+                (opener_kind(rest), false)
+            };
+            stack.push(Frame {
+                kind,
+                last_term: false,
+                then_term,
+            });
+        } else if closes == 0
+            && let Some(top) = stack.last_mut()
+        {
+            top.last_term = is_terminal(t);
+        }
+    }
+    if dead.is_empty() {
+        return text.to_string();
+    }
+    let mut remove: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    for &p in &dead {
+        let mut j = p + 1;
+        while j < lines.len() {
+            let t = lines[j].trim();
+            if t.is_empty() || t.starts_with("//") {
+                j += 1;
+                continue;
+            }
+            if t.starts_with("goto L") && t.ends_with(';') {
+                remove.insert(j);
+                j += 1;
+            } else {
+                break;
+            }
+        }
+    }
+    lines
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !remove.contains(i))
+        .map(|(_, l)| l.to_string())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn apply_guard_flatten(text: &str) -> String {
+    #[derive(Clone, Copy, PartialEq)]
+    enum FrameKind {
+        If,
+        ElseIf,
+        Else,
+        Plain,
+        Loopish,
+    }
+    struct Frame {
+        kind: FrameKind,
+        last_term: bool,
+        then_term: bool,
+    }
+    let is_terminal = |t: &str| -> bool {
+        t.starts_with("return")
+            || t.starts_with("throw ")
+            || t.starts_with("goto L")
+            || t == "break;"
+            || t == "continue;"
+    };
+    let opener_kind = |s: &str| -> FrameKind {
+        if s.starts_with("if ") {
+            FrameKind::If
+        } else if s.starts_with("while ")
+            || s.starts_with("for ")
+            || s.starts_with("switch ")
+            || s.starts_with("try")
+            || s.starts_with("catch ")
+        {
+            FrameKind::Loopish
+        } else {
+            FrameKind::Plain
+        }
+    };
+    let net = |l: &str| -> i32 {
+        let t = l.trim();
+        let closes = t.chars().take_while(|&c| c == '}').count() as i32;
+        let opens = i32::from(t.ends_with('{'));
+        opens - closes
+    };
+    let mut lines: Vec<String> = text.lines().map(|l| l.to_string()).collect();
+    for _round in 0..128 {
+        let mut stack: Vec<Frame> = Vec::new();
+        let mut hit: Option<(usize, bool)> = None;
+        for (i, line) in lines.iter().enumerate() {
+            let t = line.trim();
+            if t.is_empty() || t.starts_with("//") || (t.starts_with('L') && t.ends_with(':')) {
+                continue;
+            }
+            let closes = t.chars().take_while(|&c| c == '}').count();
+            let rest = t[closes..].trim_start();
+            let mut popped_then: Option<bool> = None;
+            for _ in 0..closes {
+                let Some(f) = stack.pop() else {
+                    continue;
+                };
+                let term = match f.kind {
+                    FrameKind::If | FrameKind::ElseIf | FrameKind::Loopish => false,
+                    FrameKind::Else => f.then_term && f.last_term,
+                    FrameKind::Plain => f.last_term,
+                };
+                match f.kind {
+                    FrameKind::If => popped_then = Some(f.last_term),
+                    FrameKind::ElseIf => popped_then = Some(f.then_term && f.last_term),
+                    _ => {}
+                }
+                if let Some(parent) = stack.last_mut() {
+                    parent.last_term = term;
+                }
+            }
+            if rest.ends_with('{') {
+                if rest.starts_with("else") && popped_then == Some(true) {
+                    hit = Some((
+                        i,
+                        rest.starts_with("else if ") || rest.starts_with("else if("),
+                    ));
+                    break;
+                }
+                let (kind, then_term) =
+                    if rest.starts_with("else if ") || rest.starts_with("else if(") {
+                        (FrameKind::ElseIf, popped_then.unwrap_or(false))
+                    } else if rest.starts_with("else") {
+                        (FrameKind::Else, popped_then.unwrap_or(false))
+                    } else {
+                        (opener_kind(rest), false)
+                    };
+                stack.push(Frame {
+                    kind,
+                    last_term: false,
+                    then_term,
+                });
+            } else if closes == 0
+                && let Some(top) = stack.last_mut()
+            {
+                top.last_term = is_terminal(t);
+            }
+        }
+        let Some((i, is_else_if)) = hit else {
+            break;
+        };
+        let indent = " ".repeat(lines[i].len() - lines[i].trim_start().len());
+        if is_else_if {
+            let t = lines[i].trim();
+            let cond_part = t
+                .trim_start_matches('}')
+                .trim_start()
+                .strip_prefix("else ")
+                .unwrap_or("")
+                .to_string();
+            lines[i] = format!("{indent}}}");
+            lines.insert(i + 1, format!("{indent}{cond_part}"));
+        } else {
+            let mut depth = net(&lines[i]);
+            let mut close_at = None;
+            for (j, line) in lines.iter().enumerate().skip(i + 1) {
+                depth += net(line);
+                if depth <= 0 {
+                    let tj = lines[j].trim();
+                    if tj == "}" && !tj.ends_with('{') {
+                        close_at = Some(j);
+                    }
+                    break;
+                }
+            }
+            let Some(close_at) = close_at else {
+                break;
+            };
+            lines[i] = format!("{indent}}}");
+            lines.remove(close_at);
+        }
+    }
+    lines.join("\n")
+}
+
+fn apply_else_if_collapse(text: &str) -> String {
+    let net = |l: &str| -> i32 {
+        let t = l.trim();
+        let closes = t.chars().take_while(|&c| c == '}').count() as i32;
+        i32::from(t.ends_with('{')) - closes
+    };
+    let mut lines: Vec<String> = text.lines().map(|l| l.to_string()).collect();
+    for _round in 0..8 {
+        let mut changed = false;
+        let mut i = 0usize;
+        while i < lines.len() {
+            if lines[i].trim() != "} else {" {
+                i += 1;
+                continue;
+            }
+            let e_indent = lines[i].len() - lines[i].trim_start().len();
+            let mut depth = 1i32;
+            let mut e_close = None;
+            for (j, line) in lines.iter().enumerate().skip(i + 1) {
+                depth += net(line);
+                if depth <= 0 {
+                    if depth == 0 {
+                        e_close = Some(j);
+                    }
+                    break;
+                }
+            }
+            let Some(e_close) = e_close else {
+                i += 1;
+                continue;
+            };
+            if lines[e_close].trim() != "}" {
+                i += 1;
+                continue;
+            }
+            let mut k = i + 1;
+            while k < e_close && (lines[k].trim().is_empty() || lines[k].trim().starts_with("//")) {
+                k += 1;
+            }
+            if k >= e_close {
+                i += 1;
+                continue;
+            }
+            let bt = lines[k].trim().to_string();
+            if !bt.starts_with("if ") || !bt.ends_with('{') {
+                i += 1;
+                continue;
+            }
+            let mut depth2 = 1i32;
+            let mut if_close = None;
+            for (j, line) in lines.iter().enumerate().skip(k + 1).take(e_close - k - 1) {
+                depth2 += net(line);
+                if depth2 <= 0 {
+                    if depth2 == 0 {
+                        if_close = Some(j);
+                    }
+                    break;
+                }
+            }
+            let Some(if_close) = if_close else {
+                i += 1;
+                continue;
+            };
+            let tail_clean = lines
+                .iter()
+                .take(e_close)
+                .skip(if_close + 1)
+                .all(|l| l.trim().is_empty() || l.trim().starts_with("//"));
+            if !tail_clean {
+                i += 1;
+                continue;
+            }
+            let indent = " ".repeat(e_indent);
+            lines[i] = format!("{indent}}} else {bt}");
+            lines.remove(e_close);
+            lines.remove(k);
+            changed = true;
+            i += 1;
+        }
+        if !changed {
+            break;
+        }
+    }
+    lines.join("\n")
+}
+
+fn replace_var_token(line: &str, tok: &str, rep: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let chars: Vec<char> = line.chars().collect();
+    let tc: Vec<char> = tok.chars().collect();
+    let mut i = 0usize;
+    let mut in_str = false;
+    let mut esc = false;
+    while i < chars.len() {
+        let c = chars[i];
+        if in_str {
+            out.push(c);
+            if esc {
+                esc = false;
+            } else if c == '\\' {
+                esc = true;
+            } else if c == '"' {
+                in_str = false;
+            }
+            i += 1;
+            continue;
+        }
+        if c == '"' {
+            in_str = true;
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        if i + tc.len() <= chars.len() && chars[i..i + tc.len()] == tc[..] {
+            let before_ok = i == 0
+                || !(chars[i - 1].is_alphanumeric() || chars[i - 1] == '_' || chars[i - 1] == '.');
+            let after = i + tc.len();
+            let after_ok =
+                after >= chars.len() || !(chars[after].is_alphanumeric() || chars[after] == '_');
+            if before_ok && after_ok {
+                out.push_str(rep);
+                i = after;
+                continue;
+            }
+        }
+        out.push(c);
+        i += 1;
+    }
+    out
+}
+
+fn name_from_type(ty: &str) -> String {
+    let t = ty.trim();
+    if let Some(elem) = t.strip_suffix("[]") {
+        return format!("{}Arr", name_from_type(elem));
+    }
+    match t {
+        "int" => return "i".to_string(),
+        "long" => return "j".to_string(),
+        "float" => return "f".to_string(),
+        "double" => return "d".to_string(),
+        "boolean" => return "z".to_string(),
+        "byte" => return "b".to_string(),
+        "char" => return "c".to_string(),
+        "short" => return "s".to_string(),
+        "java.lang.String" | "String" => return "str".to_string(),
+        "java.lang.Object" | "Object" => return "obj".to_string(),
+        _ => {}
+    }
+    let simple = t.rsplit('.').next().unwrap_or(t);
+    let simple = simple.split('<').next().unwrap_or(simple);
+    if simple.is_empty() || !simple.chars().next().is_some_and(|c| c.is_uppercase()) {
+        return String::new();
+    }
+    camel_case(simple)
+}
+
+fn apply_type_based_names(text: &str) -> String {
+    let mut lines: Vec<String> = text.lines().map(|l| l.to_string()).collect();
+    let mut var_types: std::collections::HashMap<String, Option<String>> =
+        std::collections::HashMap::new();
+    let mut order: Vec<String> = Vec::new();
+    for l in &lines {
+        let t = l.trim();
+        if t.is_empty() || t.starts_with("//") {
+            continue;
+        }
+        let Some((lhs, _)) = t.split_once(" = ") else {
+            continue;
+        };
+        let Some(sp) = lhs.rfind(' ') else {
+            continue;
+        };
+        let ty = &lhs[..sp];
+        let var = &lhs[sp + 1..];
+        if var.len() < 2 || !var.starts_with('v') || !var[1..].chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        if ty.is_empty() || ty.contains('(') || ty.contains(';') || ty.contains(',') {
+            continue;
+        }
+        let name = name_from_type(ty);
+        if name.is_empty() {
+            continue;
+        }
+        let entry = var_types.entry(var.to_string()).or_insert_with(|| {
+            order.push(var.to_string());
+            Some(name.clone())
+        });
+        if let Some(existing) = entry
+            && *existing != name
+        {
+            *entry = None;
+        }
+    }
+    let mut taken: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for l in &lines {
+        if l.trim_start().starts_with("//") {
+            continue;
+        }
+        let chars: Vec<char> = l.chars().collect();
+        let mut i = 0usize;
+        let mut in_str = false;
+        while i < chars.len() {
+            let c = chars[i];
+            if in_str {
+                if c == '"' {
+                    in_str = false;
+                }
+                i += 1;
+                continue;
+            }
+            if c == '"' {
+                in_str = true;
+                i += 1;
+                continue;
+            }
+            if c.is_alphabetic() || c == '_' {
+                let start = i;
+                while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
+                    i += 1;
+                }
+                let tok: String = chars[start..i].iter().collect();
+                let mut p = start;
+                while p > 0 && chars[p - 1].is_whitespace() {
+                    p -= 1;
+                }
+                let after_dot = p > 0 && chars[p - 1] == '.';
+                let is_v = tok.starts_with('v')
+                    && tok.len() > 1
+                    && tok[1..].chars().all(|ch| ch.is_ascii_digit());
+                if !after_dot && !is_v {
+                    taken.insert(tok);
+                }
+            } else {
+                i += 1;
+            }
+        }
+    }
+    let mut renames: Vec<(String, String)> = Vec::new();
+    for var in order {
+        let Some(Some(name)) = var_types.get(&var) else {
+            continue;
+        };
+        let mut n = 1u32;
+        let mut chosen: Option<String> = None;
+        while n <= 50 {
+            let cand = if n == 1 {
+                name.clone()
+            } else {
+                format!("{name}{n}")
+            };
+            if !taken.contains(&cand) {
+                taken.insert(cand.clone());
+                chosen = Some(cand);
+                break;
+            }
+            n += 1;
+        }
+        if let Some(c) = chosen {
+            renames.push((var, c));
+        }
+    }
+    for (var, name) in renames {
+        for l in lines.iter_mut() {
+            if l.trim_start().starts_with("//") {
+                continue;
+            }
+            if l.contains(&var) {
+                *l = replace_var_token(l, &var, &name);
+            }
+        }
+    }
+    lines.join("\n")
+}
+
+fn apply_empty_else_removal(text: &str) -> String {
+    let net = |l: &str| -> i32 {
+        let t = l.trim();
+        let closes = t.chars().take_while(|&c| c == '}').count() as i32;
+        i32::from(t.ends_with('{')) - closes
+    };
+    let mut lines: Vec<String> = text.lines().map(|l| l.to_string()).collect();
+    let mut changed = true;
+    while changed {
+        changed = false;
+        let mut i = 0usize;
+        while i < lines.len() {
+            if lines[i].trim() == "} else {" {
+                let mut depth = 1i32;
+                let mut j = i + 1;
+                let mut only_blank = true;
+                while j < lines.len() {
+                    depth += net(&lines[j]);
+                    if depth <= 0 {
+                        break;
+                    }
+                    if !lines[j].trim().is_empty() {
+                        only_blank = false;
+                    }
+                    j += 1;
+                }
+                if j < lines.len() && depth == 0 && only_blank && lines[j].trim() == "}" {
+                    let indent = lines[i].len() - lines[i].trim_start().len();
+                    lines[i] = format!("{}}}", " ".repeat(indent));
+                    lines.remove(j);
+                    changed = true;
+                }
+            }
+            i += 1;
+        }
+    }
+    lines.join("\n")
+}
+
+fn apply_labeled_continue(text: &str) -> String {
+    let net = |l: &str| -> i32 {
+        let t = l.trim();
+        let closes = t.chars().take_while(|&c| c == '}').count() as i32;
+        i32::from(t.ends_with('{')) - closes
+    };
+    let mut lines: Vec<String> = text.lines().map(|l| l.to_string()).collect();
+    let mut i = 0usize;
+    while i < lines.len() {
+        if lines[i].trim() != "while (true) {" {
+            i += 1;
+            continue;
+        }
+        let w = i;
+        let mut j = w + 1;
+        while j < lines.len() && lines[j].trim().is_empty() {
+            j += 1;
+        }
+        let label = {
+            let t = lines[j].trim().to_string();
+            if j < lines.len() && t.len() > 2 && t.starts_with('L') && t.ends_with(':') {
+                t[..t.len() - 1].to_string()
+            } else {
+                i += 1;
+                continue;
+            }
+        };
+        let label_line = j;
+        let mut depth = net(&lines[w]);
+        let mut close = None;
+        for (k, line) in lines.iter().enumerate().skip(w + 1) {
+            depth += net(line);
+            if depth <= 0 {
+                if depth == 0 {
+                    close = Some(k);
+                }
+                break;
+            }
+        }
+        let Some(close) = close else {
+            i += 1;
+            continue;
+        };
+        let goto_stmt = format!("goto {label};");
+        let inside: Vec<usize> = (w..close)
+            .filter(|&k| lines[k].trim() == goto_stmt)
+            .collect();
+        if inside.is_empty() {
+            i = close + 1;
+            continue;
+        }
+        let indent = " ".repeat(lines[w].len() - lines[w].trim_start().len());
+        lines[w] = format!("{indent}{label}: while (true) {{");
+        for &k in &inside {
+            let ind = " ".repeat(lines[k].len() - lines[k].trim_start().len());
+            lines[k] = format!("{ind}continue {label};");
+        }
+        lines[label_line] = String::new();
+        i = close + 1;
+    }
+    lines.join("\n")
+}
+
+fn degrade_try_markers(text: &str) -> String {
+    text.lines()
+        .map(|l| {
+            let t = l.trim();
+            let indent = &l[..l.len() - t.len()];
+            if t.starts_with("// try@") {
+                format!("{indent}// try")
+            } else if t.starts_with("// endtry@") {
+                format!("{indent}// end try")
+            } else if let Some(rest) = t.strip_prefix("// catch@") {
+                match rest.split_once(" (") {
+                    Some((_, tp)) => format!("{indent}// catch ({tp}"),
+                    None => format!("{indent}// catch"),
+                }
+            } else if t.starts_with("// endcatch@") {
+                String::new()
+            } else {
+                l.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn apply_try_catch_syntax(text: &str) -> String {
+    let net = |l: &str| -> i32 {
+        let t = l.trim();
+        let closes = t.chars().take_while(|&c| c == '}').count() as i32;
+        i32::from(t.ends_with('{')) - closes
+    };
+    let lines: Vec<String> = text.lines().map(|l| l.to_string()).collect();
+    let mut try_open: HashMap<usize, usize> = HashMap::new();
+    let mut try_close: HashMap<usize, usize> = HashMap::new();
+    let mut catch_open: HashMap<(usize, usize), (usize, String)> = HashMap::new();
+    let mut catch_close: HashMap<(usize, usize), usize> = HashMap::new();
+    let parse_kj = |s: &str| -> Option<(usize, usize)> {
+        let mut it = s.split('.');
+        let k = it.next()?.parse::<usize>().ok()?;
+        let j = it.next()?.parse::<usize>().ok()?;
+        if it.next().is_some() {
+            return None;
+        }
+        Some((k, j))
+    };
+    for (i, l) in lines.iter().enumerate() {
+        let t = l.trim();
+        if let Some(ks) = t.strip_prefix("// try@") {
+            if let Ok(k) = ks.parse::<usize>() {
+                let poisoned = try_open.insert(k, i).is_some();
+                if poisoned {
+                    try_open.insert(k, usize::MAX);
+                }
+            }
+        } else if let Some(ks) = t.strip_prefix("// endtry@") {
+            if let Ok(k) = ks.parse::<usize>() {
+                let poisoned = try_close.insert(k, i).is_some();
+                if poisoned {
+                    try_close.insert(k, usize::MAX);
+                }
+            }
+        } else if let Some(rest) = t.strip_prefix("// catch@") {
+            if let Some((ks, types_part)) = rest.split_once(" (") {
+                let kj = parse_kj(ks).or_else(|| ks.parse::<usize>().ok().map(|k| (k, 0)));
+                if let Some((k, j)) = kj {
+                    let types = types_part.strip_suffix(" e)").unwrap_or("").to_string();
+                    if types.is_empty() {
+                        continue;
+                    }
+                    let poisoned = catch_open.insert((k, j), (i, types)).is_some();
+                    if poisoned {
+                        catch_open.insert((k, j), (usize::MAX, String::new()));
+                    }
+                }
+            }
+        } else if let Some(ks) = t.strip_prefix("// endcatch@") {
+            let kj = parse_kj(ks).or_else(|| ks.parse::<usize>().ok().map(|k| (k, 0)));
+            if let Some((k, j)) = kj {
+                let poisoned = catch_close.insert((k, j), i).is_some();
+                if poisoned {
+                    catch_close.insert((k, j), usize::MAX);
+                }
+            }
+        }
+    }
+    let mut replaces: HashMap<usize, String> = HashMap::new();
+    let mut deletes: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let mut insert_after: HashMap<usize, Vec<String>> = HashMap::new();
+    let mut ks: Vec<usize> = catch_open.keys().map(|(k, _)| *k).collect();
+    ks.sort();
+    ks.dedup();
+    ks.sort_by_key(|k| {
+        let span = match (try_open.get(k), try_close.get(k)) {
+            (Some(&a), Some(&b)) if a < b && a != usize::MAX && b != usize::MAX => b - a,
+            _ => usize::MAX,
+        };
+        (span, *k)
+    });
+    let has_marker = |v: &[String]| -> bool {
+        v.iter().any(|l| {
+            let t = l.trim();
+            t.starts_with("// try@")
+                || t.starts_with("// endtry@")
+                || t.starts_with("// catch@")
+                || t.starts_with("// endcatch@")
+        })
+    };
+    let balanced = |v: &[String]| -> bool {
+        let mut d = 0i32;
+        for l in v {
+            d += net(l);
+            if d < 0 {
+                return false;
+            }
+        }
+        d == 0
+    };
+    for k in ks {
+        let (Some(&a), Some(&b)) = (try_open.get(&k), try_close.get(&k)) else {
+            continue;
+        };
+        if a == usize::MAX || b == usize::MAX || !(a < b) {
+            continue;
+        }
+        if replaces.contains_key(&a) || replaces.contains_key(&b) {
+            continue;
+        }
+        let region: Vec<String> = lines[a + 1..b].to_vec();
+        if !balanced(&region) || has_marker(&region) {
+            continue;
+        }
+        let mut js: Vec<(usize, usize, usize, String)> = Vec::new();
+        for ((kk, j), (c, types)) in &catch_open {
+            if *kk != k || *c == usize::MAX {
+                continue;
+            }
+            let Some(&e) = catch_close.get(&(*kk, *j)) else {
+                continue;
+            };
+            if e == usize::MAX || !(*c < e) {
+                continue;
+            }
+            js.push((*j, *c, e, types.clone()));
+        }
+        js.sort();
+        if js.is_empty() {
+            continue;
+        }
+        let mut chain: Vec<(usize, usize, String, Vec<String>)> = Vec::new();
+        let mut ok = true;
+        for (_j, c, e, types) in js {
+            if (c >= a && c <= b) || (e >= a && e <= b) {
+                ok = false;
+                break;
+            }
+            if (c..=e).any(|x| deletes.contains(&x) || replaces.contains_key(&x)) {
+                ok = false;
+                break;
+            }
+            let cbody: Vec<String> = lines[c + 1..e]
+                .iter()
+                .filter(|l| l.trim() != "// exception handler")
+                .cloned()
+                .collect();
+            if !balanced(&cbody) || has_marker(&cbody) {
+                ok = false;
+                break;
+            }
+            chain.push((c, e, types, cbody));
+        }
+        if !ok || chain.is_empty() {
+            continue;
+        }
+        let indent = " ".repeat(lines[a].len() - lines[a].trim_start().len());
+        replaces.insert(a, format!("{indent}try {{"));
+        let mut ins: Vec<String> = Vec::new();
+        for (idx, (c, e, types, cbody)) in chain.iter().enumerate() {
+            if idx == 0 {
+                replaces.insert(b, format!("{indent}}} catch ({types} e) {{"));
+            } else {
+                ins.push(format!("{indent}}} catch ({types} e) {{"));
+            }
+            ins.extend(cbody.iter().cloned());
+            for x in *c..=*e {
+                deletes.insert(x);
+            }
+        }
+        ins.push(format!("{indent}}}"));
+        insert_after.insert(b, ins);
+    }
+    let mut out: Vec<String> = Vec::with_capacity(lines.len());
+    for (i, l) in lines.iter().enumerate() {
+        if deletes.contains(&i) {
+            continue;
+        }
+        if let Some(rep) = replaces.get(&i) {
+            out.push(rep.clone());
+        } else {
+            let t = l.trim();
+            let indent = &l[..l.len() - t.len()];
+            if t.starts_with("// try@") {
+                out.push(format!("{indent}// try"));
+            } else if t.starts_with("// endtry@") {
+                out.push(format!("{indent}// end try"));
+            } else if let Some(rest) = t.strip_prefix("// catch@") {
+                match rest.split_once(" (") {
+                    Some((_, tp)) => out.push(format!("{indent}// catch ({tp}")),
+                    None => out.push(format!("{indent}// catch")),
+                }
+            } else if t.starts_with("// endcatch@") {
+                continue;
+            } else {
+                out.push(l.clone());
+            }
+        }
+        if let Some(ins) = insert_after.get(&i) {
+            out.extend(ins.iter().cloned());
+        }
+    }
+    out.join("\n")
+}
+
+fn apply_catch_var_naming(text: &str) -> String {
+    let net = |l: &str| -> i32 {
+        let t = l.trim();
+        let closes = t.chars().take_while(|&c| c == '}').count() as i32;
+        i32::from(t.ends_with('{')) - closes
+    };
+    let mut lines: Vec<String> = text.lines().map(|l| l.to_string()).collect();
+    let mut taken: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for l in &lines {
+        let chars: Vec<char> = l.chars().collect();
+        let mut k = 0usize;
+        while k < chars.len() {
+            if chars[k].is_alphabetic() || chars[k] == '_' {
+                let s = k;
+                while k < chars.len() && (chars[k].is_alphanumeric() || chars[k] == '_') {
+                    k += 1;
+                }
+                let tok: String = chars[s..k].iter().collect();
+                taken.insert(tok);
+            } else {
+                k += 1;
+            }
+        }
+    }
+    let mut counter = 0u32;
+    let mut i = 0usize;
+    while i < lines.len() {
+        let t = lines[i].trim().to_string();
+        let Some(rest) = t
+            .strip_prefix("} catch (")
+            .and_then(|r| r.strip_suffix(") {"))
+            .map(|r| r.to_string())
+        else {
+            i += 1;
+            continue;
+        };
+        let Some(old_var) = rest.split_whitespace().last().map(|s| s.to_string()) else {
+            i += 1;
+            continue;
+        };
+        if old_var.is_empty() || !old_var.chars().all(|c| c.is_alphanumeric() || c == '_') {
+            i += 1;
+            continue;
+        }
+        let mut depth = 1i32;
+        let mut j = i + 1;
+        let mut end = None;
+        while j < lines.len() {
+            if lines[j].trim().starts_with("} catch") {
+                end = Some(j);
+                break;
+            }
+            depth += net(&lines[j]);
+            if depth <= 0 {
+                end = Some(j);
+                break;
+            }
+            j += 1;
+        }
+        let Some(end) = end else {
+            i += 1;
+            continue;
+        };
+        let mut k = i + 1;
+        while k < end && lines[k].trim().is_empty() {
+            k += 1;
+        }
+        if k >= end {
+            i += 1;
+            continue;
+        }
+        let first = lines[k].trim().to_string();
+        let Some((lhs_full, rhs)) = first.strip_suffix(';').and_then(|l| l.split_once(" = "))
+        else {
+            i += 1;
+            continue;
+        };
+        let lhs = lhs_full
+            .split_whitespace()
+            .last()
+            .unwrap_or(lhs_full)
+            .trim();
+        let rhs = rhs.trim();
+        let is_v = |s: &str| {
+            s.len() > 1 && s.starts_with('v') && s[1..].chars().all(|c| c.is_ascii_digit())
+        };
+        if !is_v(lhs) || !is_v(rhs) {
+            i += 1;
+            continue;
+        }
+        if lines[k + 1..end].iter().any(|l| contains_token(l, rhs)) {
+            i += 1;
+            continue;
+        }
+        let name = loop {
+            counter += 1;
+            let cand = if counter == 1 {
+                "e".to_string()
+            } else {
+                format!("e{counter}")
+            };
+            if !taken.contains(&cand) {
+                taken.insert(cand.clone());
+                break cand;
+            }
+            if counter > 32 {
+                break String::new();
+            }
+        };
+        if name.is_empty() {
+            i = end + 1;
+            continue;
+        }
+        let types_part = rest.trim_end_matches(&old_var).trim_end();
+        let pad = " ".repeat(lines[i].len() - lines[i].trim_start().len());
+        lines[i] = format!("{pad}}} catch ({types_part} {name}) {{");
+        for l in lines[k + 1..end].iter_mut() {
+            *l = replace_var_token(l, lhs, &name);
+        }
+        lines[k] = String::new();
+        i = end;
+    }
+    lines.join("\n")
+}
+
 fn apply_brace_repair(text: &str) -> String {
     let lines: Vec<String> = text.lines().map(|l| l.to_string()).collect();
     let lead_closes = |t: &str| t.chars().take_while(|&c| c == '}').count() as i32;
@@ -1362,6 +2475,143 @@ fn apply_reindent(text: &str) -> String {
     out.join("\n")
 }
 
+fn chunk_terminates(chunk: &[String]) -> bool {
+    #[derive(Clone, Copy, PartialEq)]
+    enum K {
+        If,
+        ElseIf,
+        Else,
+        Plain,
+    }
+    let mut stack: Vec<(K, bool, bool)> = Vec::new();
+    let mut root_term = false;
+    let is_term =
+        |t: &str| t.starts_with("return") || t.starts_with("throw ") || t.starts_with("goto L");
+    for l in chunk {
+        let t = l.trim();
+        if t.is_empty() || t.starts_with("//") {
+            continue;
+        }
+        if (t.starts_with('L') && t.ends_with(':'))
+            || t.starts_with("break")
+            || t.starts_with("continue")
+            || t.starts_with("while ")
+            || t.starts_with("for ")
+            || t.starts_with("switch ")
+            || t.starts_with("synchronized ")
+            || t.starts_with("try")
+            || t.starts_with("case ")
+            || t.starts_with("default:")
+        {
+            return false;
+        }
+        let closes = t.chars().take_while(|&c| c == '}').count();
+        let rest = t[closes..].trim_start();
+        let mut popped_then: Option<bool> = None;
+        for _ in 0..closes {
+            let Some((kind, last_term, then_term)) = stack.pop() else {
+                return false;
+            };
+            let term = match kind {
+                K::If | K::ElseIf => false,
+                K::Else => then_term && last_term,
+                K::Plain => last_term,
+            };
+            match kind {
+                K::If => popped_then = Some(last_term),
+                K::ElseIf => popped_then = Some(then_term && last_term),
+                _ => {}
+            }
+            if let Some(top) = stack.last_mut() {
+                top.1 = term;
+            } else {
+                root_term = term;
+            }
+        }
+        if rest.ends_with('{') {
+            let kind = if rest.starts_with("else if ") || rest.starts_with("else if(") {
+                K::ElseIf
+            } else if rest.starts_with("else") {
+                K::Else
+            } else if rest.starts_with("if ") {
+                K::If
+            } else {
+                K::Plain
+            };
+            let then_term = match kind {
+                K::Else | K::ElseIf => popped_then.unwrap_or(false),
+                _ => false,
+            };
+            stack.push((kind, false, then_term));
+        } else if closes == 0 {
+            let term = is_term(t);
+            if let Some(top) = stack.last_mut() {
+                top.1 = term;
+            } else {
+                root_term = term;
+            }
+        }
+    }
+    stack.is_empty() && root_term
+}
+
+fn try_chunk_inline(
+    lines: &[String],
+    lpos: usize,
+    goto_indent: usize,
+    sites: usize,
+) -> Option<String> {
+    let net = |l: &str| -> i32 {
+        let t = l.trim();
+        let closes = t.chars().take_while(|&c| c == '}').count() as i32;
+        i32::from(t.ends_with('{')) - closes
+    };
+    let mut depth = 0i32;
+    let mut saw_open = false;
+    let mut end = None;
+    for (j, line) in lines.iter().enumerate().skip(lpos + 1) {
+        let t = line.trim();
+        if t.is_empty() {
+            continue;
+        }
+        depth += net(line);
+        if depth > 0 {
+            saw_open = true;
+        }
+        if depth < 0 {
+            return None;
+        }
+        if saw_open && depth == 0 {
+            end = Some(j);
+            break;
+        }
+    }
+    let end = end?;
+    let chunk: Vec<String> = lines[lpos + 1..=end]
+        .iter()
+        .filter(|l| !l.trim().is_empty())
+        .cloned()
+        .collect();
+    if chunk.is_empty() || chunk.len() > 14 || chunk.len() * sites > 80 {
+        return None;
+    }
+    if !chunk_terminates(&chunk) {
+        return None;
+    }
+    let min_ind = chunk
+        .iter()
+        .map(|l| l.len() - l.trim_start().len())
+        .min()
+        .unwrap_or(0);
+    let mut out: Vec<String> = Vec::new();
+    for l in &chunk {
+        let ind = l.len() - l.trim_start().len();
+        let shift = goto_indent + ind.saturating_sub(min_ind);
+        out.push(format!("{}{}", " ".repeat(shift), l.trim()));
+    }
+    Some(out.join("\n"))
+}
+
 fn apply_small_block_inline(text: &str) -> String {
     let mut lines: Vec<String> = text.lines().map(|l| l.to_string()).collect();
     let mut label_pos: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
@@ -1383,10 +2633,6 @@ fn apply_small_block_inline(text: &str) -> String {
             i += 1;
             continue;
         };
-        if inlined_labels.contains(target) {
-            i += 1;
-            continue;
-        }
         // Collect flat statements after the label until terminal or control structure
         let goto_indent = lines[i].len() - lines[i].trim_start().len();
         let mut stmts: Vec<String> = Vec::new();
@@ -1426,6 +2672,12 @@ fn apply_small_block_inline(text: &str) -> String {
             j += 1;
         }
         if !ok || terminal.is_none() {
+            let goto_stmt = format!("goto L{target};");
+            let sites = lines.iter().filter(|l| l.trim() == goto_stmt).count();
+            if let Some(replacement) = try_chunk_inline(&lines, lpos, goto_indent, sites) {
+                lines[i] = replacement;
+                inlined_labels.insert(target.to_string());
+            }
             i += 1;
             continue;
         }
@@ -1444,7 +2696,8 @@ fn apply_small_block_inline(text: &str) -> String {
         let t = line.trim();
         if t.len() > 2 && t.starts_with('L') && t.ends_with(':') {
             let label_num = &t[1..t.len() - 1];
-            if inlined_labels.contains(label_num) && !text.contains(&format!("goto {t}")) {
+            if inlined_labels.contains(label_num) && !text.contains(&format!("goto L{label_num};"))
+            {
                 continue;
             }
         }
@@ -1519,9 +2772,11 @@ fn apply_dead_assign(text: &str) -> String {
             out.push(line.to_string());
             continue;
         }
-        // Check if var appears in any subsequent line (within 100 lines)
         let mut used = false;
-        for line_ref in lines.iter().take(lines.len().min(i + 100)).skip(i + 1) {
+        for (j, line_ref) in lines.iter().enumerate() {
+            if j == i {
+                continue;
+            }
             if contains_token(line_ref, var) {
                 used = true;
                 break;
@@ -1769,9 +3024,14 @@ fn apply_semantic_names(text: &str) -> String {
         } else if rhs_t.ends_with(".toString()") {
             "str".to_string()
         } else if let Some(ty) = rhs_t.strip_prefix("new ") {
-            let ty_name = ty.split('(').next().unwrap_or(ty).trim();
+            let ty_name = ty.split(['(', '{', ' ']).next().unwrap_or(ty).trim();
             let short = ty_name.rsplit('.').next().unwrap_or(ty_name);
-            if short.is_empty() || !short.chars().next().is_some_and(|c| c.is_uppercase()) {
+            if short.is_empty()
+                || !short.chars().next().is_some_and(|c| c.is_uppercase())
+                || !short
+                    .chars()
+                    .all(|c| c.is_alphanumeric() || c == '.' || c == '_' || c == '$')
+            {
                 continue;
             }
             camel_case(short)
@@ -1831,30 +3091,170 @@ fn camel_case(s: &str) -> String {
     out
 }
 
-fn apply_cast_paren_cleanup(text: &str) -> String {
-    let mut out = text.to_string();
-    // ((Type) (expr)) → (Type) expr
-    loop {
-        let before = out.clone();
-        if let Some(pos) = out.find("((")
-            && let Some(mid) = out[pos..].find(") (")
-        {
-            let inner_start = pos + 2;
-            let cast_end = pos + mid + 1;
-            let expr_start = cast_end + 2;
-            if let Some(close) = out[expr_start..].find(')') {
-                let expr_end = expr_start + close;
-                let cast_type = &out[inner_start..cast_end - 1];
-                let expr = &out[expr_start..expr_end];
-                let replacement = format!("({cast_type}) {expr}");
-                out = format!("{}{}{}", &out[..pos], replacement, &out[expr_end + 1..]);
+fn paren_match(chars: &[char], open: usize) -> Option<usize> {
+    let mut depth = 0i32;
+    let mut in_str = false;
+    let mut esc = false;
+    for (i, &c) in chars.iter().enumerate().skip(open) {
+        if in_str {
+            if esc {
+                esc = false;
+            } else if c == '\\' {
+                esc = true;
+            } else if c == '"' {
+                in_str = false;
             }
+            continue;
         }
-        if out == before {
-            break;
+        match c {
+            '"' => in_str = true,
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
         }
     }
-    out
+    None
+}
+
+fn unwrap_paren_ok(chars: &[char], i: usize, close: usize, prefix: &[char]) -> bool {
+    let content = &chars[i + 1..close];
+    if content.is_empty() {
+        return false;
+    }
+    let cs: String = content.iter().collect();
+    let base = cs.strip_suffix("[]").unwrap_or(&cs);
+    if matches!(
+        base,
+        "int" | "byte" | "short" | "char" | "long" | "float" | "double" | "boolean"
+    ) {
+        return false;
+    }
+    let mut p = prefix.len();
+    while p > 0 && prefix[p - 1].is_whitespace() {
+        p -= 1;
+    }
+    if p > 0 {
+        let pc = prefix[p - 1];
+        if pc.is_alphanumeric() || pc == '_' || pc == ')' || pc == ']' || pc == '"' {
+            let mut w = p;
+            while w > 0 && (prefix[w - 1].is_alphanumeric() || prefix[w - 1] == '_') {
+                w -= 1;
+            }
+            let word: String = prefix[w..p].iter().collect();
+            if word != "return" && word != "throw" {
+                return false;
+            }
+        }
+    }
+    let mut nx = close + 1;
+    while nx < chars.len() && chars[nx].is_whitespace() {
+        nx += 1;
+    }
+    if nx < chars.len() {
+        let nc = chars[nx];
+        if nc.is_alphanumeric() || nc == '_' || matches!(nc, '(' | '"' | '\'' | '!' | '~') {
+            return false;
+        }
+    }
+    if content[0] == '(' && paren_match(content, 0) == Some(content.len() - 1) {
+        return true;
+    }
+    let mut depth = 0i32;
+    let mut in_str = false;
+    let mut esc = false;
+    for &c in content {
+        if in_str {
+            if esc {
+                esc = false;
+            } else if c == '\\' {
+                esc = true;
+            } else if c == '"' {
+                in_str = false;
+            }
+            continue;
+        }
+        match c {
+            '"' => in_str = true,
+            '(' | '[' => depth += 1,
+            ')' | ']' => depth -= 1,
+            '+' | '-' | '*' | '/' | '%' | '&' | '|' | '^' | '<' | '>' | '=' | '?' | ':' | ','
+            | '!' | '~'
+                if depth == 0 =>
+            {
+                return false;
+            }
+            _ => {}
+        }
+    }
+    true
+}
+
+fn apply_cast_paren_cleanup(text: &str) -> String {
+    let out: Vec<String> = text
+        .lines()
+        .map(|l| {
+            if l.trim_start().starts_with("//") {
+                return l.to_string();
+            }
+            let mut line = l.to_string();
+            for _round in 0..8 {
+                let chars: Vec<char> = line.chars().collect();
+                let mut result: Vec<char> = Vec::with_capacity(chars.len());
+                let mut drop: std::collections::HashSet<usize> = std::collections::HashSet::new();
+                let mut i = 0usize;
+                let mut in_str = false;
+                let mut esc = false;
+                let mut changed = false;
+                while i < chars.len() {
+                    if drop.contains(&i) {
+                        i += 1;
+                        continue;
+                    }
+                    let c = chars[i];
+                    if in_str {
+                        result.push(c);
+                        if esc {
+                            esc = false;
+                        } else if c == '\\' {
+                            esc = true;
+                        } else if c == '"' {
+                            in_str = false;
+                        }
+                        i += 1;
+                        continue;
+                    }
+                    if c == '"' {
+                        in_str = true;
+                        result.push(c);
+                        i += 1;
+                        continue;
+                    }
+                    if c == '('
+                        && let Some(close) = paren_match(&chars, i)
+                        && unwrap_paren_ok(&chars, i, close, &result)
+                    {
+                        drop.insert(close);
+                        changed = true;
+                        i += 1;
+                        continue;
+                    }
+                    result.push(c);
+                    i += 1;
+                }
+                line = result.into_iter().collect();
+                if !changed {
+                    break;
+                }
+            }
+            line
+        })
+        .collect();
+    out.join("\n")
 }
 
 fn apply_enhanced_for(text: &str) -> String {
@@ -2080,17 +3480,29 @@ pub struct TryInfo {
     pub handler_types: HashMap<u32, Vec<String>>,
     pub catch_all_addrs: Vec<u32>,
     pub try_regions: Vec<(u32, u32)>,
+    pub entries: Vec<TryEntry>,
+    pub shared_handlers: std::collections::HashSet<u32>,
+}
+
+pub struct TryEntry {
+    pub k: usize,
+    pub start: u32,
+    pub end: u32,
+    pub handlers: Vec<(u32, Vec<String>)>,
 }
 
 pub fn build_try_info(dex: &DexFile, tries: &[crate::TryItem]) -> TryInfo {
     let mut handler_types: HashMap<u32, Vec<String>> = HashMap::new();
     let mut catch_all_addrs = Vec::new();
     let mut try_regions = Vec::new();
-    for t in tries {
+    let mut entries: Vec<TryEntry> = Vec::new();
+    let mut handler_ref_count: HashMap<u32, usize> = HashMap::new();
+    for (k, t) in tries.iter().enumerate() {
         let region = (t.start_addr, t.start_addr + t.insn_count as u32);
         if !try_regions.contains(&region) {
             try_regions.push(region);
         }
+        let mut entry_handlers: Vec<(u32, Vec<String>)> = Vec::new();
         for h in &t.handlers {
             let type_desc = dex
                 .types
@@ -2100,19 +3512,49 @@ pub fn build_try_info(dex: &DexFile, tries: &[crate::TryItem]) -> TryInfo {
             let jt = crate::types::java_type(&type_desc);
             let entry = handler_types.entry(h.addr).or_default();
             if !entry.contains(&jt) {
-                entry.push(jt);
+                entry.push(jt.clone());
+            }
+            *handler_ref_count.entry(h.addr).or_default() += 1;
+            if let Some((_, types)) = entry_handlers.iter_mut().find(|(a, _)| *a == h.addr) {
+                if !types.contains(&jt) {
+                    types.push(jt);
+                }
+            } else {
+                entry_handlers.push((h.addr, vec![jt]));
             }
         }
-        if let Some(addr) = t.catch_all_addr
-            && !catch_all_addrs.contains(&addr)
-        {
-            catch_all_addrs.push(addr);
+        if let Some(addr) = t.catch_all_addr {
+            if !catch_all_addrs.contains(&addr) {
+                catch_all_addrs.push(addr);
+            }
+            *handler_ref_count.entry(addr).or_default() += 1;
+            let throwable = "Throwable".to_string();
+            if let Some((_, types)) = entry_handlers.iter_mut().find(|(a, _)| *a == addr) {
+                if !types.contains(&throwable) {
+                    types.push(throwable);
+                }
+            } else {
+                entry_handlers.push((addr, vec![throwable]));
+            }
         }
+        entries.push(TryEntry {
+            k,
+            start: t.start_addr,
+            end: t.start_addr + t.insn_count as u32,
+            handlers: entry_handlers,
+        });
     }
+    let shared_handlers = handler_ref_count
+        .into_iter()
+        .filter(|(_, c)| *c > 1)
+        .map(|(a, _)| a)
+        .collect();
     TryInfo {
         handler_types,
         catch_all_addrs,
         try_regions,
+        entries,
+        shared_handlers,
     }
 }
 
@@ -2126,10 +3568,6 @@ pub fn render_method_pseudocode_full(
     let mut ctx = RenderCtx::new(func);
     ctx.value_types = value_types.clone();
 
-    let handler_types = &try_info.handler_types;
-    let catch_all_addrs = &try_info.catch_all_addrs;
-    let try_regions = &try_info.try_regions;
-
     let mut order = reverse_post_order(func);
     let reachable: std::collections::HashSet<BlockId> = order.iter().copied().collect();
     let mut orphans: Vec<BlockId> = func
@@ -2140,7 +3578,62 @@ pub fn render_method_pseudocode_full(
         .filter(|id| !reachable.contains(id))
         .collect();
     orphans.sort_by_key(|id| func.cfg.blocks[id.0 as usize].start_addr);
-    order.extend(orphans);
+    order.extend(orphans.clone());
+    let mut region_catch: HashMap<u32, Vec<(usize, usize, String)>> = HashMap::new();
+    let mut region_endcatch: HashMap<u32, Vec<(usize, usize)>> = HashMap::new();
+    {
+        let orphan_pos: HashMap<BlockId, usize> =
+            orphans.iter().enumerate().map(|(i, &b)| (b, i)).collect();
+        let addr_to_bid: HashMap<u32, BlockId> = func
+            .cfg
+            .blocks
+            .iter()
+            .map(|b| (b.start_addr as u32, b.id))
+            .collect();
+        for e in &try_info.entries {
+            for (j, (h_addr, types)) in e.handlers.iter().enumerate() {
+                let Some(&h_bid) = addr_to_bid.get(h_addr) else {
+                    continue;
+                };
+                if reachable.contains(&h_bid) || !orphan_pos.contains_key(&h_bid) {
+                    continue;
+                }
+                let mut region: std::collections::HashSet<BlockId> =
+                    std::collections::HashSet::new();
+                let mut stack = vec![h_bid];
+                while let Some(b) = stack.pop() {
+                    if !region.insert(b) {
+                        continue;
+                    }
+                    if let Some(succs) = func.cfg.succs.get(b.0 as usize) {
+                        for &s in succs {
+                            if !reachable.contains(&s) && orphan_pos.contains_key(&s) {
+                                stack.push(s);
+                            }
+                        }
+                    }
+                }
+                let mut positions: Vec<usize> = region
+                    .iter()
+                    .filter_map(|b| orphan_pos.get(b).copied())
+                    .collect();
+                positions.sort_unstable();
+                let (Some(&pmin), Some(&pmax)) = (positions.first(), positions.last()) else {
+                    continue;
+                };
+                if pmax - pmin + 1 != positions.len() || orphan_pos[&h_bid] != pmin {
+                    continue;
+                }
+                let last_bid = orphans[pmax];
+                let last_addr = func.cfg.blocks[last_bid.0 as usize].start_addr as u32;
+                region_catch
+                    .entry(*h_addr)
+                    .or_default()
+                    .push((e.k, j, types.join(" | ")));
+                region_endcatch.entry(last_addr).or_default().push((e.k, j));
+            }
+        }
+    }
     let mut block_renders: HashMap<BlockId, crate::structure::BlockRender> = HashMap::new();
     for &bid in &order {
         let block = &func.cfg.blocks[bid.0 as usize];
@@ -2208,24 +3701,101 @@ pub fn render_method_pseudocode_full(
         } else {
             None
         };
+        if cond.is_none()
+            && jump.is_none()
+            && switch.is_none()
+            && let Some(succs) = func.cfg.succs.get(bid.0 as usize)
+            && succs.len() == 1
+        {
+            jump = Some(succs[0]);
+        }
+        if let Some(succs) = func.cfg.succs.get(bid.0 as usize) {
+            let mut seen: Vec<(u32, u32)> = Vec::new();
+            for &s in succs {
+                let Some(succ_block) = func.cfg.blocks.get(s.0 as usize) else {
+                    continue;
+                };
+                for &pid in &succ_block.phis {
+                    let Some(inst) = func.values.get(pid.0 as usize) else {
+                        continue;
+                    };
+                    let SsaOp::Phi { incoming } = &inst.op else {
+                        continue;
+                    };
+                    for (pred, val) in incoming {
+                        if *pred == bid && val.0 != u32::MAX && !seen.contains(&(pid.0, val.0)) {
+                            seen.push((pid.0, val.0));
+                            let lhs = ctx.name_of(pid);
+                            let rhs = ctx.operand_text(&Operand::Value(*val));
+                            lines.push(format!("{lhs} = {rhs};"));
+                        }
+                    }
+                }
+            }
+        }
         let block_addr = block.start_addr as u32;
         let mut prefix: Vec<String> = Vec::new();
-        if let Some(types) = handler_types.get(&block_addr) {
-            let mut all: Vec<String> = types.clone();
-            if catch_all_addrs.contains(&block_addr) && !all.iter().any(|t| t == "Throwable") {
-                all.push("Throwable".to_string());
+        let mut suffix: Vec<String> = Vec::new();
+        for e in &try_info.entries {
+            if e.end == block_addr {
+                prefix.push(format!("// endtry@{}", e.k));
             }
-            prefix.push(format!("// catch ({} e)", all.join(" | ")));
-        } else if catch_all_addrs.contains(&block_addr) {
-            prefix.push("// catch (Throwable e)".to_string());
         }
-        if try_regions.iter().any(|(s, _)| block_addr == *s) {
-            prefix.push("// try".to_string());
-        } else if try_regions.iter().any(|(_, e)| block_addr == *e) {
-            prefix.push("// end try".to_string());
+        for e in &try_info.entries {
+            if e.start == block_addr {
+                prefix.push(format!("// try@{}", e.k));
+            }
         }
+        for (k, j, types) in region_catch.get(&block_addr).into_iter().flatten() {
+            prefix.push(format!("// catch@{k}.{j} ({types} e)"));
+        }
+        for (k, j) in region_endcatch.get(&block_addr).into_iter().flatten() {
+            suffix.push(format!("// endcatch@{k}.{j}"));
+        }
+        let region_mapped: std::collections::HashSet<(usize, usize)> = region_catch
+            .get(&block_addr)
+            .into_iter()
+            .flatten()
+            .map(|(k, j, _)| (*k, *j))
+            .collect();
+        let mut catch_ks: Vec<(usize, usize, String)> = Vec::new();
+        for e in &try_info.entries {
+            for (j, (addr, types)) in e.handlers.iter().enumerate() {
+                if *addr == block_addr && !region_mapped.contains(&(e.k, j)) {
+                    catch_ks.push((e.k, j, types.join(" | ")));
+                }
+            }
+        }
+        let terminates = lines
+            .iter()
+            .rev()
+            .map(|l| l.trim())
+            .find(|t| !t.is_empty() && !t.starts_with("//"))
+            .is_some_and(|t| {
+                t.starts_with("return") || t.starts_with("throw ") || t.starts_with("goto L")
+            });
         let mut all_lines = prefix;
-        all_lines.extend(lines);
+        if !catch_ks.is_empty() && terminates {
+            for (k, j, types) in &catch_ks {
+                all_lines.push(format!("// catch@{k}.{j} ({types} e)"));
+                all_lines.extend(lines.iter().cloned());
+                all_lines.push(format!("// endcatch@{k}.{j}"));
+            }
+        } else {
+            if !catch_ks.is_empty() {
+                let mut all: Vec<String> = Vec::new();
+                for (_, _, types) in &catch_ks {
+                    for t in types.split(" | ") {
+                        if !all.iter().any(|x| x == t) {
+                            all.push(t.to_string());
+                        }
+                    }
+                }
+                all_lines.push(format!("// catch ({} e)", all.join(" | ")));
+            }
+            all_lines.extend(lines);
+        }
+        all_lines.extend(suffix);
         block_renders.insert(
             bid,
             crate::structure::BlockRender {
@@ -2237,16 +3807,21 @@ pub fn render_method_pseudocode_full(
         );
     }
 
-    let text = crate::structure::render_structured(func, &block_renders);
+    let (text, bailed) = crate::structure::render_structured(func, &block_renders);
     let text = text.trim_end().to_string();
+    let text = if bailed {
+        degrade_try_markers(&text)
+    } else {
+        text
+    };
     if text.is_empty() {
         return "    <empty>".to_string();
     }
     let text = fuse_new_init(&text);
     let text = apply_copy_chain_collapse(&text);
     let text = apply_string_concat_fold(&text);
-    let text = apply_for_loop_recovery(&text);
     let text = apply_latch_continue_cleanup(&text);
+    let text = apply_for_loop_recovery(&text);
     let text = apply_dead_allocation_cleanup(&text);
     let text = apply_arm_tail_goto_cleanup(&text);
     let text = apply_boxing_cleanup(&text);
@@ -2256,20 +3831,32 @@ pub fn render_method_pseudocode_full(
     let text = apply_semantic_names(&text);
     let text = apply_cast_paren_cleanup(&text);
     let text = apply_loop_recovery(&text);
+    let text = apply_dead_goto_after_else(&text);
+    let text = apply_guard_flatten(&text);
+    let text = apply_else_if_collapse(&text);
     let text = apply_loop_wrap(&text);
     let text = apply_switch_break(&text);
     let text = apply_small_block_inline(&text);
     let text = apply_dead_assign(&text);
+    let text = apply_guard_flatten(&text);
+    let text = apply_else_if_collapse(&text);
+    let text = apply_empty_else_removal(&text);
     let name_to_id: HashMap<String, SsaValueId> = ctx
         .value_names
         .iter()
         .map(|(id, name)| (name.clone(), *id))
         .collect();
     let text = apply_typed_declarations(&text, value_types, &name_to_id);
+    let text = apply_type_based_names(&text);
     let text = apply_unused_label_cleanup(&text);
     let text = apply_control_kind_repair(&text);
     let text = apply_condition_paren_repair(&text);
+    let text = apply_stmt_paren_repair(&text);
+    let text = apply_cast_paren_cleanup(&text);
     let text = apply_brace_repair(&text);
+    let text = apply_labeled_continue(&text);
+    let text = apply_try_catch_syntax(&text);
+    let text = apply_catch_var_naming(&text);
     apply_reindent(&text)
 }
 

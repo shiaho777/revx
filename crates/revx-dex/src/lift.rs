@@ -1071,6 +1071,7 @@ pub struct DexMethodLifter<'a> {
     pending_call_type: Option<String>,
     value_types: crate::types::ValueTypes,
     switch_cases: HashMap<BlockId, Vec<(String, BlockId)>>,
+    phi_regs: HashMap<SsaValueId, u16>,
 }
 
 impl<'a> DexMethodLifter<'a> {
@@ -1087,8 +1088,9 @@ impl<'a> DexMethodLifter<'a> {
             block_defs: HashMap::new(),
             pending_call_result: None,
             pending_call_type: None,
-            value_types: HashMap::new(),
+            value_types: crate::types::ValueTypes::new(),
             switch_cases: HashMap::new(),
+            phi_regs: HashMap::new(),
         }
     }
 
@@ -1291,6 +1293,73 @@ impl<'a> DexMethodLifter<'a> {
                 .insert(reg, id);
         }
 
+        self.setup_params(is_static, &param_types);
+        self.run_round(&insns, None);
+        let snapshot = self.block_defs.clone();
+
+        self.reset_state();
+        self.setup_params(is_static, &param_types);
+        self.run_round(&insns, Some(&snapshot));
+        self.patch_phi_placeholders();
+
+        LiftOutput {
+            func: self.func,
+            value_types: self.value_types,
+            switch_cases: self.switch_cases,
+        }
+    }
+
+    fn setup_params(&mut self, is_static: bool, param_types: &[String]) {
+        let registers = self.ctx.code.registers_size;
+        let ins = self.ctx.code.ins_size;
+        for i in 0..ins {
+            let reg = registers - ins + i;
+            let name = if !is_static && i == 0 {
+                "this".to_string()
+            } else {
+                let param_index = if is_static { i } else { i - 1 };
+                format!("p{param_index}")
+            };
+            let id = self.func.new_value_id();
+            let inst = SsaInstruction {
+                id,
+                op: SsaOp::Copy {
+                    src: Operand::Symbol(name),
+                },
+                source_addr: 0,
+                block: BlockId(0),
+            };
+            self.func.cfg.block_mut(BlockId(0)).insts.push(id);
+            self.func.values.push(inst);
+            let ty = if !is_static && i == 0 {
+                self.ctx
+                    .dex
+                    .methods
+                    .get(self.ctx.method_idx as usize)
+                    .map(|m| m.class.clone())
+                    .unwrap_or_default()
+            } else {
+                param_types
+                    .get(if is_static { i } else { i - 1 } as usize)
+                    .cloned()
+                    .unwrap_or_default()
+            };
+            if !ty.is_empty() {
+                self.set_type(id, &ty);
+            }
+            self.reg_values.insert(reg, id);
+            self.block_defs
+                .entry(BlockId(0))
+                .or_default()
+                .insert(reg, id);
+        }
+    }
+
+    fn run_round(
+        &mut self,
+        insns: &BTreeMap<u32, (Insn, usize)>,
+        snapshot: Option<&HashMap<BlockId, HashMap<u16, SsaValueId>>>,
+    ) {
         let mut order = self.reverse_post_order();
         let reachable: BTreeSet<BlockId> = order.iter().copied().collect();
         let mut orphans: Vec<BlockId> = (0..self.func.cfg.blocks.len() as u32)
@@ -1308,7 +1377,7 @@ impl<'a> DexMethodLifter<'a> {
             let block_end = self.func.cfg.blocks[bid.0 as usize].end_addr as u32;
 
             if bid != BlockId(0) {
-                self.merge_predecessor_regs(bid);
+                self.merge_predecessor_regs(bid, snapshot);
             }
 
             let mut cur_off = block_addr;
@@ -1320,11 +1389,41 @@ impl<'a> DexMethodLifter<'a> {
                 cur_off += *size as u32;
             }
         }
+    }
 
-        LiftOutput {
-            func: self.func,
-            value_types: self.value_types,
-            switch_cases: self.switch_cases,
+    fn reset_state(&mut self) {
+        self.func.values.clear();
+        self.func.next_value = 0;
+        for b in self.func.cfg.blocks.iter_mut() {
+            b.insts.clear();
+            b.phis.clear();
+        }
+        self.reg_values.clear();
+        self.block_defs.clear();
+        self.pending_call_result = None;
+        self.pending_call_type = None;
+        self.value_types.clear();
+        self.switch_cases.clear();
+        self.phi_regs.clear();
+    }
+
+    fn patch_phi_placeholders(&mut self) {
+        let block_defs = self.block_defs.clone();
+        let phi_regs = self.phi_regs.clone();
+        for inst in self.func.values.iter_mut() {
+            let SsaOp::Phi { incoming } = &mut inst.op else {
+                continue;
+            };
+            let Some(&reg) = phi_regs.get(&inst.id) else {
+                continue;
+            };
+            for (pred, val) in incoming.iter_mut() {
+                if val.0 == u32::MAX
+                    && let Some(id) = block_defs.get(pred).and_then(|d| d.get(&reg))
+                {
+                    *val = *id;
+                }
+            }
         }
     }
 
@@ -1358,7 +1457,11 @@ impl<'a> DexMethodLifter<'a> {
         post
     }
 
-    fn merge_predecessor_regs(&mut self, block: BlockId) {
+    fn merge_predecessor_regs(
+        &mut self,
+        block: BlockId,
+        snapshot: Option<&HashMap<BlockId, HashMap<u16, SsaValueId>>>,
+    ) {
         let preds = self.func.cfg.predecessors(block).to_vec();
         if preds.is_empty() {
             return;
@@ -1368,6 +1471,13 @@ impl<'a> DexMethodLifter<'a> {
             if let Some(defs) = self.block_defs.get(&pred) {
                 for (&reg, &id) in defs {
                     common.entry(reg).or_default().push((pred, id));
+                }
+            } else if let Some(snap) = snapshot.and_then(|s| s.get(&pred)) {
+                for &reg in snap.keys() {
+                    common
+                        .entry(reg)
+                        .or_default()
+                        .push((pred, SsaValueId(u32::MAX)));
                 }
             }
         }
@@ -1390,6 +1500,7 @@ impl<'a> DexMethodLifter<'a> {
                 };
                 self.func.cfg.block_mut(block).phis.push(phi_id);
                 self.func.values.push(phi);
+                self.phi_regs.insert(phi_id, reg);
                 self.reg_values.insert(reg, phi_id);
                 self.block_defs
                     .entry(block)
@@ -1597,11 +1708,11 @@ impl<'a> DexMethodLifter<'a> {
                 type_idx,
             } => {
                 let size_val = self.value(*size);
-                let t = self.ctx.dex.type_name(*type_idx);
+                let t = crate::types::java_type(&self.ctx.dex.type_name(*type_idx));
                 let id = self.push_inst(
                     block,
                     SsaOp::Call {
-                        target: Operand::Symbol(format!("new {t}[]")),
+                        target: Operand::Symbol(format!("new {t}")),
                         args: vec![size_val],
                     },
                 );
@@ -1616,12 +1727,12 @@ impl<'a> DexMethodLifter<'a> {
                 self.set_type(copy_id, &t);
             }
             Insn::FilledNewArray { regs, type_idx } => {
-                let t = self.ctx.dex.type_name(*type_idx);
+                let t = crate::types::java_type(&self.ctx.dex.type_name(*type_idx));
                 let args: Vec<Operand> = regs.iter().map(|&r| self.value(r)).collect();
                 let id = self.push_inst(
                     block,
                     SsaOp::Call {
-                        target: Operand::Symbol(format!("new {t}[]")),
+                        target: Operand::Symbol(format!("new {t}")),
                         args,
                     },
                 );
