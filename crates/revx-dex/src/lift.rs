@@ -925,6 +925,21 @@ pub fn decode_all(code: &CodeItem) -> BTreeMap<u32, (Insn, usize)> {
     let mut map = BTreeMap::new();
     let mut off = 0usize;
     while off < code.insns.len() {
+        if let Some(payload) = crate::insns::decode_payload(&code.insns, off) {
+            let size = match payload {
+                crate::insns::Payload::PackedSwitch { size_units, .. }
+                | crate::insns::Payload::SparseSwitch { size_units, .. }
+                | crate::insns::Payload::FillArrayData { size_units, .. } => size_units,
+            };
+            if off
+                .checked_add(size)
+                .is_none_or(|end| end > code.insns.len())
+            {
+                break;
+            }
+            off += size;
+            continue;
+        }
         match decode_insn_structured(&code.insns, off) {
             Some((insn, size)) => {
                 map.insert(off as u32, (insn, size));
@@ -971,6 +986,7 @@ pub fn build_basic_blocks(
                 leaders.insert(next);
             }
             Insn::PackedSwitch { payload_off, .. } | Insn::SparseSwitch { payload_off, .. } => {
+                leaders.insert(next);
                 if let Some(payload) =
                     crate::insns::decode_payload(&code.insns, *payload_off as usize)
                 {
@@ -1008,6 +1024,12 @@ pub fn build_basic_blocks(
         let mut last_off = None;
         for (&off, (insn, _)) in insns.range(start..end) {
             last_off = Some((off, insn));
+            if matches!(
+                insn,
+                Insn::Return { .. } | Insn::Throw { .. } | Insn::Goto { .. }
+            ) {
+                break;
+            }
         }
         if let Some((off, insn)) = last_off {
             match insn {
@@ -1034,6 +1056,7 @@ pub fn build_basic_blocks(
                             _ => {}
                         }
                     }
+                    edges.push(off + insns[&off].1 as u32);
                 }
                 Insn::Return { .. } | Insn::Throw { .. } => {}
                 _ => edges.push(end),
@@ -1391,6 +1414,12 @@ impl<'a> DexMethodLifter<'a> {
                     break;
                 };
                 self.lift_insn(bid, cur_off, insn);
+                if matches!(
+                    insn,
+                    Insn::Return { .. } | Insn::Throw { .. } | Insn::Goto { .. }
+                ) {
+                    break;
+                }
                 cur_off += *size as u32;
             }
         }
@@ -1810,6 +1839,12 @@ impl<'a> DexMethodLifter<'a> {
                             .or_default()
                             .push((key.clone(), target));
                     }
+                }
+                if let Some(&target) = succs.get(keys.len()) {
+                    self.switch_cases
+                        .entry(block)
+                        .or_default()
+                        .push(("default".into(), target));
                 }
             }
             Insn::Cmp {

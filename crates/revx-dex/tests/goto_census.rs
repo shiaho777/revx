@@ -312,7 +312,7 @@ fn census_aggregates_the_rendered_methods_exception_flow() {
     dex.data.extend_from_slice(&[1, 0, 1]);
     dex.classes[0].class_data.as_mut().unwrap().virtual_methods[0].code_off = offset;
     let report = census::census_dex(&dex, None);
-    assert_eq!(report.schema_version, 2);
+    assert_eq!(report.schema_version, 3);
     assert_eq!(report.selection.completed_methods, 1);
     let method = &report.methods[0];
     let flow = method.exception_flow.as_ref().unwrap();

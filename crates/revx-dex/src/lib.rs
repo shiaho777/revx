@@ -9,6 +9,7 @@ pub mod insns;
 pub mod jni;
 pub mod kotlin;
 pub mod lift;
+pub mod region;
 pub mod render;
 pub mod signature;
 pub mod structure;
