@@ -41,14 +41,17 @@ Issue #80。边界：独立的异常流模型与普查接入，不改变普通 C
 完成标准：上述精确测试、CLI 和最新 PR CI 通过，附输入哈希标识的本地统计报告。
 R2 不以 goto 削减或 try/catch 降级归零验收；这些属于 R3 的结构化工作。
 
-## R3 — Region 树与 handler 区域化
+## R3 — Region 树与 handler 区域化：首版已交付
 
-在 R2 异常模型基础上设计 DEX Region 表示，分离块图变换、区域构造与文本生成。
-现有 `ssa.rs` 的实验区域遍历只是可参考的实现，不等同于已具备完整 Region AST。
+Issue #82。边界：独立 try 区域的区域树路径 + 整方法回退；共享 handler、普通入口可达 handler、多入口循环、finally 不在本阶段强行恢复。
 
-验收重点：共享/入口可达 handler、嵌套 try/catch 的正确结构化；副作用、异常顺序、控制转移保持测试通过。
-在固定语料上同时记录 goto 与降级数量，按明确实例解释变化。具体数值目标须在实现方案中冻结，不能用未知分类作分母。
-不在缺少正确性证据时强求所有降级注释归零。
+- `revx-dex/src/region.rs`：Region AST（Sequence/Block/If/Loop/Break/Continue/Switch/TryCatch），由 CFG walk 构建，校验所有块唯一归属、所有普通边被表达、handler 顺序与元数据一致；任何校验失败整方法回退 legacy 并带机器可读原因。
+- 默认入口走 Auto（区域树→回退 legacy）；`--mode legacy` 保留旧路径；诊断 API 与默认 API 已统一走同一结构化路径。
+- 普查 schema v3 报告 region/legacy 采用、结构化 try 数和回退原因分布；switch 默认边、payload 边界与共享 case 目标的 lift 修复随本阶段交付。
+- 本地语料（SHA-256 656331a8…）实测：region 路径 5,121/28,903 方法（17.7%）、结构化 try 7、0 处理失败；legacy 2,982 vs auto 2,976 goto。见 [R3 报告](benches/region-tree-2026-09.md)。
+
+验收重点已达成首版：合成 CFG-vs-Region 执行轨迹等价（菱形、循环、异常注入）、真实 DEX switch 回归、四种异常回退原因精确断言、预算回退。
+共享/入口可达 handler、嵌套 try/catch 的完整结构化仍未攻克（structured_try_count=7/1,731），其主因分布见报告；具体数值目标在后续阶段冻结。
 
 ## R4 — 多入口循环归一化
 
