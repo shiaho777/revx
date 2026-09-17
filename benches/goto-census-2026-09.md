@@ -1,65 +1,62 @@
-# dex goto 普查 — 首个权威基线(2026-09-17)
+# DEX goto 普查 — R1 单样本观测（2026-09-17）
 
-取代无出处的"3,280":本文件数字由 `revx dex goto-census --json` 产出,可复现。
+本报告记录 R1 命令的本地运行结果，不是多语料质量排名。
+用户提到的 3,280 尚无可核实的语料、版本或统计口径；不能与本报告的 2,924 比较或据此声称削减。
 
-## 口径(先读这个)
+## 统计口径
 
-- **final_goto_count**:最终伪代码文本中的 `goto L<n>;` 语句数。token 级扫描,
-  跳过字符串/注释,只认语句位置;逐条计数,不按目标去重。
-- **raw_emission_count**:结构化 walk 中 emit_goto 的调用次数(revisit / forward-revisit)。
-  文本后处理 pass 只消灭/转换 goto 不新增,但 break/continue/删除都会使 final < raw,
-  **两者是不同指标,不得混用**。
-- **provenance**:每条 final goto 的成因显式标为 unknown。raw 分类是发射路径的启发式
-  标签,不构成"多入口循环"或"handler 交错"的证明——那些归因要等 R2/R3 的结构化
-  诊断落地。当前诚实口径:final 计数是事实,成因是假设。
+- `final_goto_count`：最终伪代码的 `goto L<n>;` 次数；跳过字符串和注释，同目标的多个 goto 分别计数。
+- `raw_emission_count`：结构化 walk 实际输出 goto 的次数。已经变为 break/continue 的分支不计入该数。
+- 后处理可能删除、转换或复制文本，所以 final 与 raw 没有保证的大小关系。不能从二者差值推断每条发射的去向或删除比例。
+- 最终 goto 的 provenance 是 `unknown`。raw 的 revisit/forward-revisit 是发射路径名称，不是多入口循环或 handler 交错的根因证据。
+- `completed` 仅表示方法处理返回结果，不代表伪代码可编译或语义正确。
 
-## 基线:esp-overlay app-release.apk 的 classes.dex(5.4MB)
+## 本地输入与历史结果
 
-复跑:
+输入：本地 esp-overlay app-release.apk 的 classes.dex，5,461,076 字节。
+R1 时未记录提交绑定和输入哈希；R2 报告会对其实际输入重新记录，不能反向保证两次文件相同。
+APK/DEX 不随仓库发布。
+
 ```bash
-unzip -o app-release.apk classes.dex -d /tmp/revx-dex-corpus
-revx-engine dex goto-census /tmp/revx-dex-corpus/classes.dex --json
+revx-engine dex goto-census /path/to/classes.dex --json
 ```
 
-| 指标 | 值 |
-|---|---|
-| 定义方法总数 | 30,261 |
-| completed / failed | 28,903 / **0** |
-| skipped_codeless | 1,358(抽象/native 方法) |
-| **最终输出 goto** | **2,924**(2,924 行,1,527 个方法) |
-| raw 发射 | 4,508(revisit 2,633 + forward-revisit 1,875) |
+| 指标 | R1 观测值 |
+|---|---:|
+| 定义方法 | 30,261 |
+| completed | 28,903 |
+| failed | 0 |
+| skipped_codeless | 1,358 |
+| 最终 goto / 含 goto 的方法 | 2,924 / 1,527 |
+| raw 发射 | 4,508 |
+| raw revisit / forward-revisit | 2,633 / 1,875 |
 | bailed 方法 | 0 |
 
-final/raw = 65%:35% 的发射被现有文本 pass 消灭或转换(break/continue/内联/删除)。
+这是同一个样本上的两项不同计数，不是“35% 的发射已消除”的逐跳转追踪证据。
 
-## Top 方法(goto 数)
+## 较多 goto 的方法
 
 | goto | 方法 |
 |---|---|
 | 34 | FragmentManager.moveToState |
 | 27 | BundleKt.bundleOf |
 | 27 | ArraysKt.contentDeepEquals |
-| 22 | FragmentTransition.addToFirstInFirstOut |
+| 22 | FragmentTransition.addToFirstInLastOut |
 | 15 | PathParser$PathDataNode.addCommand |
 | 14 | BitmapCompat.createScaledBitmap / DurationKt.parseDuration / NestedScrollView.onTouchEvent |
 | 12 | UriCompat.toSafeString |
 | 11 | FindAddress.attemptMatch |
 
-特征:重灾区和 jadx 相同——状态机(moveToState)、深度嵌套 equals/解析器、
-多出口工具函数。没有游戏专属样本;王者语料的 .so 走 native 赛道,DEX 普查
-后续补 ToolTrove-73 与 2 个开源 APK(语料就位即跑,命令同上)。
+未在此样本上运行同配置 JADX 对照，不能断言两者的失败模式或质量相同。
 
-## 后续阶段验收基线
+## 后续验收
 
-| 阶段 | 目标 |
-|---|---|
-| R2(异常感知 CFG) | final goto 中 handler 交错类可归因;try/catch 降级注释 = 0 |
-| R3(Region 树) | final goto ≤ 1,462(基线 -50%) |
-| R4(多入口循环拆分) | 多入口循环类 final goto = 0 |
-| R5(收敛) | 剩余全部带机器可读成因标注 → V1 |
+R2 验证保守异常流模型、共享/正常可达 handler 诊断和正常 CFG 不变；不负责降低 goto。
+R3 才实现区域树与 handler 区域化，数值目标需与固定语料、正确性测试一起确定。
+R4 处理多入口循环；R5 做固定版本验收。详见 [ROADMAP](../ROADMAP.md)。
 
-## 已知非确定性问题(不归本 PR 修)
+## 输出确定性限制
 
-`dex decompile` 输出跨进程非确定:同一二进制重复运行,语句顺序与临时变量编号
-(v23/v24)、变量名(i2/i3)漂移。根因疑似 HashMap 迭代序参与命名/排序。普查命令
-只输出计数与站点,数字稳定可复现;输出确定性修复进 backlog-v2。
+R1 检查发现基线二进制自身的跨进程输出也存在语句顺序、临时变量编号漂移，因此跨版本字节一致性检查没有通过。
+HashMap 迭代序只是候选原因，未定位确认。少数重复运行的汇总计数相同不保证所有输出或未来运行确定。
+对语句排序、统一变量名或只比较计数不能证明语义等价；同一份 IR 的普通/诊断路径一致性需独立测试。

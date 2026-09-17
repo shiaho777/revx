@@ -4,6 +4,7 @@
 pub mod annotations;
 pub mod census;
 pub mod classgen;
+pub mod exception;
 pub mod insns;
 pub mod jni;
 pub mod kotlin;

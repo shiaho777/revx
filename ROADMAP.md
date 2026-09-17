@@ -1,94 +1,70 @@
-# ReVX 终局路线图 v1 — DEX 反编译质量收官战
+# ReVX v1 — 有边界的 DEX 质量路线
 
-> 目标:世界上最好的全文件逆向工具。native 赛道(ELF/PE/Mach-O + il2cpp)已是独走赛道,
-> 本路线图只解决最后一块:DEX 结构化质量追平并超越 jadx,然后**封版**,不再无限推进。
-> 每阶段 = 1 Issue + 1 PR + 1 个可量化的验收数字,数字不动 = 阶段未完成,不得开下一阶段。
+长期目标是全面、轻量、高性能的逆向工具，并在明确的专项上超越现有工具。
+这不是当前已经实现的结论。R1–R5 只覆盖 DEX 质量主线，不代表“全文件工具”已经完成。
+每阶段一个 Issue/PR，以可重复的正确性测试和明确交付物验收；阶段结束后停止，不自动扩展范围。
 
-## 0. 终局定义(满足即封版)
+## 发布验收原则
 
-| # | 胜利条件 | 度量方式 |
-|---|---|---|
-| V1 | 黄金语料上 goto 仅剩"不可归约"残留,且每条带机器可读原因标注 | `dex-goto-census` 分类计数 |
-| V2 | 反编译成功率 ≥ jadx(以 jadx 自身 21% WARN 率为对标线) | 语料批处理 WARN 率 |
-| V3 | while/for/do-while/switch/try-catch-finally 全部语法化,无文本降级注释 | 语料扫描降级计数 = 0 |
-| V4 | 性能红线不破:lean 档 8MB、native 吞吐 ~2,700 函数/s 无回退 | `scripts/bench.sh` CSV 对比 |
-| V5 | 全文件矩阵成立:DEX ∥ native × {x64, arm64} × {DWARF/PDB, il2cpp, Kotlin @Metadata} 单工具覆盖 | vs-jadx 基准表复测 |
+- 正确性优先：减少 goto、没有警告或能生成文本，都不等于语义正确。
+- 与 JADX 比较必须固定同一语料、版本、配置和任务。历史单次 WARN 率不能直接等同反编译失败率。
+- 性能必须同时报告分析覆盖范围、耗时、峰值内存及构建配置。8 MB 是既有 lean 配置的预算设置，不是所有 DEX 分析的内存保证；历史 native 吞吐不是当前全任务性能承诺。
+- 各文件格式、架构和元数据能力分别验收，不把 DEX 与 x64/ARM64、DWARF/PDB 等拼成未经验证的全覆盖矩阵。
+- 所有无法可靠结构化的情况保留明确诊断和降级输出，不以删代码或错误内联换取 goto 归零。
 
-封版后新想法进 `benches/backlog-v2.md`,不进主线。
+## 第 0 步 — 既有提交落地：完成
 
-## 1. 现状快照(2026-09-17)
+44 个提交通过 PR #75、#76、#77 合入 main，Issue #72、#73、#74 已关闭。
+本地旧分支已删除。缺少 upstream 跟踪本身并不能证明代码没有其他备份；这里的成果是集成与 CI 验证，不是对备份状态的断言。
 
-- ~~分支止血~~ **已完成**:44 个提交经 PR #75/#76/#77(Issue #72/#73/#74)全部合入 main,`codex/dex-decompile` 已删除。
-- 结构化引擎现状:CFG 上的递归文本 walk(`revx-dex/src/structure.rs`),靠 ~20 个文本后处理 pass 修补;**无 Region 树、无多入口循环拆分、handler 区域化只有受限雏形**(`render.rs:3593-3633` 要求孤立子图+地址连续)。
-- `ssa.rs` 存在实验性 dominance region tree(`REVX_REGION_TREE` opt-in,分支 `codex/a2-region-tree-experimental`),**DEX 调用链未接入**。
-- 已知问题(记录,不属于单阶段):dex decompile 输出跨进程存在非确定性(语句顺序/临时变量编号漂移,同一二进制重复运行即可复现);修复需排序 IR 收集,进 backlog-v2。
+## R1 — 最终输出 goto 普查：测量工具已交付
 
-## 2. 第 0 步 — 分支止血(半天,先于一切)
+PR #79 / Issue #78。
 
-44 个未合提交违背 AGENTS.md 自身流程,一旦本地丢失无法恢复。
-动作:开 Issue(DEX 反编译质量线落地)→ 按 plan 分主题拆 2-3 个 PR → CI 绿 → merge。
-此后所有工作恢复 Issue + PR + CI 节奏,这是"有计划"的形式保障。
+`revx dex goto-census <path> --json [--limit N]` 分别报告最终文本 goto 和结构化阶段发射诊断。
+最终计数跳过字符串/注释，不按目标标签去重。后处理可能删除、转换或复制文本，因此 final 不保证小于 raw。
+最终 goto 的根因仍为 `unknown`；最初设想的五类根因分类尚未交付。
 
-## 3. 主线五阶段(每阶段独立 Issue+PR,顺序执行)
+单个本地 DEX 的历史观测为：30,261 个定义方法，28,903 个有代码方法处理完成、0 个处理失败、1,358 个无代码方法；最终 goto 2,924，raw 4,508。
+它不能替代来源未核实的 3,280，也不证明比其他语料或工具更优。见 [R1 报告](benches/goto-census-2026-09.md)。
 
-### R1 — 权威度量:goto 普查 ✅(2026-09-17 落地,PR Fixes #78)
+## R2 — DEX 异常流模型与诊断
 
-已交付:`revx dex goto-census <path> --json [--limit N]`(crates/revx-dex/src/census.rs +
-revx-engine 子命令)。最终输出计数(token 级扫描,跳过字符串/注释,只认语句位置的
-`goto L<n>;`)与结构期发射诊断(revisit / forward-revisit + bailed)**分开报告**,
-不做虚假归因(每条 final goto 的 provenance 显式为 unknown)。
+Issue #80。边界：独立的异常流模型与普查接入，不改变普通 CFG 或渲染文本。
 
-首个真实基线(esp-overlay classes.dex,30,261 方法):
-- completed 28,903 / failed 0 / skipped_codeless 1,358
-- **最终输出 goto = 2,924(1,527 个方法)**;raw 发射 = 4,508(revisit 2,633 + fwd 1,875)
-- 用户口中"3,280"已被此可复现数字取代(见 benches/goto-census-2026-09.md)
-- 后续各阶段验收一律用此命令复跑对比。
+- 从已解析的 try 区间与 ordered typed/catch-all handlers 构造保守潜在异常连接。
+- 模型挂在 LiftOutput，记录保护块、handler BlockId、共享引用、普通入口可达性和无效地址/区间诊断。
+- 不把异常边混入共享 `ssa::Cfg.succs/preds`，不改变支配树、phi 或 native 分析。
+- 普查复用同一次 lift，schema v2 报告模型和统计，final goto 归因仍是 unknown。
+- 用合成 DEX 与 CFG 测试验证编码、顺序、共享关系、无效输入以及正常图和同一 IR 的渲染保持不变。
 
-### R2 — 异常感知 CFG(handler 的地基)
+完成标准：上述精确测试、CLI 和最新 PR CI 通过，附输入哈希标识的本地统计报告。
+R2 不以 goto 削减或 try/catch 降级归零验收；这些属于 R3 的结构化工作。
 
-`revx-analysis::ssa::Cfg`(ssa.rs:2093)增加异常边;DEX lift 构图时把 try/handler
-建模为 CFG 实体而非后处理文本标记。try/catch 组装从 `render.rs:2076` 的文本标记搬运
-改为区域节点构造;`render.rs:2249` 的"失败降级为注释"路径仅在 V3 验收时允许 0 次触发。
-**验收:census (b) 类 goto → 0;语料 try/catch 降级注释 = 0。**
+## R3 — Region 树与 handler 区域化
 
-### R3 — Region 树成为 DEX 结构化底座(架构换血,最大 PR)
+在 R2 异常模型基础上设计 DEX Region 表示，分离块图变换、区域构造与文本生成。
+现有 `ssa.rs` 的实验区域遍历只是可参考的实现，不等同于已具备完整 Region AST。
 
-把实验 region tree 从 ssa.rs opt-in 移植为 DEX 主路径:structure.rs 的文本 walk 改为
-Region AST 构建再渲染。E→U 的 ~20 个文本修复 pass 逐个重新落位:能表达为区域变换的
-收编为 pass,被区域语义覆盖的退役。handler 区域(try/catch/finally/共享 handler)
-成为一等 Region 节点。文本路径保留一个 release 的 fallback 开关用于 A/B 回归。
-**验收:渲染主路径为 AST 驱动;census (a)(b) 之外的 goto 较 R1 基线 -50%。**
+验收重点：共享/入口可达 handler、嵌套 try/catch 的正确结构化；副作用、异常顺序、控制转移保持测试通过。
+在固定语料上同时记录 goto 与降级数量，按明确实例解释变化。具体数值目标须在实现方案中冻结，不能用未知分类作分母。
+不在缺少正确性证据时强求所有降级注释归零。
 
-### R4 — 多入口循环拆分(最难的算法攻坚)
+## R4 — 多入口循环归一化
 
-SCC 归一化 + 节点拆分 + phi 重映射(jadx FixMultiEntryLoops 思想,clean-room 重实现)。
-拆分结果落回 R3 的 Region 树,phi 修复走已有的两轮 lift 管线。
-**验收:census (a) 类 goto → 0(真不可归约的按 V1 标注保留);语料循环恢复率 ≥ 95%。**
+SCC 检测、预算受限的节点拆分及 phi 重映射；连接 R3 区域表示。
+验收需包含多入口/嵌套循环、异常区间与循环相交、代码扩张限制以及运行语义对照。
+不能安全处理的情况保留说明，不承诺任意输入 goto 归零。
 
-### R5 — 收敛与终局复测(关机动作)
+## R5 — 固定范围的发布验收
 
-结构化 pass 收敛式迭代到不动点(借鉴 jadx CodeShrink 多次穿插思想),清掉 (c)(d) 长尾;
-跑全套 V1-V5 终局复测,数字写入 `benches/vs-jadx-2026-09.md` 增补节,发封版说明。
-**验收:V1-V5 全绿 → 路线图 v1 封版,DEX 质量线关闭。**
+复跑冻结语料、正确性回归和同配置性能基线，检查格式能力清单和所有已知降级。
+完成这一发布版本的验收后关闭 R1–R5；新格式、协程等独立需求进入后续版本，不在本主线无限追加。
+“世界最强”不是可执行的发布条件，应以公开、可复现的专项比较结果说明优势与限制。
 
-## 4. 贯穿红线(每个 PR 必查,违反即打回)
+## 已知限制与工程规则
 
-1. `cargo test --workspace` + clippy + fmt 全绿,CI(`ci / test`)是唯一合并门。
-2. `scripts/bench.sh` CSV 无回退;lean 档 8MB 预算与 native 吞吐是产品承诺,不为质量让路。
-3. 141/141 语料稳定性不回退;新优化必须带 golden 输出对比。
-4. 不再开字母计划散修:任何不属于 R1-R5 的新想法写入 backlog-v2,主线只认路线图。
-5. jadx 是 GPL-3.0:只做行为观察与思想级 clean-room,无代码移植,保持进程隔离。
-
-## 5. 明确不做(v1 封版前)
-
-- 100% goto 归零:不可归约控制流保留带原因标注的 goto,这是诚实而非失败。
-- 协程/续体的完整语法恢复:进 backlog-v2。
-- DEX 之外的容器格式扩展(APK 签名分析、资源表):进 backlog-v2。
-- 逐函数并行化(原 M4 遗留):随 R1 重测后决定是否值得。
-
-## 6. 为什么这条线能赢
-
-jadx 在 DEX 赛道有十年积累,正面硬拼每个语法糖不现实。revx 的取胜组合是:
-**结构化质量追到第一梯队(R1-R5 做到 goto 近零、语法化完整)** + jadx 没有的维度——
-native 独走、il2cpp/metadata 深度、8MB 轻量档、全文件单工具、MCP 证据链。
-"超越 jadx"的落点是:**在它停下的地方继续向前(native+metadata),在它的主场做到无可指摘(V1-V5)。**
+- main 上已有跨进程反编译文本漂移（临时变量编号、语句顺序）。原因尚未确证；排序输出或统一变量名不能证明语义等价。R2 用同一份 IR 检验诊断路径，不掩盖跨进程验收的限制。
+- 每个 PR：fmt、clippy、check、workspace tests 及最新 CI 全绿才合并。保留命令真实退出码，不用截断输出推断成功。
+- 不上传本地 APK/DEX、完整私有分析结果、缓存或凭证。默认 CI 运行合成测试，不依赖未提供的外部语料。
+- 算法实现遵守依赖与源代码许可证；不复制未经许可的代码。路线图不以对第三方工具的未经核实评价作为技术依据。
