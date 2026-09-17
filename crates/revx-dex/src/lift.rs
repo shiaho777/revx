@@ -948,6 +948,16 @@ pub fn build_basic_blocks(
 ) -> BTreeMap<u32, DexBasicBlock> {
     let mut leaders: BTreeSet<u32> = BTreeSet::new();
     leaders.insert(0);
+    for t in &code.tries {
+        leaders.insert(t.start_addr);
+        leaders.insert(t.start_addr + t.insn_count as u32);
+        for h in &t.handlers {
+            leaders.insert(h.addr);
+        }
+        if let Some(a) = t.catch_all_addr {
+            leaders.insert(a);
+        }
+    }
     for (&off, (insn, size)) in insns {
         let next = off + *size as u32;
         match insn {
@@ -1281,7 +1291,14 @@ impl<'a> DexMethodLifter<'a> {
                 .insert(reg, id);
         }
 
-        let order = self.reverse_post_order();
+        let mut order = self.reverse_post_order();
+        let reachable: BTreeSet<BlockId> = order.iter().copied().collect();
+        let mut orphans: Vec<BlockId> = (0..self.func.cfg.blocks.len() as u32)
+            .map(BlockId)
+            .filter(|id| !reachable.contains(id))
+            .collect();
+        orphans.sort_by_key(|id| self.func.cfg.blocks[id.0 as usize].start_addr);
+        order.extend(orphans);
         let mut visited = BTreeSet::new();
         for &bid in &order {
             if !visited.insert(bid) {
@@ -1346,37 +1363,38 @@ impl<'a> DexMethodLifter<'a> {
         if preds.is_empty() {
             return;
         }
-        let mut common: HashMap<u16, Vec<SsaValueId>> = HashMap::new();
-        for pred in &preds {
-            if let Some(defs) = self.block_defs.get(pred) {
+        let mut common: HashMap<u16, Vec<(BlockId, SsaValueId)>> = HashMap::new();
+        for &pred in &preds {
+            if let Some(defs) = self.block_defs.get(&pred) {
                 for (&reg, &id) in defs {
-                    common.entry(reg).or_default().push(id);
+                    common.entry(reg).or_default().push((pred, id));
                 }
             }
         }
-        for (reg, ids) in common {
-            if ids.len() == preds.len() {
-                let first = ids[0];
-                if ids.iter().all(|&id| id == first) {
-                    self.reg_values.insert(reg, first);
-                } else {
-                    let phi_id = self.func.new_value_id();
-                    let incoming: Vec<(BlockId, SsaValueId)> =
-                        preds.iter().map(|&p| (p, first)).collect();
-                    let phi = SsaInstruction {
-                        id: phi_id,
-                        op: SsaOp::Phi { incoming },
-                        source_addr: 0,
-                        block,
-                    };
-                    self.func.cfg.block_mut(block).phis.push(phi_id);
-                    self.func.values.push(phi);
-                    self.reg_values.insert(reg, phi_id);
-                    self.block_defs
-                        .entry(block)
-                        .or_default()
-                        .insert(reg, phi_id);
-                }
+        for (reg, pairs) in common {
+            if pairs.len() != preds.len() {
+                continue;
+            }
+            let first = pairs[0].1;
+            if pairs.iter().all(|&(_, id)| id == first) {
+                self.reg_values.insert(reg, first);
+            } else {
+                let phi_id = self.func.new_value_id();
+                let incoming: Vec<(BlockId, SsaValueId)> =
+                    pairs.iter().map(|&(p, id)| (p, id)).collect();
+                let phi = SsaInstruction {
+                    id: phi_id,
+                    op: SsaOp::Phi { incoming },
+                    source_addr: 0,
+                    block,
+                };
+                self.func.cfg.block_mut(block).phis.push(phi_id);
+                self.func.values.push(phi);
+                self.reg_values.insert(reg, phi_id);
+                self.block_defs
+                    .entry(block)
+                    .or_default()
+                    .insert(reg, phi_id);
             }
         }
     }
@@ -1454,11 +1472,12 @@ impl<'a> DexMethodLifter<'a> {
             }
             Insn::ConstMethodHandle { dst, idx } => {
                 let sig = self.ctx.dex.method_signature(*idx);
+                let mr = format_method_ref(&sig);
                 self.define(
                     *dst,
                     block,
                     SsaOp::Copy {
-                        src: Operand::Symbol(format!("{sig}::handle")),
+                        src: Operand::Symbol(mr),
                     },
                 );
             }
@@ -2087,6 +2106,19 @@ pub struct LiftOutput {
 pub fn lift_method_to_ssa(dex: &DexFile, code: &CodeItem, method_idx: u32) -> LiftOutput {
     let ctx = DexLiftContext::new(dex, code, method_idx);
     DexMethodLifter::new(ctx).lift()
+}
+
+pub fn format_method_ref(sig: &str) -> String {
+    let Some((class, rest)) = sig.split_once("->") else {
+        return sig.to_string();
+    };
+    let method = rest.split('(').next().unwrap_or(rest);
+    let class_short = crate::types::simple_name(&crate::types::java_type(class));
+    if method.is_empty() {
+        sig.to_string()
+    } else {
+        format!("{class_short}::{method}")
+    }
 }
 
 fn invoke_target(kind: InvokeKind, sig: &str) -> String {

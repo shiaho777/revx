@@ -277,6 +277,15 @@ impl<'a> RenderCtx<'a> {
                     )
                 } else if t == "__exception" {
                     "// exception handler".to_string()
+                } else if let Some(rest) = t.strip_prefix("@lcs:") {
+                    let (iface, impl_sig) = rest.split_once(':').unwrap_or((rest, ""));
+                    let mr = crate::lift::format_method_ref(impl_sig);
+                    let name = self.name_of(id);
+                    if arg_texts.is_empty() {
+                        format!("{name} = ({iface}) {mr};")
+                    } else {
+                        format!("{name} = ({iface}) ({}) -> {mr};", arg_texts.join(", "))
+                    }
                 } else if t.starts_with("@cs:") {
                     let cs = t.strip_prefix("@cs:").unwrap_or("");
                     let name = self.name_of(id);
@@ -636,7 +645,8 @@ pub struct MethodPseudocode {
 pub fn decompile_method(dex: &DexFile, code: &CodeItem, method_idx: u32) -> MethodPseudocode {
     let output = lift_method_to_ssa(dex, code, method_idx);
     let sig = dex.method_signature(method_idx);
-    let text = render_method_pseudocode_full(&output);
+    let try_info = build_try_info(dex, &code.tries);
+    let text = render_method_pseudocode_full(&output, &try_info);
     MethodPseudocode {
         signature: sig,
         pseudocode: text,
@@ -645,14 +655,1492 @@ pub fn decompile_method(dex: &DexFile, code: &CodeItem, method_idx: u32) -> Meth
     }
 }
 
-pub fn render_method_pseudocode_full(output: &crate::lift::LiftOutput) -> String {
+fn apply_string_concat_fold(text: &str) -> String {
+    let mut out_lines: Vec<String> = Vec::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.contains(".append(")
+            && trimmed.contains(".toString()")
+            && let Some(folded) = fold_concat_line(trimmed)
+        {
+            let indent = line.len() - line.trim_start().len();
+            out_lines.push(format!("{}{}", " ".repeat(indent), folded));
+            continue;
+        }
+        out_lines.push(line.to_string());
+    }
+    out_lines.join("\n")
+}
+
+fn fold_concat_line(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    let (prefix, chain) = if let Some(rest) = trimmed.strip_prefix("return ") {
+        let after_semi = rest.trim().strip_suffix(';').unwrap_or(rest.trim());
+        let inner = after_semi
+            .strip_suffix(')')
+            .and_then(|r| r.strip_suffix(".toString()"))
+            .or_else(|| after_semi.strip_suffix(".toString()"))
+            .unwrap_or(after_semi)
+            .trim();
+        ("return ".to_string(), inner.to_string())
+    } else if let Some((p, rest)) = trimmed.split_once(" = ") {
+        if p.contains('"') {
+            return None;
+        }
+        let inner = rest
+            .trim()
+            .strip_suffix(';')
+            .and_then(|r| r.strip_suffix(".toString()"))
+            .unwrap_or(rest.trim())
+            .trim();
+        (format!("{p} = "), inner.to_string())
+    } else {
+        return None;
+    };
+    if !chain.contains(".append(") {
+        return None;
+    }
+    let parts = split_append_args(&chain);
+    if parts.len() >= 2 {
+        Some(format!("{prefix}{};", parts.join(" + ")))
+    } else {
+        None
+    }
+}
+
+fn split_append_args(chain: &str) -> Vec<String> {
+    let segments: Vec<&str> = chain.split(".append(").collect();
+    if segments.len() < 2 {
+        return vec![];
+    }
+    let mut args: Vec<String> = Vec::new();
+    for seg in &segments[1..] {
+        let arg = balanced_prefix(seg);
+        let arg = arg.trim();
+        let arg = arg
+            .strip_prefix('(')
+            .and_then(|a| a.strip_suffix(')'))
+            .unwrap_or(arg);
+        if !arg.is_empty() {
+            args.push(arg.trim().to_string());
+        }
+    }
+    args
+}
+
+fn balanced_prefix(s: &str) -> &str {
+    let bytes = s.as_bytes();
+    let mut depth = 0i32;
+    let mut in_string = false;
+    let mut end = s.len();
+    for (i, &b) in bytes.iter().enumerate() {
+        if b == b'"' && (i == 0 || bytes[i - 1] != b'\\') {
+            in_string = !in_string;
+        }
+        if in_string {
+            continue;
+        }
+        if b == b'(' {
+            depth += 1;
+        } else if b == b')' {
+            if depth == 0 {
+                end = i;
+                break;
+            }
+            depth -= 1;
+            if depth == 0 {
+                end = i + 1;
+                break;
+            }
+        }
+    }
+    &s[..end.min(s.len())]
+}
+
+fn apply_for_loop_recovery(text: &str) -> String {
+    let mut lines: Vec<String> = text.lines().map(|l| l.to_string()).collect();
+    let mut i = 0usize;
+    while i < lines.len() {
+        let trimmed = lines[i].trim().to_string();
+        let Some(cond) = trimmed
+            .strip_prefix("while (")
+            .and_then(|r| r.strip_suffix(") {"))
+        else {
+            i += 1;
+            continue;
+        };
+        let Some(var) = loop_var(cond) else {
+            i += 1;
+            continue;
+        };
+        // find init: previous non-empty line is TYPE VAR = INIT;
+        let init_line = if i > 0 {
+            lines[i - 1].trim().to_string()
+        } else {
+            String::new()
+        };
+        let Some(init_info) = parse_init(&init_line, &var) else {
+            i += 1;
+            continue;
+        };
+        // find matching close brace and check last body line for increment
+        let open_indent = lines[i].len() - lines[i].trim_start().len();
+        let mut j = i + 1;
+        let mut depth = 1usize;
+        while j < lines.len() && depth > 0 {
+            let t = lines[j].trim();
+            depth += t.matches('{').count();
+            depth = depth.saturating_sub(t.matches('}').count());
+            if depth == 0 {
+                break;
+            }
+            j += 1;
+        }
+        if j >= lines.len() {
+            i += 1;
+            continue;
+        }
+        // last non-empty line inside the loop
+        let mut last_body = j;
+        while last_body > i + 1 && lines[last_body - 1].trim().is_empty() {
+            last_body -= 1;
+        }
+        last_body -= 1;
+        let inc_line = lines[last_body].trim().to_string();
+        let Some(inc_text) = parse_increment(&inc_line, &var) else {
+            i += 1;
+            continue;
+        };
+        // transform: remove init line, rewrite while line, remove increment line
+        let indent = " ".repeat(open_indent);
+        lines[i] = format!(
+            "{indent}for ({} {} = {}; {}; {}) {{",
+            init_info.0, var, init_info.1, cond, inc_text
+        );
+        lines[last_body] = String::new();
+        lines[i - 1] = String::new();
+        i = j;
+    }
+    lines.join("\n")
+}
+
+fn loop_var(cond: &str) -> Option<String> {
+    for op in [" <= ", " >= ", " < ", " > ", " != ", " == "] {
+        if let Some(pos) = cond.find(op) {
+            let lhs = cond[..pos].trim();
+            if lhs.chars().all(|c| c.is_alphanumeric() || c == '_') && !lhs.is_empty() {
+                return Some(lhs.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn parse_init(line: &str, var: &str) -> Option<(String, String)> {
+    let (decl, init) = line.strip_suffix(';').and_then(|l| l.split_once(" = "))?;
+    let init = init.trim();
+    let name = decl.split_whitespace().last()?;
+    if name != var {
+        return None;
+    }
+    let ty = decl.split_whitespace().next()?;
+    if ty == name {
+        return None;
+    }
+    Some((ty.to_string(), init.to_string()))
+}
+
+fn parse_increment(line: &str, var: &str) -> Option<String> {
+    let line = line.strip_suffix(';').unwrap_or(line);
+    let Some((lhs, rhs)) = line.split_once(" = ") else {
+        if line == format!("{var}++") || line == format!("++{var}") {
+            return Some(format!("{var}++"));
+        }
+        return None;
+    };
+    if lhs.trim() != var {
+        return None;
+    }
+    let rhs = rhs.trim();
+    for op in [" + ", " - "] {
+        if let Some(pos) = rhs.find(op) {
+            let base = rhs[..pos].trim();
+            let step = rhs[pos + op.len()..].trim();
+            if base == var && step.parse::<i64>().is_ok() {
+                let n: i64 = step.parse().ok()?;
+                let sign = if op == " + " { "+" } else { "-" };
+                let mag = n.unsigned_abs();
+                if sign == "+" && mag == 1 {
+                    return Some(format!("{var}++"));
+                }
+                if sign == "-" && mag == 1 {
+                    return Some(format!("{var}--"));
+                }
+                return Some(format!("{var} {sign}= {mag}"));
+            }
+        }
+    }
+    None
+}
+
+fn apply_boxing_cleanup(text: &str) -> String {
+    let mut out: Vec<String> = Vec::new();
+    for line in text.lines() {
+        let mut l = line.to_string();
+        // Simple iterative replacement: String.valueOf(X) → X for simple X
+        while let Some(start) = l.find("String.valueOf(") {
+            let after = &l[start + 15..];
+            if let Some(close) = after.find(')') {
+                let inner = &after[..close];
+                if inner
+                    .chars()
+                    .all(|c| c.is_alphanumeric() || c == '_' || c == '.' || c == '$' || c == '"')
+                    && !inner.is_empty()
+                {
+                    l = format!("{}{}{}", &l[..start], inner, &l[start + 15 + close + 1..]);
+                } else {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+        l = l.replace("(java.lang.Object) ", "");
+        out.push(l);
+    }
+    out.join("\n")
+}
+
+#[allow(clippy::mut_range_bound)]
+fn apply_loop_recovery(text: &str) -> String {
+    let mut lines: Vec<String> = text.lines().map(|l| l.to_string()).collect();
+    // Build label -> line index map
+    let mut labels: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for (i, line) in lines.iter().enumerate() {
+        let t = line.trim();
+        if t.len() > 2 && t.starts_with('L') && t.ends_with(':') {
+            labels.insert(t[..t.len() - 1].to_string(), i);
+        }
+    }
+    if labels.is_empty() {
+        return lines.join("\n");
+    }
+    // Find backward gotos: "goto L{N};" where L{N} label appears earlier
+    let mut i = 0usize;
+    while i < lines.len() {
+        let t = lines[i].trim().to_string();
+        let Some(goto_target) = t
+            .strip_prefix("goto ")
+            .and_then(|r| r.strip_suffix(';'))
+            .map(|s| s.to_string())
+        else {
+            i += 1;
+            continue;
+        };
+        let Some(&label_line) = labels.get(&goto_target) else {
+            i += 1;
+            continue;
+        };
+        if label_line >= i {
+            i += 1;
+            continue;
+        }
+        // Backward goto found. Check if the label line is followed by an if/while
+        let mut if_line = label_line + 1;
+        while if_line < lines.len() && lines[if_line].trim().is_empty() {
+            if_line += 1;
+        }
+        if if_line >= lines.len() || !lines[if_line].trim().starts_with("if (") {
+            i += 1;
+            continue;
+        }
+        // Strict shape check: the if's then-block must close with a plain `}`
+        // (no else), the backward goto must be inside that block, and no other
+        // goto may target the label (it is about to be deleted).
+        let net = |l: &str| -> i32 {
+            let t = l.trim();
+            let mut d = 0i32;
+            if t.ends_with('{') {
+                d += 1;
+            }
+            if t.starts_with('}') {
+                d -= 1;
+            }
+            d
+        };
+        let mut depth = net(&lines[if_line]);
+        let mut close_line = None;
+        for (j, line) in lines.iter().enumerate().skip(if_line + 1) {
+            depth += net(line);
+            if depth <= 0 {
+                close_line = Some(j);
+                break;
+            }
+        }
+        let Some(close_line) = close_line else {
+            i += 1;
+            continue;
+        };
+        if !(if_line < i && i < close_line) {
+            i += 1;
+            continue;
+        }
+        let close_t = lines[close_line].trim();
+        if close_t.starts_with("} else") || close_t.starts_with("else") {
+            i += 1;
+            continue;
+        }
+        let mut after = close_line + 1;
+        while after < lines.len() && lines[after].trim().is_empty() {
+            after += 1;
+        }
+        if after < lines.len() && lines[after].trim().starts_with("else") {
+            i += 1;
+            continue;
+        }
+        let goto_stmt = format!("goto {goto_target};");
+        let outside = lines
+            .iter()
+            .enumerate()
+            .any(|(j, l)| l.trim() == goto_stmt && j != i && (j <= if_line || j >= close_line));
+        if outside {
+            i += 1;
+            continue;
+        }
+        // Convert: label → remove, if → while (with proper condition), goto → remove
+        let indent = lines[if_line].len() - lines[if_line].trim_start().len();
+        let cond = lines[if_line]
+            .trim()
+            .strip_prefix("if (")
+            .and_then(|r| r.strip_suffix(") {"))
+            .unwrap_or("")
+            .to_string();
+        // If the condition is a negation (from empty-then inversion), unwrap it for while
+        let while_cond =
+            if let Some(inner) = cond.strip_prefix("!(").and_then(|s| s.strip_suffix(')')) {
+                inner.to_string()
+            } else {
+                cond.clone()
+            };
+        lines[if_line] = format!("{}while ({while_cond}) {{", " ".repeat(indent));
+        lines[label_line] = String::new();
+        lines[i] = String::new();
+        // Remove any remaining goto to the same label within the while body
+        for line_ref in lines.iter_mut().take(close_line).skip(if_line + 1) {
+            if line_ref.trim() == format!("goto {goto_target};") {
+                *line_ref = String::new();
+            }
+        }
+        i += 1;
+    }
+    lines.join("\n")
+}
+
+fn apply_loop_wrap(text: &str) -> String {
+    let mut lines: Vec<String> = text.lines().map(|l| l.to_string()).collect();
+    let indent_of = |l: &str| l.len() - l.trim_start().len();
+    for _round in 0..64 {
+        let mut labels: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for (i, line) in lines.iter().enumerate() {
+            let t = line.trim();
+            if t.len() > 2 && t.starts_with('L') && t.ends_with(':') {
+                labels.insert(t[..t.len() - 1].to_string(), i);
+            }
+        }
+        let mut fired = false;
+        for i in 0..lines.len() {
+            let t = lines[i].trim();
+            let Some(target) = t.strip_prefix("goto ").and_then(|r| r.strip_suffix(';')) else {
+                continue;
+            };
+            let Some(&ll) = labels.get(target) else {
+                continue;
+            };
+            if ll >= i {
+                continue;
+            }
+            let d = indent_of(&lines[ll]);
+            if indent_of(&lines[i]) != d {
+                continue;
+            }
+            let mut depth = 0i32;
+            let mut ok = true;
+            for line in lines.iter().take(i).skip(ll + 1) {
+                let t2 = line.trim();
+                if t2.is_empty() {
+                    continue;
+                }
+                if indent_of(line) < d {
+                    ok = false;
+                    break;
+                }
+                if t2.ends_with('{') {
+                    depth += 1;
+                }
+                if t2.starts_with('}') {
+                    depth -= 1;
+                }
+                if depth < 0 {
+                    ok = false;
+                    break;
+                }
+            }
+            if !ok || depth != 0 {
+                continue;
+            }
+            let pad = " ".repeat(d);
+            let inner = " ".repeat(d + 4);
+            let goto_stmt = format!("goto {target};");
+            let residual = lines
+                .iter()
+                .enumerate()
+                .any(|(k, l)| k != i && l.trim() == goto_stmt);
+            let mut out: Vec<String> = Vec::with_capacity(lines.len() + 2);
+            out.extend_from_slice(&lines[..ll]);
+            out.push(format!("{pad}while (true) {{"));
+            if residual {
+                out.push(format!("{inner}{target}:"));
+            }
+            for line in lines.iter().take(i).skip(ll + 1) {
+                if line.trim().is_empty() {
+                    out.push(String::new());
+                } else {
+                    out.push(format!("    {line}"));
+                }
+            }
+            out.push(format!("{pad}}}"));
+            out.extend_from_slice(&lines[i + 1..]);
+            lines = out;
+            fired = true;
+            break;
+        }
+        if !fired {
+            break;
+        }
+    }
+    lines.join("\n")
+}
+
+fn apply_unused_label_cleanup(text: &str) -> String {
+    let lines: Vec<String> = text.lines().map(|l| l.to_string()).collect();
+    let mut targets: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for l in &lines {
+        let t = l.trim();
+        if let Some(target) = t.strip_prefix("goto ").and_then(|r| r.strip_suffix(';')) {
+            targets.insert(target.to_string());
+        }
+    }
+    let out: Vec<String> = lines
+        .into_iter()
+        .map(|l| {
+            let t = l.trim();
+            if t.len() > 2
+                && t.starts_with('L')
+                && t.ends_with(':')
+                && !targets.contains(&t[..t.len() - 1])
+            {
+                String::new()
+            } else {
+                l
+            }
+        })
+        .collect();
+    out.join("\n")
+}
+
+fn apply_control_kind_repair(text: &str) -> String {
+    let lines: Vec<String> = text.lines().map(|l| l.to_string()).collect();
+    let opener_kind = |s: &str| -> &str {
+        for (kw, kind) in [
+            ("if ", "if"),
+            ("while ", "while"),
+            ("for ", "for"),
+            ("switch ", "switch"),
+            ("try", "try"),
+            ("synchronized ", "synchronized"),
+            ("do", "do"),
+        ] {
+            if s.starts_with(kw) {
+                return kind;
+            }
+        }
+        "block"
+    };
+    let mut stack: Vec<String> = Vec::new();
+    let mut inserts: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    for (i, l) in lines.iter().enumerate() {
+        let t = l.trim();
+        if t.is_empty() || t.starts_with("//") {
+            continue;
+        }
+        let closes = t.chars().take_while(|&c| c == '}').count();
+        let rest = t[closes..].trim_start();
+        let is_else = rest.starts_with("else");
+        if is_else && closes > 0 {
+            let mut k = 0;
+            while let Some(top) = stack.last() {
+                if top == "if" {
+                    break;
+                }
+                k += 1;
+                stack.pop();
+            }
+            if k > 0 {
+                inserts.insert(i, k);
+            }
+        }
+        for _ in 0..closes {
+            stack.pop();
+        }
+        if t.ends_with('{') {
+            let kind = if is_else {
+                "if"
+            } else if rest.starts_with("catch") {
+                "catch"
+            } else {
+                opener_kind(rest)
+            };
+            stack.push(kind.to_string());
+        }
+    }
+    if inserts.is_empty() {
+        return lines.join("\n");
+    }
+    let mut out: Vec<String> = Vec::with_capacity(lines.len() + inserts.len());
+    for (i, l) in lines.iter().enumerate() {
+        if let Some(&k) = inserts.get(&i) {
+            let indent = " ".repeat(l.len() - l.trim_start().len());
+            for _ in 0..k {
+                out.push(format!("{indent}}}"));
+            }
+        }
+        out.push(l.clone());
+    }
+    out.join("\n")
+}
+
+fn apply_condition_paren_repair(text: &str) -> String {
+    let out: Vec<String> = text
+        .lines()
+        .map(|l| {
+            let t = l.trim();
+            let Some((kw, rest)) = ["if ", "while ", "for ", "switch ", "synchronized "]
+                .iter()
+                .find_map(|kw| t.strip_prefix(kw).map(|r| (*kw, r)))
+            else {
+                return l.to_string();
+            };
+            if !rest.ends_with(") {") || !rest.starts_with('(') || rest.len() < 5 {
+                return l.to_string();
+            }
+            let cond = &rest[1..rest.len() - 3];
+            let mut depth = 0i32;
+            let mut repaired = String::with_capacity(cond.len());
+            let mut in_str = false;
+            let mut esc = false;
+            for c in cond.chars() {
+                if in_str {
+                    repaired.push(c);
+                    if esc {
+                        esc = false;
+                    } else if c == '\\' {
+                        esc = true;
+                    } else if c == '"' {
+                        in_str = false;
+                    }
+                    continue;
+                }
+                match c {
+                    '"' => {
+                        in_str = true;
+                        repaired.push(c);
+                    }
+                    '(' => {
+                        depth += 1;
+                        repaired.push(c);
+                    }
+                    ')' => {
+                        if depth == 0 {
+                            continue;
+                        }
+                        depth -= 1;
+                        repaired.push(c);
+                    }
+                    _ => repaired.push(c),
+                }
+            }
+            for _ in 0..depth {
+                repaired.push(')');
+            }
+            if repaired == cond {
+                return l.to_string();
+            }
+            let indent = " ".repeat(l.len() - l.trim_start().len());
+            format!("{indent}{kw}({repaired}) {{")
+        })
+        .collect();
+    out.join("\n")
+}
+
+fn apply_brace_repair(text: &str) -> String {
+    let lines: Vec<String> = text.lines().map(|l| l.to_string()).collect();
+    let lead_closes = |t: &str| t.chars().take_while(|&c| c == '}').count() as i32;
+    let mut keep = vec![true; lines.len()];
+    let mut depth = 0i32;
+    for (i, l) in lines.iter().enumerate() {
+        let t = l.trim();
+        if t.is_empty() || t.starts_with("//") {
+            continue;
+        }
+        let c = lead_closes(t);
+        let o = i32::from(t.ends_with('{'));
+        let mut unmatched = false;
+        for _ in 0..c {
+            if depth == 0 {
+                unmatched = true;
+                break;
+            }
+            depth -= 1;
+        }
+        if unmatched {
+            keep[i] = false;
+        } else {
+            depth += o;
+        }
+    }
+    let mut depth2 = 0i32;
+    for i in (0..lines.len()).rev() {
+        if !keep[i] {
+            continue;
+        }
+        let t = lines[i].trim();
+        if t.is_empty() || t.starts_with("//") {
+            continue;
+        }
+        depth2 += lead_closes(t);
+        if t.ends_with('{') {
+            if depth2 == 0 {
+                keep[i] = false;
+            } else {
+                depth2 -= 1;
+            }
+        }
+    }
+    lines
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| keep[*i])
+        .map(|(_, l)| l.clone())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn apply_reindent(text: &str) -> String {
+    let mut out: Vec<String> = Vec::new();
+    let mut depth = 1i32;
+    let mut prev_blank = false;
+    for l in text.lines() {
+        let t = l.trim();
+        if t.is_empty() {
+            if !prev_blank && !out.is_empty() {
+                out.push(String::new());
+                prev_blank = true;
+            }
+            continue;
+        }
+        prev_blank = false;
+        let closes = t.chars().take_while(|&c| c == '}').count() as i32;
+        depth = (depth - closes).max(0);
+        out.push(format!("{}{}", "    ".repeat(depth as usize), t));
+        if t.ends_with('{') {
+            depth += 1;
+        }
+    }
+    while out.last().is_some_and(|l| l.is_empty()) {
+        out.pop();
+    }
+    out.join("\n")
+}
+
+fn apply_small_block_inline(text: &str) -> String {
+    let mut lines: Vec<String> = text.lines().map(|l| l.to_string()).collect();
+    let mut label_pos: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for (idx, line) in lines.iter().enumerate() {
+        let t = line.trim();
+        if t.len() > 2 && t.starts_with('L') && t.ends_with(':') {
+            label_pos.insert(t[1..t.len() - 1].to_string(), idx);
+        }
+    }
+    let mut inlined_labels: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut i = 0usize;
+    while i < lines.len() {
+        let t = lines[i].trim().to_string();
+        let Some(target) = t.strip_prefix("goto L").and_then(|r| r.strip_suffix(';')) else {
+            i += 1;
+            continue;
+        };
+        let Some(&lpos) = label_pos.get(target) else {
+            i += 1;
+            continue;
+        };
+        if inlined_labels.contains(target) {
+            i += 1;
+            continue;
+        }
+        // Collect flat statements after the label until terminal or control structure
+        let goto_indent = lines[i].len() - lines[i].trim_start().len();
+        let mut stmts: Vec<String> = Vec::new();
+        let mut terminal: Option<String> = None;
+        let mut ok = true;
+        let mut j = lpos + 1;
+        while j < lines.len() {
+            let lj = lines[j].trim().to_string();
+            if lj.is_empty() {
+                j += 1;
+                continue;
+            }
+            // Stop at next label
+            if lj.starts_with('L') && lj.ends_with(':') {
+                break;
+            }
+            // Stop at control structures (too complex to inline)
+            if lj.starts_with("if ")
+                || lj.starts_with("while ")
+                || lj.starts_with("switch ")
+                || lj.starts_with("for ")
+                || lj == "}"
+                || lj == "} else {"
+            {
+                ok = false;
+                break;
+            }
+            if lj.starts_with("return") || lj.starts_with("throw") {
+                terminal = Some(lj.clone());
+                break;
+            }
+            stmts.push(lj.clone());
+            if stmts.len() > 3 {
+                ok = false;
+                break;
+            }
+            j += 1;
+        }
+        if !ok || terminal.is_none() {
+            i += 1;
+            continue;
+        }
+        // Inline: replace goto with statements + terminal at goto's indent
+        let indent = " ".repeat(goto_indent);
+        let mut replacement: Vec<String> = stmts.iter().map(|s| format!("{indent}{s}")).collect();
+        replacement.push(format!("{indent}{}", terminal.unwrap()));
+        lines[i] = replacement.join("\n");
+        inlined_labels.insert(target.to_string());
+        i += 1;
+    }
+    // Remove labels that no longer have any goto references
+    let text = lines.join("\n");
+    let mut out: Vec<String> = Vec::new();
+    for line in text.lines() {
+        let t = line.trim();
+        if t.len() > 2 && t.starts_with('L') && t.ends_with(':') {
+            let label_num = &t[1..t.len() - 1];
+            if inlined_labels.contains(label_num) && !text.contains(&format!("goto {t}")) {
+                continue;
+            }
+        }
+        out.push(line.to_string());
+    }
+    out.join("\n")
+}
+
+fn apply_switch_break(text: &str) -> String {
+    let mut lines: Vec<String> = text.lines().map(|l| l.to_string()).collect();
+    let mut i = 0usize;
+    while i < lines.len() {
+        let t = lines[i].trim().to_string();
+        let Some(_target) = t.strip_prefix("goto L").and_then(|r| r.strip_suffix(';')) else {
+            i += 1;
+            continue;
+        };
+        // Next non-empty line must be a case boundary: "}", "case ", or "default:"
+        let mut j = i + 1;
+        while j < lines.len() && lines[j].trim().is_empty() {
+            j += 1;
+        }
+        if j >= lines.len() {
+            i += 1;
+            continue;
+        }
+        let next = lines[j].trim();
+        if !(next == "}" || next.starts_with("case ") || next.starts_with("default:")) {
+            i += 1;
+            continue;
+        }
+        // Look back for the enclosing switch (track brace depth for nested blocks)
+        let mut depth = 0i32;
+        let mut in_switch = false;
+        for k in (0..i).rev() {
+            let lt = lines[k].trim();
+            depth += lt.matches('}').count() as i32;
+            depth -= lt.matches('{').count() as i32;
+            if depth < 0 {
+                // We've exited the enclosing block
+                if lt.starts_with("switch (") {
+                    in_switch = true;
+                }
+                break;
+            }
+            if lt.starts_with("case ") || lt.starts_with("default:") {
+                in_switch = true;
+                break;
+            }
+        }
+        if in_switch {
+            let indent = lines[i].len() - lines[i].trim_start().len();
+            lines[i] = format!("{}break;", " ".repeat(indent));
+        }
+        i += 1;
+    }
+    lines.join("\n")
+}
+
+fn apply_dead_assign(text: &str) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut out: Vec<String> = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        let t = line.trim();
+        // Check for assignments to vN variables
+        let Some((lhs, _)) = t.strip_suffix(';').and_then(|l| l.split_once(" = ")) else {
+            out.push(line.to_string());
+            continue;
+        };
+        let var = lhs.split_whitespace().last().unwrap_or(lhs).trim();
+        if !(var.starts_with('v') && var[1..].chars().all(|c| c.is_ascii_digit())) {
+            out.push(line.to_string());
+            continue;
+        }
+        // Check if var appears in any subsequent line (within 100 lines)
+        let mut used = false;
+        for line_ref in lines.iter().take(lines.len().min(i + 100)).skip(i + 1) {
+            if contains_token(line_ref, var) {
+                used = true;
+                break;
+            }
+        }
+        if !used {
+            // Also check if var is used in the same line (after =)
+            // (already excluded by the split)
+            continue;
+        }
+        out.push(line.to_string());
+    }
+    out.join("\n")
+}
+
+fn apply_empty_then_inversion(text: &str) -> String {
+    let mut lines: Vec<String> = text.lines().map(|l| l.to_string()).collect();
+    let mut i = 0usize;
+    while i < lines.len() {
+        let t = lines[i].trim().to_string();
+        let Some(cond) = t
+            .strip_prefix("if (")
+            .and_then(|r| r.strip_suffix(") {"))
+            .map(|c| c.to_string())
+        else {
+            i += 1;
+            continue;
+        };
+        // Next non-empty line must be "}" or "} else {" (empty then arm)
+        let mut j = i + 1;
+        while j < lines.len() && lines[j].trim().is_empty() {
+            j += 1;
+        }
+        if j >= lines.len() {
+            i += 1;
+            continue;
+        }
+        let next_t = lines[j].trim();
+        let (close_line, else_line) = if next_t == "} else {" {
+            // Combined "} else {" on one line
+            (j, j)
+        } else if next_t == "}" {
+            // Separate "}" then "else {"
+            let mut k = j + 1;
+            while k < lines.len() && lines[k].trim().is_empty() {
+                k += 1;
+            }
+            if k >= lines.len() || lines[k].trim() != "else {" {
+                i += 1;
+                continue;
+            }
+            (j, k)
+        } else {
+            i += 1;
+            continue;
+        };
+        // Invert: replace if-line, remove } and else {
+        let indent = lines[i].len() - lines[i].trim_start().len();
+        let negated = negate_condition_text(&cond);
+        lines[i] = format!("{}if ({negated}) {{", " ".repeat(indent));
+        if close_line == else_line {
+            lines[close_line] = String::new();
+        } else {
+            lines[close_line] = String::new();
+            lines[else_line] = String::new();
+        }
+        i = else_line + 1;
+    }
+    lines.join("\n")
+}
+
+fn negate_condition_text(cond: &str) -> String {
+    let c = cond.trim();
+    if let Some(inner) = c.strip_prefix("!(").and_then(|s| s.strip_suffix(')')) {
+        return inner.to_string();
+    }
+    for (op, neg) in [
+        (" == 0", " != 0"),
+        (" != 0", " == 0"),
+        (" == null", " != null"),
+        (" != null", " == null"),
+    ] {
+        if c.ends_with(op) {
+            let base = c.strip_suffix(op).unwrap_or(c);
+            return format!("{base}{neg}");
+        }
+    }
+    for (op, neg) in [
+        (" == ", " != "),
+        (" != ", " == "),
+        (" < ", " >= "),
+        (" >= ", " < "),
+        (" > ", " <= "),
+        (" <= ", " > "),
+    ] {
+        if let Some(pos) = c.rfind(op) {
+            let lhs = &c[..pos];
+            let rhs = &c[pos + op.len()..];
+            return format!("{lhs}{neg}{rhs}");
+        }
+    }
+    format!("!({c})")
+}
+
+fn apply_boolean_condition_simplify(text: &str) -> String {
+    let mut out: Vec<String> = Vec::new();
+    for line in text.lines() {
+        out.push(simplify_condition_line(line));
+    }
+    out.join("\n")
+}
+
+fn simplify_condition_line(line: &str) -> String {
+    let trimmed = line.trim();
+    if !trimmed.starts_with("if (") && !trimmed.starts_with("while (") {
+        return line.to_string();
+    }
+    // Extract the condition: everything between the first ( and the last ) before {
+    let open = match line.find('(') {
+        Some(p) => p,
+        None => return line.to_string(),
+    };
+    let close = match line.rfind(") {") {
+        Some(p) => p,
+        None => return line.to_string(),
+    };
+    if close <= open {
+        return line.to_string();
+    }
+    let cond = &line[open + 1..close];
+    let indent = line.len() - line.trim_start().len();
+    let prefix = &line[..open];
+    let _suffix = &line[close + 2..];
+
+    if let Some(expr) = cond.strip_suffix(" == 0") {
+        let expr = expr.trim();
+        let expr = strip_outer_parens_pair(expr);
+        if is_boolean_call(expr) {
+            return format!(
+                "{}{} (!({})) {{",
+                " ".repeat(indent),
+                prefix.trim_end(),
+                expr
+            );
+        }
+        return line.to_string();
+    }
+    if let Some(expr) = cond.strip_suffix(" != 0") {
+        let expr = expr.trim();
+        let expr = strip_outer_parens_pair(expr);
+        if is_boolean_call(expr) {
+            return format!("{}{} ({}) {{", " ".repeat(indent), prefix.trim_end(), expr);
+        }
+        return line.to_string();
+    }
+    line.to_string()
+}
+
+fn is_boolean_call(expr: &str) -> bool {
+    if !expr.contains('(') || !expr.contains(')') {
+        return false;
+    }
+    !expr.contains(" & ") && !expr.contains(" | ") && !expr.contains(" ^ ")
+}
+
+fn strip_outer_parens_pair(s: &str) -> &str {
+    s.strip_prefix('(')
+        .and_then(|inner| inner.strip_suffix(')'))
+        .unwrap_or(s)
+}
+
+fn extract_field_name(rhs: &str) -> Option<String> {
+    // vN = this.fieldName; or vN = obj.fieldName;
+    let r = rhs.trim().strip_suffix(';').unwrap_or(rhs.trim());
+    let dot_pos = r.rfind('.')?;
+    let field = &r[dot_pos + 1..];
+    if field.is_empty() || field.contains('(') || field.contains(' ') {
+        return None;
+    }
+    if !field
+        .chars()
+        .all(|c| c.is_alphanumeric() || c == '_' || c == '$')
+    {
+        return None;
+    }
+    // Only if the receiver is `this` or a simple identifier
+    let recv = &r[..dot_pos];
+    if recv.contains('(') || recv.contains('[') {
+        return None;
+    }
+    Some(camel_case(field))
+}
+
+fn extract_getter_name(rhs: &str) -> Option<String> {
+    let r = rhs.trim().strip_suffix(';').unwrap_or(rhs.trim());
+    let paren = r.find('(')?;
+    if !r[paren..].ends_with("()") {
+        return None;
+    }
+    let method_part = &r[..paren];
+    let dot = method_part.rfind('.')?;
+    let method = &method_part[dot + 1..];
+    let rest = method
+        .strip_prefix("get")
+        .or_else(|| method.strip_prefix("is"))?;
+    if rest.len() <= 1 || !rest.chars().next().is_some_and(|c| c.is_uppercase()) {
+        return None;
+    }
+    let mut chars = rest.chars();
+    let first = chars.next()?.to_lowercase().next()?;
+    let name = format!("{first}{}", chars.as_str());
+    if name.is_empty() {
+        return None;
+    }
+    Some(name)
+}
+
+fn apply_semantic_names(text: &str) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut name_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut type_counts: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    for line in &lines {
+        let t = line.trim();
+        let Some((lhs, rhs)) = t.strip_suffix(';').and_then(|l| l.split_once(" = ")) else {
+            continue;
+        };
+        let var = lhs.split_whitespace().last().unwrap_or(lhs).trim();
+        if !(var.starts_with('v') && var[1..].chars().all(|c| c.is_ascii_digit())) {
+            continue;
+        }
+        let rhs_t = rhs.trim();
+        let semantic = if let Some(t) = rhs_t
+            .strip_prefix('(')
+            .and_then(|r| r.split_once(')'))
+            .map(|(t, _)| t.to_string())
+            .filter(|t| looks_like_java_type(t))
+        {
+            let short = t.rsplit('.').next().unwrap_or(&t);
+            camel_case(short)
+        } else if rhs_t.ends_with(".iterator()") {
+            "it".to_string()
+        } else if rhs_t.ends_with(".size()") || rhs_t.ends_with(".length()") {
+            "size".to_string()
+        } else if rhs_t.ends_with(".toString()") {
+            "str".to_string()
+        } else if let Some(ty) = rhs_t.strip_prefix("new ") {
+            let ty_name = ty.split('(').next().unwrap_or(ty).trim();
+            let short = ty_name.rsplit('.').next().unwrap_or(ty_name);
+            if short.is_empty() || !short.chars().next().is_some_and(|c| c.is_uppercase()) {
+                continue;
+            }
+            camel_case(short)
+        } else if let Some(field) = extract_field_name(rhs_t) {
+            field
+        } else if let Some(getter) = extract_getter_name(rhs_t) {
+            getter
+        } else {
+            continue;
+        };
+        let count = type_counts.entry(semantic.clone()).or_insert(0);
+        *count += 1;
+        let final_name = if *count == 1 {
+            semantic
+        } else {
+            format!("{semantic}{count}")
+        };
+        name_map.insert(var.to_string(), final_name);
+    }
+    if name_map.is_empty() {
+        return text.to_string();
+    }
+    let mut out: Vec<String> = Vec::new();
+    for line in &lines {
+        let mut l = line.to_string();
+        for (old, new) in &name_map {
+            l = replace_token(&l, old, new);
+        }
+        out.push(l);
+    }
+    out.join("\n")
+}
+
+fn looks_like_java_type(s: &str) -> bool {
+    if s.is_empty() || s.contains(' ') || s.contains('(') || s.contains(')') {
+        return false;
+    }
+    let first = s.chars().next().unwrap();
+    if !first.is_uppercase() {
+        return false;
+    }
+    s.chars()
+        .all(|c| c.is_alphanumeric() || c == '.' || c == '_' || c == '$')
+}
+
+fn camel_case(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut first = true;
+    for c in s.chars() {
+        if first {
+            out.extend(c.to_lowercase());
+            first = false;
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+fn apply_cast_paren_cleanup(text: &str) -> String {
+    let mut out = text.to_string();
+    // ((Type) (expr)) → (Type) expr
+    loop {
+        let before = out.clone();
+        if let Some(pos) = out.find("((")
+            && let Some(mid) = out[pos..].find(") (")
+        {
+            let inner_start = pos + 2;
+            let cast_end = pos + mid + 1;
+            let expr_start = cast_end + 2;
+            if let Some(close) = out[expr_start..].find(')') {
+                let expr_end = expr_start + close;
+                let cast_type = &out[inner_start..cast_end - 1];
+                let expr = &out[expr_start..expr_end];
+                let replacement = format!("({cast_type}) {expr}");
+                out = format!("{}{}{}", &out[..pos], replacement, &out[expr_end + 1..]);
+            }
+        }
+        if out == before {
+            break;
+        }
+    }
+    out
+}
+
+fn apply_enhanced_for(text: &str) -> String {
+    let mut lines: Vec<String> = text.lines().map(|l| l.to_string()).collect();
+    let mut i = 0usize;
+    while i < lines.len() {
+        let t = lines[i].trim().to_string();
+        let Some((lhs, rhs)) = t.strip_suffix(';').and_then(|l| l.split_once(" = ")) else {
+            i += 1;
+            continue;
+        };
+        let iter = lhs.split_whitespace().last().unwrap_or(lhs).trim();
+        let recv = rhs.trim();
+        let Some(coll) = recv.strip_suffix(".iterator()") else {
+            i += 1;
+            continue;
+        };
+        if iter.is_empty()
+            || coll.is_empty()
+            || !iter.chars().all(|c| c.is_alphanumeric() || c == '_')
+        {
+            i += 1;
+            continue;
+        }
+        let has_call = format!("{iter}.hasNext(");
+        let next_call = format!("{iter}.next(");
+        // Scan forward (up to 5 non-empty lines) for the hasNext check
+        let mut j = i + 1;
+        let mut non_empty = 0;
+        while j < lines.len() && non_empty < 5 {
+            if lines[j].trim().is_empty() {
+                j += 1;
+                continue;
+            }
+            non_empty += 1;
+            let w = lines[j].trim();
+            if !(w.contains(&has_call) && w.ends_with('{')) {
+                j += 1;
+                continue;
+            }
+            // Found hasNext — check if while or inverted if
+            let is_while = w.starts_with("while (");
+            let is_inverted = w.starts_with("if (");
+            if !is_while && !is_inverted {
+                j += 1;
+                continue;
+            }
+            let if_line = j;
+            if is_inverted {
+                let mut j2 = j + 1;
+                while j2 < lines.len() && lines[j2].trim().is_empty() {
+                    j2 += 1;
+                }
+                if j2 >= lines.len() || lines[j2].trim() != "} else {" {
+                    j = j2;
+                    continue;
+                }
+                j = j2;
+            }
+            // Scan forward for the .next() assignment
+            let mut k = j + 1;
+            let mut next_found = false;
+            let mut elem_type = String::new();
+            let mut elem_name = String::new();
+            while k < lines.len() && k < j + 10 {
+                let n = lines[k].trim();
+                if n.is_empty() {
+                    k += 1;
+                    continue;
+                }
+                if n == "}" {
+                    break;
+                }
+                if let Some((nlhs, nrhs)) = n.strip_suffix(';').and_then(|l| l.split_once(" = "))
+                    && nrhs.contains(&next_call)
+                {
+                    let decl = nlhs.trim();
+                    let name = decl.split_whitespace().last().unwrap_or(decl);
+                    if decl.contains(' ') {
+                        let (ty, _) = decl.rsplit_once(' ').unwrap();
+                        elem_type = ty.to_string();
+                    } else {
+                        let cast_type = nrhs
+                            .trim()
+                            .strip_prefix('(')
+                            .and_then(|r| r.split_once(')'))
+                            .map(|(t, _)| t.to_string());
+                        if let Some(ct) = cast_type {
+                            elem_type = ct;
+                        }
+                    }
+                    elem_name = name.to_string();
+                    next_found = true;
+                    break;
+                }
+                k += 1;
+            }
+            if !next_found || elem_type.is_empty() || elem_name.is_empty() {
+                break;
+            }
+            let elem_type = elem_type
+                .trim_start_matches('(')
+                .trim_end_matches(')')
+                .to_string();
+            let indent = lines[j].len() - lines[j].trim_start().len();
+            let coll_clean = coll
+                .strip_prefix('(')
+                .and_then(|c| c.strip_suffix(')'))
+                .unwrap_or(coll);
+            lines[j] = format!(
+                "{}for ({} {} : {}) {{",
+                " ".repeat(indent),
+                elem_type,
+                elem_name,
+                coll_clean
+            );
+            lines[i] = String::new();
+            lines[k] = String::new();
+            if is_inverted {
+                let orig_if = if_line;
+                if orig_if < lines.len() {
+                    lines[orig_if] = String::new();
+                }
+            }
+            // For inverted: remove the "} else {" line
+            if is_inverted {
+                let mut j3 = j;
+                while j3 > 0 && lines[j3].trim().is_empty() {
+                    j3 -= 1;
+                }
+            }
+            break;
+        }
+        i += 1;
+    }
+    lines.join("\n")
+}
+
+fn apply_arm_tail_goto_cleanup(text: &str) -> String {
+    let mut lines: Vec<String> = text.lines().map(|l| l.to_string()).collect();
+    // Build label positions to determine goto direction
+    let mut label_pos: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for (idx, line) in lines.iter().enumerate() {
+        let t = line.trim();
+        if t.len() > 2 && t.starts_with('L') && t.ends_with(':') {
+            label_pos.insert(t[1..t.len() - 1].to_string(), idx);
+        }
+    }
+    let mut i = 0usize;
+    while i < lines.len() {
+        let trimmed = lines[i].trim();
+        if let Some(target) = trimmed
+            .strip_prefix("goto L")
+            .and_then(|r| r.strip_suffix(';'))
+        {
+            // Only remove FORWARD gotos (target label appears after this line)
+            let is_forward = label_pos.get(target).is_some_and(|&pos| pos > i);
+            if is_forward {
+                let mut j = i + 1;
+                while j < lines.len() && lines[j].trim().is_empty() {
+                    j += 1;
+                }
+                if j < lines.len() {
+                    let next = lines[j].trim();
+                    if next == "}" || next == "} else {" {
+                        lines[i] = String::new();
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    lines.join("\n")
+}
+
+fn apply_dead_allocation_cleanup(text: &str) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut out = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.contains("= new StringBuilder()") {
+            let var = trimmed
+                .strip_suffix(";")
+                .and_then(|l| l.split_once(" = "))
+                .map(|(v, _)| v.trim())
+                .map(|v| v.split_whitespace().last().unwrap_or(v))
+                .unwrap_or("");
+            if !var.is_empty() {
+                let uses = lines
+                    .iter()
+                    .enumerate()
+                    .filter(|(j, l2)| *j != i && contains_token(l2, var))
+                    .count();
+                if uses == 0 {
+                    continue;
+                }
+            }
+        }
+        out.push(*line);
+    }
+    out.join("\n")
+}
+
+fn apply_latch_continue_cleanup(text: &str) -> String {
+    let mut lines: Vec<String> = text.lines().map(|l| l.to_string()).collect();
+    let mut i = 1usize;
+    while i < lines.len() {
+        if lines[i].trim() == "}" {
+            let mut j = i;
+            while j > 0 && lines[j - 1].trim().is_empty() {
+                j -= 1;
+            }
+            if j > 0 && lines[j - 1].trim() == "continue;" {
+                lines[j - 1] = String::new();
+            }
+        }
+        i += 1;
+    }
+    lines.join("\n")
+}
+
+pub struct TryInfo {
+    pub handler_types: HashMap<u32, Vec<String>>,
+    pub catch_all_addrs: Vec<u32>,
+    pub try_regions: Vec<(u32, u32)>,
+}
+
+pub fn build_try_info(dex: &DexFile, tries: &[crate::TryItem]) -> TryInfo {
+    let mut handler_types: HashMap<u32, Vec<String>> = HashMap::new();
+    let mut catch_all_addrs = Vec::new();
+    let mut try_regions = Vec::new();
+    for t in tries {
+        let region = (t.start_addr, t.start_addr + t.insn_count as u32);
+        if !try_regions.contains(&region) {
+            try_regions.push(region);
+        }
+        for h in &t.handlers {
+            let type_desc = dex
+                .types
+                .get(h.type_idx as usize)
+                .cloned()
+                .unwrap_or_default();
+            let jt = crate::types::java_type(&type_desc);
+            let entry = handler_types.entry(h.addr).or_default();
+            if !entry.contains(&jt) {
+                entry.push(jt);
+            }
+        }
+        if let Some(addr) = t.catch_all_addr
+            && !catch_all_addrs.contains(&addr)
+        {
+            catch_all_addrs.push(addr);
+        }
+    }
+    TryInfo {
+        handler_types,
+        catch_all_addrs,
+        try_regions,
+    }
+}
+
+pub fn render_method_pseudocode_full(
+    output: &crate::lift::LiftOutput,
+    try_info: &TryInfo,
+) -> String {
     let func = &output.func;
     let value_types = &output.value_types;
     let switch_cases = &output.switch_cases;
     let mut ctx = RenderCtx::new(func);
     ctx.value_types = value_types.clone();
 
-    let order = reverse_post_order(func);
+    let handler_types = &try_info.handler_types;
+    let catch_all_addrs = &try_info.catch_all_addrs;
+    let try_regions = &try_info.try_regions;
+
+    let mut order = reverse_post_order(func);
+    let reachable: std::collections::HashSet<BlockId> = order.iter().copied().collect();
+    let mut orphans: Vec<BlockId> = func
+        .cfg
+        .blocks
+        .iter()
+        .map(|b| b.id)
+        .filter(|id| !reachable.contains(id))
+        .collect();
+    orphans.sort_by_key(|id| func.cfg.blocks[id.0 as usize].start_addr);
+    order.extend(orphans);
     let mut block_renders: HashMap<BlockId, crate::structure::BlockRender> = HashMap::new();
     for &bid in &order {
         let block = &func.cfg.blocks[bid.0 as usize];
@@ -694,6 +2182,12 @@ pub fn render_method_pseudocode_full(output: &crate::lift::LiftOutput) -> String
                             .first()
                             .map(|a| ctx.operand_text(a))
                             .unwrap_or_default();
+                    } else {
+                        if let Some(line) = ctx.render_inst(iid)
+                            && !line.starts_with("// phi()")
+                        {
+                            lines.push(line);
+                        }
                     }
                 }
                 _ => {
@@ -714,10 +2208,28 @@ pub fn render_method_pseudocode_full(output: &crate::lift::LiftOutput) -> String
         } else {
             None
         };
+        let block_addr = block.start_addr as u32;
+        let mut prefix: Vec<String> = Vec::new();
+        if let Some(types) = handler_types.get(&block_addr) {
+            let mut all: Vec<String> = types.clone();
+            if catch_all_addrs.contains(&block_addr) && !all.iter().any(|t| t == "Throwable") {
+                all.push("Throwable".to_string());
+            }
+            prefix.push(format!("// catch ({} e)", all.join(" | ")));
+        } else if catch_all_addrs.contains(&block_addr) {
+            prefix.push("// catch (Throwable e)".to_string());
+        }
+        if try_regions.iter().any(|(s, _)| block_addr == *s) {
+            prefix.push("// try".to_string());
+        } else if try_regions.iter().any(|(_, e)| block_addr == *e) {
+            prefix.push("// end try".to_string());
+        }
+        let mut all_lines = prefix;
+        all_lines.extend(lines);
         block_renders.insert(
             bid,
             crate::structure::BlockRender {
-                lines,
+                lines: all_lines,
                 cond,
                 jump,
                 switch,
@@ -732,12 +2244,33 @@ pub fn render_method_pseudocode_full(output: &crate::lift::LiftOutput) -> String
     }
     let text = fuse_new_init(&text);
     let text = apply_copy_chain_collapse(&text);
+    let text = apply_string_concat_fold(&text);
+    let text = apply_for_loop_recovery(&text);
+    let text = apply_latch_continue_cleanup(&text);
+    let text = apply_dead_allocation_cleanup(&text);
+    let text = apply_arm_tail_goto_cleanup(&text);
+    let text = apply_boxing_cleanup(&text);
+    let text = apply_enhanced_for(&text);
+    let text = apply_empty_then_inversion(&text);
+    let text = apply_boolean_condition_simplify(&text);
+    let text = apply_semantic_names(&text);
+    let text = apply_cast_paren_cleanup(&text);
+    let text = apply_loop_recovery(&text);
+    let text = apply_loop_wrap(&text);
+    let text = apply_switch_break(&text);
+    let text = apply_small_block_inline(&text);
+    let text = apply_dead_assign(&text);
     let name_to_id: HashMap<String, SsaValueId> = ctx
         .value_names
         .iter()
         .map(|(id, name)| (name.clone(), *id))
         .collect();
-    apply_typed_declarations(&text, value_types, &name_to_id)
+    let text = apply_typed_declarations(&text, value_types, &name_to_id);
+    let text = apply_unused_label_cleanup(&text);
+    let text = apply_control_kind_repair(&text);
+    let text = apply_condition_paren_repair(&text);
+    let text = apply_brace_repair(&text);
+    apply_reindent(&text)
 }
 
 pub fn decompile_dex(
@@ -885,5 +2418,67 @@ fn render_invoke_call(
                 format!("{class_name}.{method_name}({});", arg_texts.join(", "))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod concat_tests {
+    use super::*;
+
+    #[test]
+    fn folds_simple_append_chain() {
+        let line = "return ((v1.append((\" [ SEQ = \"))).append(this.j)).toString();";
+        let folded = fold_concat_line(line);
+        eprintln!("folded: {folded:?}");
+        assert!(folded.is_some(), "should fold");
+    }
+
+    #[test]
+    fn folds_real_tostring_chain() {
+        let line = "return (((((((((v1.append((this.a()))).append((\" [ SEQ = \"))).append(this.j)).append((\", ACK = \"))).append(v30)).append((\", LEN = \"))).append((this.b()))).append((\" ]\"))).toString();";
+        let folded = fold_concat_line(line);
+        eprintln!("folded: {folded:?}");
+        assert!(folded.is_some(), "should fold real chain");
+        let f = folded.unwrap();
+        assert!(f.contains(" + "), "result should contain +: {f}");
+        assert!(
+            !f.contains("append"),
+            "result should not contain append: {f}"
+        );
+    }
+
+    #[test]
+    fn trace_strip_steps() {
+        let line = "return (((v1.append((this.a()))).append(v30)).toString());";
+        let rest = line.trim().strip_prefix("return ").unwrap();
+        let after_semi = rest.trim().strip_suffix(';');
+        eprintln!("after_semi: {after_semi:?}");
+        let after_paren = after_semi.and_then(|r| r.strip_suffix(')'));
+        eprintln!("after_paren: {after_paren:?}");
+        let after_ts = after_paren.and_then(|r| r.strip_suffix(".toString()"));
+        eprintln!("after_toString: {after_ts:?}");
+        assert!(after_ts.is_some(), "toString strip should work");
+    }
+}
+
+#[cfg(test)]
+mod boxing_tests {
+    use super::*;
+
+    #[test]
+    fn removes_string_value_of_identifier() {
+        let input = "v1 = (\"text\").concat((String.valueOf(p1)));";
+        let out = apply_boxing_cleanup(input);
+        eprintln!("in:  {input}");
+        eprintln!("out: {out}");
+        assert!(!out.contains("String.valueOf(p1)"), "{out}");
+    }
+
+    #[test]
+    fn removes_string_value_of_literal() {
+        let input = "v1 = String.valueOf(\"hello\");";
+        let out = apply_boxing_cleanup(input);
+        eprintln!("out: {out}");
+        assert!(!out.contains("String.valueOf"), "{out}");
     }
 }
