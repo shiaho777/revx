@@ -6,6 +6,7 @@ members = [
     "crates/revx-arch-x64",
     "crates/revx-core",
     "crates/revx-daemon",
+    "crates/revx-dex",
     "crates/revx-loader",
     "crates/revx-micro",
     "crates/revx-query",

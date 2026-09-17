@@ -24,5 +24,6 @@ tracing-subscriber.workspace = true
 uuid.workspace = true
 revx-core = { path = "../revx-core" }
 revx-daemon = { path = "../revx-daemon", default-features = false }
+revx-dex = { path = "../revx-dex" }
 revx-loader = { path = "../revx-loader", default-features = false }
 revx-workspace = { path = "../revx-workspace", default-features = false, features = ["sqlite-bundled"] }

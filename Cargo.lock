@@ -907,6 +907,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "revx-dex"
+version = "0.1.0"
+
+[[package]]
 name = "revx-engine"
 version = "0.1.0"
 dependencies = [
@@ -914,6 +918,7 @@ dependencies = [
  "clap",
  "revx-core",
  "revx-daemon",
+ "revx-dex",
  "revx-loader",
  "revx-workspace",
  "serde",

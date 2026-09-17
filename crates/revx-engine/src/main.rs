@@ -83,6 +83,61 @@ enum Command {
     Daemon(DaemonCommands),
     #[command(subcommand)]
     Mcp(McpCommands),
+    #[command(subcommand)]
+    Dex(DexCommands),
+}
+
+#[derive(Subcommand)]
+enum DexCommands {
+    Disasm(DexDisasmArgs),
+    Decompile(DexDecompileArgs),
+    Java(DexJavaArgs),
+    JniLink(DexJniLinkArgs),
+    KotlinNames(DexKotlinNamesArgs),
+}
+
+#[derive(Args)]
+struct DexKotlinNamesArgs {
+    path: PathBuf,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Args)]
+struct DexJniLinkArgs {
+    dex_path: PathBuf,
+    so_path: Option<PathBuf>,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Args)]
+struct DexJavaArgs {
+    path: PathBuf,
+    #[arg(long)]
+    class: Option<String>,
+    #[arg(long, default_value_t = 3)]
+    limit: usize,
+}
+
+#[derive(Args)]
+struct DexDisasmArgs {
+    path: PathBuf,
+    #[arg(long)]
+    class: Option<String>,
+    #[arg(long, default_value_t = 200)]
+    limit: usize,
+}
+
+#[derive(Args)]
+struct DexDecompileArgs {
+    path: PathBuf,
+    #[arg(long)]
+    class: Option<String>,
+    #[arg(long)]
+    method: Option<String>,
+    #[arg(long, default_value_t = 20)]
+    limit: usize,
 }
 
 #[derive(Args)]
@@ -740,7 +795,227 @@ async fn main() -> Result<()> {
             write_config,
             init_workspace,
         }) => cmd_mcp_install(prefix, workspace, host, write_config, init_workspace),
+        Command::Dex(DexCommands::Disasm(args)) => cmd_dex_disasm(args),
+        Command::Dex(DexCommands::Decompile(args)) => cmd_dex_decompile(args),
+        Command::Dex(DexCommands::Java(args)) => cmd_dex_java(args),
+        Command::Dex(DexCommands::JniLink(args)) => cmd_dex_jni_link(args),
+        Command::Dex(DexCommands::KotlinNames(args)) => cmd_dex_kotlin_names(args),
     }
+}
+
+fn cmd_dex_kotlin_names(args: DexKotlinNamesArgs) -> Result<()> {
+    let data =
+        fs::read(&args.path).with_context(|| format!("failed to read {}", args.path.display()))?;
+    let dex =
+        revx_dex::DexFile::parse(data).map_err(|e| anyhow::anyhow!("DEX parse failed: {e}"))?;
+    let metadata = revx_dex::kotlin::extract_kotlin_metadata(&dex);
+    let recovered = revx_dex::kotlin::recover_names(&metadata);
+    if args.json {
+        let rows: Vec<serde_json::Value> = recovered
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "obfuscated": r.obfuscated,
+                    "real": r.real,
+                    "members": r.members,
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::json!({
+                "kotlin_classes": metadata.len(),
+                "recovered": recovered.len(),
+                "rows": rows,
+            })
+        );
+    } else {
+        for r in &recovered {
+            println!("{}\t{}\t{}", r.obfuscated, r.real, r.members.join(","));
+        }
+        eprintln!(
+            "// {} kotlin @Metadata classes, {} names recovered",
+            metadata.len(),
+            recovered.len()
+        );
+    }
+    Ok(())
+}
+
+fn cmd_dex_jni_link(args: DexJniLinkArgs) -> Result<()> {
+    let data = fs::read(&args.dex_path)
+        .with_context(|| format!("failed to read {}", args.dex_path.display()))?;
+    let dex =
+        revx_dex::DexFile::parse(data).map_err(|e| anyhow::anyhow!("DEX parse failed: {e}"))?;
+    let natives = revx_dex::jni::all_native_methods(&dex);
+
+    let mut export_map: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    if let Some(so_path) = &args.so_path {
+        let image = load_binary(so_path)
+            .with_context(|| format!("failed to load {}", so_path.display()))?;
+        for e in &image.exports {
+            if let Some(addr) = e.address {
+                export_map.insert(e.name.clone(), addr);
+            }
+        }
+    }
+
+    let mut matched = 0usize;
+    let mut json_rows = Vec::new();
+    for n in &natives {
+        let mut found_addr: Option<u64> = export_map
+            .get(&n.mangled)
+            .or_else(|| n.mangled_overload.as_ref().and_then(|o| export_map.get(o)))
+            .copied();
+        let symbol_used = if export_map.contains_key(&n.mangled) {
+            n.mangled.clone()
+        } else if let Some(o) = &n.mangled_overload
+            && export_map.contains_key(o)
+        {
+            o.clone()
+        } else {
+            String::new()
+        };
+        if found_addr.is_none()
+            && let Some(o) = &n.mangled_overload
+            && let Some(a) = export_map.get(o)
+        {
+            found_addr = Some(*a);
+        }
+        let addr = found_addr;
+        if addr.is_some() {
+            matched += 1;
+        }
+        if args.json {
+            json_rows.push(serde_json::json!({
+                "class": n.class,
+                "method": n.method,
+                "signature": n.signature,
+                "symbol": symbol_used,
+                "address": addr,
+            }));
+        } else {
+            let status = addr
+                .map(|a| format!("{a:#x}"))
+                .unwrap_or_else(|| "unresolved".to_string());
+            println!(
+                "{}->{}\t{}\t{}\t{status}",
+                n.class, n.method, n.signature, n.mangled
+            );
+        }
+    }
+    if args.json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "native_methods": natives.len(),
+                "matched": matched,
+                "rows": json_rows,
+            })
+        );
+    } else {
+        eprintln!(
+            "// {} native methods, {} matched in {}",
+            natives.len(),
+            matched,
+            args.so_path
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "(no library)".to_string())
+        );
+    }
+    Ok(())
+}
+
+fn cmd_dex_java(args: DexJavaArgs) -> Result<()> {
+    let data =
+        fs::read(&args.path).with_context(|| format!("failed to read {}", args.path.display()))?;
+    let dex =
+        revx_dex::DexFile::parse(data).map_err(|e| anyhow::anyhow!("DEX parse failed: {e}"))?;
+    let mut emitted = 0usize;
+    for class in &dex.classes {
+        if let Some(f) = args.class.as_deref()
+            && !class.class.contains(f)
+        {
+            continue;
+        }
+        if emitted >= args.limit {
+            break;
+        }
+        emitted += 1;
+        let mut method_bodies: Vec<(u32, u32, String)> = Vec::new();
+        if let Some(cd) = &class.class_data {
+            for m in cd.direct_methods.iter().chain(cd.virtual_methods.iter()) {
+                if m.code_off == 0 {
+                    method_bodies.push((m.method_idx, 0, "    // no code".to_string()));
+                    continue;
+                }
+                match dex.code_item(m.code_off) {
+                    Ok(code) => {
+                        let mc = revx_dex::render::decompile_method(&dex, &code, m.method_idx);
+                        method_bodies.push((
+                            m.method_idx,
+                            code.registers_size as u32,
+                            mc.pseudocode,
+                        ));
+                    }
+                    Err(e) => {
+                        method_bodies.push((m.method_idx, 0, format!("    // code error: {e}")));
+                    }
+                }
+            }
+        }
+        let text = revx_dex::classgen::render_java_class(&dex, class, &method_bodies);
+        println!("{text}");
+    }
+    eprintln!("// {emitted} classes rendered");
+    Ok(())
+}
+
+fn cmd_dex_disasm(args: DexDisasmArgs) -> Result<()> {
+    let data =
+        fs::read(&args.path).with_context(|| format!("failed to read {}", args.path.display()))?;
+    let dex =
+        revx_dex::DexFile::parse(data).map_err(|e| anyhow::anyhow!("DEX parse failed: {e}"))?;
+    println!(
+        "// dex v{} strings={} types={} protos={} fields={} methods={} classes={}",
+        dex.header.version,
+        dex.strings.len(),
+        dex.types.len(),
+        dex.protos.len(),
+        dex.fields.len(),
+        dex.methods.len(),
+        dex.classes.len()
+    );
+    let lines = revx_dex::insns::disassemble_dex(&dex, args.class.as_deref(), args.limit);
+    for line in &lines {
+        println!("{line}");
+    }
+    eprintln!("// {} methods disassembled", args.limit.min(lines.len()));
+    Ok(())
+}
+
+fn cmd_dex_decompile(args: DexDecompileArgs) -> Result<()> {
+    let data =
+        fs::read(&args.path).with_context(|| format!("failed to read {}", args.path.display()))?;
+    let dex =
+        revx_dex::DexFile::parse(data).map_err(|e| anyhow::anyhow!("DEX parse failed: {e}"))?;
+    let methods = revx_dex::render::decompile_dex(
+        &dex,
+        args.class.as_deref(),
+        args.method.as_deref(),
+        args.limit,
+    );
+    println!("// {} methods decompiled", methods.len());
+    for mc in &methods {
+        println!(
+            "// {} (regs={} insns={})",
+            mc.signature, mc.registers, mc.insn_units
+        );
+        println!("{}", mc.pseudocode);
+        println!();
+    }
+    Ok(())
 }
 
 fn cmd_init(path: &Path) -> Result<()> {
