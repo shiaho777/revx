@@ -318,3 +318,30 @@ pub fn census_dex(dex: &DexFile, limit: Option<usize>) -> GotoCensus {
     }
     report
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::structure::GotoEmission;
+
+    #[test]
+    fn final_counts_are_independent_of_raw_emissions() {
+        let diagnostics = StructuringDiagnostics {
+            goto_emissions: vec![GotoEmission {
+                target: 2,
+                reason: GotoReason::Revisit,
+            }],
+            bailed: false,
+        };
+        let removed = CensusCounts::from_scan(&count_final_gotos("return;"), &diagnostics);
+        assert_eq!(removed.raw_emission_count, 1);
+        assert_eq!(removed.final_goto_count, 0);
+        let copied = CensusCounts::from_scan(
+            &count_final_gotos("goto L2; goto L2; L2: return;"),
+            &diagnostics,
+        );
+        assert_eq!(copied.raw_emission_count, 1);
+        assert_eq!(copied.final_goto_count, 2);
+        assert_eq!(copied.by_reason.unknown, 2);
+    }
+}
