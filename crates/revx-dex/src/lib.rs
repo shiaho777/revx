@@ -2,6 +2,7 @@
 //! class definitions, class data, and code items.
 
 pub mod annotations;
+pub mod census;
 pub mod classgen;
 pub mod insns;
 pub mod jni;
@@ -707,6 +708,17 @@ impl DexFile {
             });
         }
         (handles, sites)
+    }
+
+    pub fn defined_methods(&self) -> impl Iterator<Item = (&ClassDef, &EncodedMethod)> {
+        self.classes.iter().flat_map(|class| {
+            class.class_data.iter().flat_map(move |data| {
+                data.direct_methods
+                    .iter()
+                    .chain(&data.virtual_methods)
+                    .map(move |method| (class, method))
+            })
+        })
     }
 
     pub fn method_proto(&self, method_idx: u32) -> Option<&ProtoId> {

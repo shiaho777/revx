@@ -9,6 +9,24 @@
 use revx_analysis::ssa::{BlockId, Cfg, CfgBlock, DominatorTree, SsaFunction};
 use std::collections::{BTreeSet, HashMap, HashSet};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GotoReason {
+    Revisit,
+    ForwardRevisit,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GotoEmission {
+    pub target: u32,
+    pub reason: GotoReason,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct StructuringDiagnostics {
+    pub goto_emissions: Vec<GotoEmission>,
+    pub bailed: bool,
+}
+
 pub struct BlockRender {
     pub lines: Vec<String>,
     pub cond: Option<(String, BlockId, BlockId)>,
@@ -30,6 +48,7 @@ pub struct StructuredRenderer<'a> {
     depth: usize,
     hop: usize,
     bailed: bool,
+    diagnostics: Option<StructuringDiagnostics>,
 }
 
 const MAX_DEPTH: usize = 48;
@@ -42,6 +61,26 @@ pub fn render_structured(
 ) -> (String, bool) {
     let mut r = StructuredRenderer::new(func);
     r.walk(func.cfg.entry, blocks, None);
+    finish_render(r, blocks)
+}
+
+pub fn render_structured_with_diagnostics(
+    func: &SsaFunction,
+    blocks: &HashMap<BlockId, BlockRender>,
+) -> (String, StructuringDiagnostics) {
+    let mut r = StructuredRenderer::new(func);
+    r.diagnostics = Some(StructuringDiagnostics::default());
+    r.walk(func.cfg.entry, blocks, None);
+    let mut diagnostics = r.diagnostics.take().unwrap_or_default();
+    let (text, bailed) = finish_render(r, blocks);
+    diagnostics.bailed = bailed;
+    (text, diagnostics)
+}
+
+fn finish_render(
+    mut r: StructuredRenderer<'_>,
+    blocks: &HashMap<BlockId, BlockRender>,
+) -> (String, bool) {
     if r.lines.is_empty() {
         return ("    <empty>".to_string(), r.bailed);
     }
@@ -70,7 +109,8 @@ pub fn render_structured(
     for (i, (pos, label)) in insertions.iter().enumerate() {
         r.lines.insert(pos + i, label.clone());
     }
-    let mut orphans: Vec<&CfgBlock> = func
+    let mut orphans: Vec<&CfgBlock> = r
+        .func
         .cfg
         .blocks
         .iter()
@@ -146,6 +186,7 @@ impl<'a> StructuredRenderer<'a> {
             depth: 0,
             hop: 0,
             bailed: false,
+            diagnostics: None,
         }
     }
 
@@ -158,7 +199,7 @@ impl<'a> StructuredRenderer<'a> {
         self.lines.push(format!("{}{}", self.indent(), line));
     }
 
-    fn emit_goto(&mut self, target: BlockId) {
+    fn emit_goto(&mut self, target: BlockId, reason: GotoReason) {
         if let Some(&(head, exit)) = self.loop_stack.last() {
             if target == exit {
                 self.push("break;");
@@ -176,6 +217,12 @@ impl<'a> StructuredRenderer<'a> {
             }
         }
         self.goto_targets.insert(target);
+        if let Some(d) = self.diagnostics.as_mut() {
+            d.goto_emissions.push(GotoEmission {
+                target: target.0,
+                reason,
+            });
+        }
         self.push(format!("goto L{};", target.0));
     }
 
@@ -262,7 +309,7 @@ impl<'a> StructuredRenderer<'a> {
                 self.hop -= 1;
                 return;
             }
-            self.emit_goto(block);
+            self.emit_goto(block, GotoReason::Revisit);
             return;
         }
         if self.loop_heads.contains(&block) && !self.loop_stack.iter().any(|(h, _)| *h == block) {
@@ -367,7 +414,7 @@ impl<'a> StructuredRenderer<'a> {
         stop_at: Option<BlockId>,
     ) {
         if self.visited.contains(&target) {
-            self.emit_goto(target);
+            self.emit_goto(target, GotoReason::ForwardRevisit);
             return;
         }
         self.walk(target, blocks, stop_at);

@@ -94,6 +94,16 @@ enum DexCommands {
     Java(DexJavaArgs),
     JniLink(DexJniLinkArgs),
     KotlinNames(DexKotlinNamesArgs),
+    GotoCensus(DexGotoCensusArgs),
+}
+
+#[derive(Args)]
+struct DexGotoCensusArgs {
+    path: PathBuf,
+    #[arg(long)]
+    json: bool,
+    #[arg(long)]
+    limit: Option<usize>,
 }
 
 #[derive(Args)]
@@ -800,7 +810,128 @@ async fn main() -> Result<()> {
         Command::Dex(DexCommands::Java(args)) => cmd_dex_java(args),
         Command::Dex(DexCommands::JniLink(args)) => cmd_dex_jni_link(args),
         Command::Dex(DexCommands::KotlinNames(args)) => cmd_dex_kotlin_names(args),
+        Command::Dex(DexCommands::GotoCensus(args)) => cmd_dex_goto_census(args),
     }
+}
+
+fn cmd_dex_goto_census(args: DexGotoCensusArgs) -> Result<()> {
+    let data =
+        fs::read(&args.path).with_context(|| format!("failed to read {}", args.path.display()))?;
+    let dex =
+        revx_dex::DexFile::parse(data).map_err(|e| anyhow::anyhow!("DEX parse failed: {e}"))?;
+    let census = revx_dex::census::census_dex(&dex, args.limit);
+    if args.json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "schema_version": census.schema_version,
+                "selection": {
+                    "requested_limit": census.selection.requested_limit,
+                    "total_defined_methods": census.selection.total_defined_methods,
+                    "selected_methods": census.selection.selected_methods,
+                    "unselected_methods": census.selection.unselected_methods,
+                    "truncated": census.selection.truncated,
+                    "skipped_codeless_methods": census.selection.skipped_codeless_methods,
+                    "failed_methods": census.selection.failed_methods,
+                    "completed_methods": census.selection.completed_methods,
+                },
+                "totals": {
+                    "final_goto_count": census.totals.final_goto_count,
+                    "final_goto_line_count": census.totals.final_goto_line_count,
+                    "by_reason": {
+                        "revisit": census.totals.by_reason.revisit,
+                        "forward_revisit": census.totals.by_reason.forward_revisit,
+                        "unknown": census.totals.by_reason.unknown,
+                    },
+                    "raw_emission_count": census.totals.raw_emission_count,
+                    "raw_by_reason": {
+                        "revisit": census.totals.raw_by_reason.revisit,
+                        "forward_revisit": census.totals.raw_by_reason.forward_revisit,
+                        "unknown": census.totals.raw_by_reason.unknown,
+                    },
+                    "bailed_methods": census.totals.bailed_methods,
+                },
+                "final_provenance": "unknown",
+                "methods": census.methods.iter().map(|m| serde_json::json!({
+                    "class": m.class,
+                    "method_idx": m.method_idx,
+                    "signature": m.signature,
+                    "code_off": m.code_off,
+                    "status": m.status,
+                    "error": m.error,
+                    "final_goto_count": m.counts.as_ref().map(|c| c.final_goto_count).unwrap_or(0),
+                    "final_goto_line_count": m.counts.as_ref().map(|c| c.final_goto_line_count).unwrap_or(0),
+                    "by_reason": {
+                        "revisit": m.counts.as_ref().map(|c| c.by_reason.revisit).unwrap_or(0),
+                        "forward_revisit": m.counts.as_ref().map(|c| c.by_reason.forward_revisit).unwrap_or(0),
+                        "unknown": m.counts.as_ref().map(|c| c.by_reason.unknown).unwrap_or(0),
+                    },
+                    "final_goto_sites": m.final_scan.as_ref().map(|s| s.sites.iter().map(|site| serde_json::json!({
+                        "line": site.line,
+                        "target": site.target,
+                        "provenance": "unknown",
+                    })).collect::<Vec<_>>()).unwrap_or_default(),
+                    "target_counts": m.final_scan.as_ref().map(|s| s.target_counts.clone()).unwrap_or_default(),
+                    "dangling_final_targets": m.final_scan.as_ref().map(|s| s.dangling_targets.clone()).unwrap_or_default(),
+                    "labels": m.final_scan.as_ref().map(|s| s.labels.keys().cloned().collect::<Vec<_>>()).unwrap_or_default(),
+                    "raw_emission_count": m.counts.as_ref().map(|c| c.raw_emission_count).unwrap_or(0),
+                    "raw_by_reason": {
+                        "revisit": m.counts.as_ref().map(|c| c.raw_by_reason.revisit).unwrap_or(0),
+                        "forward_revisit": m.counts.as_ref().map(|c| c.raw_by_reason.forward_revisit).unwrap_or(0),
+                        "unknown": 0,
+                    },
+                    "structured_bailed": m.counts.as_ref().map(|c| c.bailed_methods > 0).unwrap_or(false),
+                })).collect::<Vec<_>>(),
+            })
+        );
+        return Ok(());
+    }
+    println!(
+        "// dex goto census v{}: final_goto={} raw_emissions={} methods={}/{} (skipped_codeless={} failed={})",
+        census.schema_version,
+        census.totals.final_goto_count,
+        census.totals.raw_emission_count,
+        census.selection.selected_methods,
+        census.selection.total_defined_methods,
+        census.selection.skipped_codeless_methods,
+        census.selection.failed_methods
+    );
+    if census.selection.truncated {
+        eprintln!(
+            "// selection: --limit {} kept the first {} of {} defined methods; {} unselected",
+            census.selection.requested_limit.unwrap_or_default(),
+            census.selection.selected_methods,
+            census.selection.total_defined_methods,
+            census.selection.unselected_methods
+        );
+    }
+    for m in &census.methods {
+        match (m.status, &m.counts) {
+            ("completed", Some(counts)) => {
+                println!(
+                    "{}\tfinal={} (lines={})\traw={} (revisit={}, fwd_revisit={})\ttargets={}",
+                    m.signature,
+                    counts.final_goto_count,
+                    counts.final_goto_line_count,
+                    counts.raw_emission_count,
+                    counts.raw_by_reason.revisit,
+                    counts.raw_by_reason.forward_revisit,
+                    m.final_scan
+                        .as_ref()
+                        .map(|s| s.target_counts.len())
+                        .unwrap_or(0)
+                );
+            }
+            ("skipped_codeless", _) => println!("{}\t<no code>", m.signature),
+            _ => println!(
+                "{}\t<error: {}>",
+                m.signature,
+                m.error.as_deref().unwrap_or("unknown")
+            ),
+        }
+    }
+    eprintln!("// final goto provenance: unknown; raw emission counts are not final counts");
+    Ok(())
 }
 
 fn cmd_dex_kotlin_names(args: DexKotlinNamesArgs) -> Result<()> {
