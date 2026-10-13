@@ -105,7 +105,7 @@ struct Builder<'a> {
     edges: BTreeSet<(BlockId, BlockId)>,
     tries: BTreeSet<usize>,
     work: usize,
-    loops: Vec<(BlockId, BlockId)>,
+    loops: Vec<(BlockId, Option<BlockId>)>,
     loop_heads: BTreeSet<BlockId>,
 }
 
@@ -129,7 +129,7 @@ impl Builder<'_> {
                 break;
             }
             if let Some(&(head, exit)) = self.loops.last() {
-                if current == exit {
+                if Some(current) == exit {
                     nodes.push(Region::Break);
                     break;
                 }
@@ -244,16 +244,16 @@ impl Builder<'_> {
                 if !members.is_subset(allowed) {
                     return Err(Failure::NestedOrCrossScope);
                 }
-                self.check_entries(&members, current)?;
-                let exits: BTreeSet<_> = members
-                    .iter()
-                    .flat_map(|b| self.output.func.cfg.succs[b.0 as usize].iter().copied())
-                    .filter(|b| !members.contains(b))
-                    .collect();
-                if exits.len() != 1 {
-                    return Err(Failure::UnsupportedShape);
+                let exits = self.expand_loop(&mut members, allowed)?;
+                if !members.is_subset(allowed) {
+                    return Err(Failure::NestedOrCrossScope);
                 }
-                let exit = *exits.first().unwrap();
+                self.check_entries(&members, current)?;
+                let exit = if exits.len() > 1 {
+                    return Err(Failure::UnsupportedShape);
+                } else {
+                    exits.first().copied()
+                };
                 self.loops.push((current, exit));
                 let body = self.path(current, &members, None, active_try, depth + 1)?;
                 self.loops.pop();
@@ -264,8 +264,11 @@ impl Builder<'_> {
                     head: current,
                     body: Box::new(body),
                 });
-                current = exit;
-                continue;
+                if let Some(next) = exit {
+                    current = next;
+                    continue;
+                }
+                break;
             }
             if !self.owned.insert(current) {
                 return Err(Failure::UnsupportedShape);
@@ -287,9 +290,6 @@ impl Builder<'_> {
                 .last()
                 .and_then(|id| self.output.func.values.get(id.0 as usize));
             if let Some(cases) = self.output.switch_cases.get(&current) {
-                if !self.loops.is_empty() {
-                    return Err(Failure::UnsupportedShape);
-                }
                 let value = block
                     .insts
                     .iter()
@@ -314,16 +314,27 @@ impl Builder<'_> {
                 {
                     return Err(Failure::UnsupportedShape);
                 }
+                let targets: Vec<BlockId> = groups.keys().copied().collect();
+                let join = self.switch_join(&targets, stop)?;
                 let mut arms = Vec::new();
                 for (target, keys) in groups {
                     self.edges.insert((current, target));
-                    let members = self.closure(target, None)?;
-                    if !members.is_subset(allowed) || members.iter().any(|b| self.owned.contains(b))
-                    {
-                        return Err(Failure::UnsupportedShape);
-                    }
-                    self.check_entries(&members, target)?;
-                    let arm = self.path(target, &members, None, active_try, depth + 1)?;
+                    let arm = if self.is_loop_control(target) {
+                        self.path(target, allowed, join, active_try, depth + 1)?
+                    } else {
+                        let members = self.arm_members(target, join)?;
+                        if !members.is_subset(allowed)
+                            || members.iter().any(|b| self.owned.contains(b))
+                        {
+                            return Err(Failure::UnsupportedShape);
+                        }
+                        self.check_entries(&members, target)?;
+                        let arm = self.path(target, &members, join, active_try, depth + 1)?;
+                        if !members.is_subset(&self.owned) {
+                            return Err(Failure::ValidationFailed);
+                        }
+                        arm
+                    };
                     arms.push((keys, arm));
                 }
                 nodes.push(Region::Switch {
@@ -331,6 +342,10 @@ impl Builder<'_> {
                     value,
                     cases: arms,
                 });
+                if let Some(next) = join {
+                    current = next;
+                    continue;
+                }
                 break;
             }
             if let Some(inst) = last {
@@ -348,11 +363,11 @@ impl Builder<'_> {
                         self.edges.insert((current, yes));
                         self.edges.insert((current, no));
                         let join = if self.loops.last().is_some_and(|(head, exit)| {
-                            [yes, no].contains(head) || [yes, no].contains(exit)
+                            [yes, no].contains(head) || exit.is_some_and(|e| [yes, no].contains(&e))
                         }) {
                             stop
                         } else {
-                            self.join(yes, no, stop)?
+                            self.join_many(&[yes, no], stop)?
                         };
                         let then = self.path(yes, allowed, join, active_try, depth + 1)?;
                         let otherwise = self.path(no, allowed, join, active_try, depth + 1)?;
@@ -419,18 +434,56 @@ impl Builder<'_> {
         Ok(found)
     }
 
-    fn join(
+    fn arm_members(
         &mut self,
-        yes: BlockId,
-        no: BlockId,
+        entry: BlockId,
+        stop: Option<BlockId>,
+    ) -> Result<BTreeSet<BlockId>, Failure> {
+        let mut found = BTreeSet::new();
+        let mut pending = vec![entry];
+        while let Some(b) = pending.pop() {
+            self.work += 1;
+            if self.work > 4096 {
+                return Err(Failure::Budget);
+            }
+            if Some(b) == stop || (b != entry && self.is_loop_control(b)) || !found.insert(b) {
+                continue;
+            }
+            let edges = self
+                .output
+                .func
+                .cfg
+                .succs
+                .get(b.0 as usize)
+                .ok_or(Failure::ValidationFailed)?;
+            pending.extend(edges);
+        }
+        Ok(found)
+    }
+
+    fn join_many(
+        &mut self,
+        starts: &[BlockId],
         stop: Option<BlockId>,
     ) -> Result<Option<BlockId>, Failure> {
-        if yes == no {
-            return Ok(Some(yes));
+        if starts.is_empty() {
+            return Ok(stop);
         }
-        let y = self.closure(yes, stop)?;
-        let n = self.closure(no, stop)?;
-        let common: BTreeSet<_> = y.intersection(&n).copied().collect();
+        if starts.iter().all(|block| *block == starts[0]) {
+            return Ok(Some(starts[0]));
+        }
+        if starts.len() == 1 {
+            return Ok(stop);
+        }
+        let mut common: Option<BTreeSet<BlockId>> = None;
+        for start in starts {
+            let found = self.closure(*start, stop)?;
+            common = Some(match common {
+                None => found,
+                Some(prev) => prev.intersection(&found).copied().collect(),
+            });
+        }
+        let common = common.unwrap_or_default();
         if common.is_empty() {
             return Ok(stop);
         }
@@ -447,6 +500,73 @@ impl Builder<'_> {
             return Err(Failure::UnsupportedShape);
         }
         Ok(Some(candidates[0]))
+    }
+
+    fn switch_join(
+        &mut self,
+        targets: &[BlockId],
+        stop: Option<BlockId>,
+    ) -> Result<Option<BlockId>, Failure> {
+        let normal: Vec<BlockId> = targets
+            .iter()
+            .copied()
+            .filter(|block| !self.is_loop_control(*block))
+            .collect();
+        if normal.is_empty() || (normal.len() < targets.len() && normal.len() == 1) {
+            return Ok(stop);
+        }
+        self.join_many(&normal, stop)
+    }
+
+    fn is_loop_control(&self, block: BlockId) -> bool {
+        self.loops
+            .last()
+            .is_some_and(|(head, exit)| block == *head || Some(block) == *exit)
+    }
+
+    fn exits_of(&self, members: &BTreeSet<BlockId>) -> BTreeSet<BlockId> {
+        members
+            .iter()
+            .flat_map(|b| self.output.func.cfg.succs[b.0 as usize].iter().copied())
+            .filter(|b| !members.contains(b))
+            .collect()
+    }
+
+    fn expand_loop(
+        &mut self,
+        members: &mut BTreeSet<BlockId>,
+        allowed: &BTreeSet<BlockId>,
+    ) -> Result<BTreeSet<BlockId>, Failure> {
+        loop {
+            self.work += 1;
+            if self.work > 4096 {
+                return Err(Failure::Budget);
+            }
+            let exits = self.exits_of(members);
+            if exits.len() <= 1 {
+                return Ok(exits);
+            }
+            let mut progressed = false;
+            for exit in exits {
+                let preds = self
+                    .output
+                    .func
+                    .cfg
+                    .preds
+                    .get(exit.0 as usize)
+                    .ok_or(Failure::ValidationFailed)?;
+                if preds.iter().all(|pred| members.contains(pred)) {
+                    if !allowed.contains(&exit) {
+                        return Err(Failure::NestedOrCrossScope);
+                    }
+                    members.insert(exit);
+                    progressed = true;
+                }
+            }
+            if !progressed {
+                return Err(Failure::UnsupportedShape);
+            }
+        }
     }
 
     fn check_entries(&self, members: &BTreeSet<BlockId>, entry: BlockId) -> Result<(), Failure> {
@@ -598,10 +718,46 @@ fn binop(kind: BinOpKind) -> &'static str {
     }
 }
 
+struct EmitCtx<'a> {
+    output: &'a LiftOutput,
+    dex: &'a DexFile,
+    loop_labels: Vec<Option<String>>,
+    switch_depth: usize,
+}
+
+fn contains_break(node: &Region) -> bool {
+    match node {
+        Region::Break => true,
+        Region::Sequence(nodes) => nodes.iter().any(contains_break),
+        Region::If { yes, no, .. } => contains_break(yes) || contains_break(no),
+        Region::Switch { cases, .. } => cases.iter().any(|(_, body)| contains_break(body)),
+        Region::TryCatch { body, catches, .. } => {
+            contains_break(body) || catches.iter().any(|catch| contains_break(&catch.body))
+        }
+        Region::Loop { .. } => false,
+        _ => false,
+    }
+}
+
+fn switch_has_loop_break(node: &Region) -> bool {
+    match node {
+        Region::Switch { cases, .. } => cases.iter().any(|(_, body)| contains_break(body)),
+        Region::Sequence(nodes) => nodes.iter().any(switch_has_loop_break),
+        Region::If { yes, no, .. } => switch_has_loop_break(yes) || switch_has_loop_break(no),
+        Region::TryCatch { body, catches, .. } => {
+            switch_has_loop_break(body)
+                || catches
+                    .iter()
+                    .any(|catch| switch_has_loop_break(&catch.body))
+        }
+        Region::Loop { .. } => false,
+        _ => false,
+    }
+}
+
 fn emit(
     node: &Region,
-    output: &LiftOutput,
-    dex: &DexFile,
+    ctx: &mut EmitCtx<'_>,
     depth: usize,
     bindings: &BTreeSet<u32>,
     lines: &mut Vec<String>,
@@ -610,20 +766,20 @@ fn emit(
     match node {
         Region::Sequence(nodes) => {
             for n in nodes {
-                emit(n, output, dex, depth, bindings, lines)?;
+                emit(n, ctx, depth, bindings, lines)?;
             }
         }
         Region::Block(id) => {
-            for iid in &output.func.cfg.blocks[id.0 as usize].insts {
-                let inst = &output.func.values[iid.0 as usize];
+            for iid in &ctx.output.func.cfg.blocks[id.0 as usize].insts {
+                let inst = &ctx.output.func.values[iid.0 as usize];
                 let rhs = match &inst.op {
                     SsaOp::Call {
                         target: Operand::Symbol(s),
                         args,
                     } if s == "__switch"
                         && args.len() == 1
-                        && output.switch_cases.contains_key(id)
-                        && output.func.cfg.blocks[id.0 as usize].insts.last() == Some(iid) =>
+                        && ctx.output.switch_cases.contains_key(id)
+                        && ctx.output.func.cfg.blocks[id.0 as usize].insts.last() == Some(iid) =>
                     {
                         None
                     }
@@ -687,15 +843,39 @@ fn emit(
                 }
             }
         }
-        Region::Loop { body, .. } => {
-            lines.push(format!("{pad}while (true) {{"));
-            emit(body, output, dex, depth + 1, bindings, lines)?;
+        Region::Loop { head, body } => {
+            let label = if switch_has_loop_break(body) {
+                Some(format!("loop_{}", head.0))
+            } else {
+                None
+            };
+            if let Some(name) = &label {
+                lines.push(format!("{pad}{name}: while (true) {{"));
+            } else {
+                lines.push(format!("{pad}while (true) {{"));
+            }
+            ctx.loop_labels.push(label);
+            emit(body, ctx, depth + 1, bindings, lines)?;
+            ctx.loop_labels.pop();
             lines.push(format!("{pad}}}"));
         }
-        Region::Break => lines.push(format!("{pad}break;")),
+        Region::Break => {
+            if ctx.switch_depth > 0 {
+                let name = ctx
+                    .loop_labels
+                    .iter()
+                    .rev()
+                    .find_map(|label| label.as_deref())
+                    .ok_or(Failure::UnsupportedShape)?;
+                lines.push(format!("{pad}break {name};"));
+            } else {
+                lines.push(format!("{pad}break;"));
+            }
+        }
         Region::Continue => lines.push(format!("{pad}continue;")),
         Region::Switch { value, cases, .. } => {
             lines.push(format!("{pad}switch ({}) {{", operand(value)?));
+            ctx.switch_depth += 1;
             for (keys, body) in cases {
                 for key in keys {
                     lines.push(if key == "default" {
@@ -705,34 +885,36 @@ fn emit(
                     });
                 }
                 lines.push(format!("{pad}{{"));
-                emit(body, output, dex, depth + 1, bindings, lines)?;
+                emit(body, ctx, depth + 1, bindings, lines)?;
+                lines.push(format!("{}break;", "    ".repeat(depth + 1)));
                 lines.push(format!("{pad}}}"));
             }
+            ctx.switch_depth -= 1;
             lines.push(format!("{pad}}}"));
         }
         Region::If {
             condition, yes, no, ..
         } => {
             lines.push(format!("{pad}if ({}) {{", operand(condition)?));
-            emit(yes, output, dex, depth + 1, bindings, lines)?;
+            emit(yes, ctx, depth + 1, bindings, lines)?;
             lines.push(format!("{pad}}} else {{"));
-            emit(no, output, dex, depth + 1, bindings, lines)?;
+            emit(no, ctx, depth + 1, bindings, lines)?;
             lines.push(format!("{pad}}}"));
         }
         Region::TryCatch { body, catches, .. } => {
             lines.push(format!("{pad}try {{"));
-            emit(body, output, dex, depth + 1, bindings, lines)?;
+            emit(body, ctx, depth + 1, bindings, lines)?;
             for catch in catches {
                 let ty = match catch.kind {
                     HandlerKind::Typed { type_idx } => {
-                        crate::types::java_type(&dex.types[type_idx as usize])
+                        crate::types::java_type(&ctx.dex.types[type_idx as usize])
                     }
                     HandlerKind::CatchAll => "Throwable".into(),
                 };
                 lines.push(format!("{pad}}} catch ({ty} v{}) {{", catch.binding.0));
                 let mut bound = bindings.clone();
                 bound.insert(catch.binding.0);
-                emit(&catch.body, output, dex, depth + 1, &bound, lines)?;
+                emit(&catch.body, ctx, depth + 1, &bound, lines)?;
             }
             lines.push(format!("{pad}}}"));
         }
@@ -746,7 +928,13 @@ pub fn render_region_tree(
     dex: &DexFile,
 ) -> Result<String, Failure> {
     let mut lines = Vec::new();
-    emit(&tree.root, output, dex, 1, &BTreeSet::new(), &mut lines)?;
+    let mut ctx = EmitCtx {
+        output,
+        dex,
+        loop_labels: Vec::new(),
+        switch_depth: 0,
+    };
+    emit(&tree.root, &mut ctx, 1, &BTreeSet::new(), &mut lines)?;
     Ok(lines.join("\n"))
 }
 
