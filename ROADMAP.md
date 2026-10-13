@@ -87,7 +87,7 @@ Issue #89。边界：在区域树 walk 之前销毁 SSA phi；失败则整方法
 - 前驱边上插入拷贝；关键边拆分消耗与循环归一化共用的新增块预算（默认 32 的剩余额度）。
 - Auto 路径：循环归一化 → phi 降级 → 区域树。只有树校验通过才采用降级后的 CFG。
 - 菱形汇合 phi、循环携带 phi、带 phi 的多入口循环走区域树；CFG 轨迹与区域树轨迹一致。
-- 跨回边 try、共享 handler、普通入口可达 handler 的区域化见 R7。多出口、循环内 switch 的回退原因不变。
+- 跨回边 try、共享 handler、普通入口可达 handler 的区域化见 R7。多出口、循环内 switch 见 R8。
 - 普查 schema v6 增加 `phi_lower_methods`。final goto 归因仍是 `unknown`。
 
 验收见 `crates/revx-dex/tests/phi_lower.rs`、`crates/revx-dex/tests/r5_acceptance.rs` 与 [R6 报告](benches/r6-phi-lowering-2026-10.md)。
@@ -100,13 +100,25 @@ Issue #91。边界：在 phi 降级之后、区域树 walk 之前给每个 try �
 - 普通入口落入 `move-exception` 时拆出 `__exception` 入口，普通前驱改接到后续块。
 - 多个 try 引用同一 handler 块时，按异常-only 前缀克隆，catch 体各自独占。
 - 循环内 try：保护块的回边不算第二出口；join 仍是循环出口，catch 在 join 处停下。
-- 重叠 try、循环与异常相交、多出口、循环内 switch 保持既有回退。普查 schema 仍为 6。
+- 重叠 try、循环与异常相交保持既有回退。多出口、循环内 switch 见 R8。普查 schema 仍为 6。
 
 验收见 `crates/revx-dex/tests/handler_structure.rs`、`crates/revx-dex/tests/r5_acceptance.rs` 与 [R7 报告](benches/r7-handler-structure-2026-10.md)。
 
+## R8 — 多出口区域与循环内 switch：已交付
+
+Issue #93。边界：循环只吸收「前驱全在循环内」的出口；switch 臂在汇合点停下；循环内 switch 允许 continue / switch-break / 带标号的 loop-break。失败则整方法回退 legacy，文本与 `--mode legacy` 相同。不包装 JADX。
+
+- 两条只从循环出来的 return 尾巴走区域树，CFG 轨迹与区域树轨迹一致。
+- switch 臂在 join 处汇合时，join 代码只发射一次。
+- 循环内 switch 走区域树；从 case 里跳出循环时给 `while` 加标号。
+- 两个出口都与循环外代码汇合时仍回退 `unsupported_control_flow`。
+- 重叠 try、循环与异常相交、预算行保持既有回退。普查 schema 仍为 6。
+
+验收见 `crates/revx-dex/tests/multi_exit.rs`、`crates/revx-dex/tests/switch_lift.rs` 与 [R8 报告](benches/r8-multi-exit-2026-10.md)。
+
 ## 已知降级（v1 冻结）
 
-- 多出口区域、循环内 switch：`unsupported_control_flow`，整方法 legacy。
+- 两个循环出口都与循环外代码汇合：`unsupported_control_flow`，整方法 legacy。
 - 重叠 try：`cross_region_edge`。
 - 多入口循环碰到异常元数据：`loop_exception_intersection`。
 - 拆分预算不够：`budget_exceeded`。

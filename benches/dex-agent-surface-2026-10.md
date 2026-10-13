@@ -19,6 +19,9 @@ Agent-facing evidence for the R5 synthetic matrix. JADX is not a CI dependency. 
 | multi-entry SCC with protected block | no | partial | `loop_exception_intersection` | same as legacy |
 | try crosses loop back-edge | yes, after R7 | complete | none | `try` inside `while (true)` |
 | multi-entry loop with phi | yes, after R6 lowering | complete | none | region `while` copies |
+| loop with two return tails | yes, after R8 | complete | none | `while (true)` with both tails |
+| switch arms rejoin | yes, after R8 | complete | none | join emitted once |
+| switch inside loop | yes, after R8 | complete | none | `switch` in `while (true)` |
 
 Tests: `crates/revx-dex/tests/evidence.rs`, `crates/revx-dex/tests/r5_acceptance.rs`.
 
