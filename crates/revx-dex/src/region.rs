@@ -44,6 +44,7 @@ pub struct RegionPathInfo {
     pub fallback_reason: Option<RegionFallbackReason>,
     pub structured_try_count: usize,
     pub nodes_split: usize,
+    pub phi_lowered: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -95,6 +96,7 @@ pub struct RegionResult {
     pub fallback_reason: Option<RegionFallbackReason>,
     pub structured_try_count: usize,
     pub nodes_split: usize,
+    pub phi_lowered: bool,
 }
 
 struct Builder<'a> {
@@ -625,6 +627,16 @@ fn emit(
                         None
                     }
                     SsaOp::Copy { src } => Some(operand(src)?),
+                    SsaOp::Store {
+                        addr: Operand::Symbol(name),
+                        value,
+                    } if name.starts_with('v')
+                        && name.len() > 1
+                        && name[1..].bytes().all(|b| b.is_ascii_digit()) =>
+                    {
+                        lines.push(format!("{pad}{name} = {};", operand(value)?));
+                        None
+                    }
                     SsaOp::BinOp { kind, lhs, rhs } => Some(format!(
                         "{} {} {}",
                         operand(lhs)?,
@@ -764,8 +776,32 @@ pub fn structure_lifted(
     } else {
         None
     };
+    let loop_splits = prepared
+        .as_ref()
+        .map(|item| item.report.nodes_split)
+        .unwrap_or(0);
     let normalized = prepared.as_ref().and_then(|item| item.lift.as_ref());
-    let subject = normalized.unwrap_or(output);
+    let base = normalized.unwrap_or(output);
+    let remaining = crate::loopnorm::DEFAULT_MAX_NEW_BLOCKS.saturating_sub(loop_splits);
+    let phi = if mode == StructuringMode::Auto {
+        Some(crate::philower::destroy_phis_with_budget(
+            base,
+            crate::philower::PhiLowerBudget {
+                max_new_blocks: remaining,
+            },
+        ))
+    } else {
+        None
+    };
+    let phi_splits = phi
+        .as_ref()
+        .map(|item| item.report.nodes_split)
+        .unwrap_or(0);
+    let phi_destroyed = phi
+        .as_ref()
+        .is_some_and(|item| item.report.phis_destroyed > 0);
+    let lowered = phi.as_ref().and_then(|item| item.lift.as_ref());
+    let subject = lowered.unwrap_or(base);
     let reason = if mode == StructuringMode::Auto {
         match build_region_tree(subject, dex)
             .and_then(|tree| render_region_tree(&tree, subject, dex).map(|text| (tree, text)))
@@ -777,15 +813,13 @@ pub fn structure_lifted(
                         used_region_path: true,
                         fallback_reason: None,
                         structured_try_count: tree.structured_try_count,
-                        nodes_split: prepared
-                            .as_ref()
-                            .map(|item| item.report.nodes_split)
-                            .unwrap_or(0),
+                        nodes_split: loop_splits + phi_splits,
+                        phi_lowered: phi_destroyed,
                     },
                     Default::default(),
                 );
             }
-            Err(reason) => Some(explained_failure(prepared.as_ref(), reason)),
+            Err(reason) => Some(explained_failure(prepared.as_ref(), phi.as_ref(), reason)),
         }
     } else {
         None
@@ -799,12 +833,33 @@ pub fn structure_lifted(
             fallback_reason: reason,
             structured_try_count: 0,
             nodes_split: 0,
+            phi_lowered: false,
         },
         diagnostics,
     )
 }
 
 fn explained_failure(
+    prepared: Option<&crate::loopnorm::LoopNormOutcome>,
+    phi: Option<&crate::philower::PhiLowerOutcome>,
+    build_reason: Failure,
+) -> Failure {
+    let loop_reason = explained_loop(prepared, build_reason);
+    if loop_reason != build_reason {
+        return loop_reason;
+    }
+    if matches!(
+        build_reason,
+        Failure::UnsupportedShape | Failure::ValidationFailed
+    ) && let Some(crate::philower::PhiLowerRefusal::ExpansionBudget) =
+        phi.and_then(|item| item.report.refusal)
+    {
+        return Failure::Budget;
+    }
+    build_reason
+}
+
+fn explained_loop(
     prepared: Option<&crate::loopnorm::LoopNormOutcome>,
     build_reason: Failure,
 ) -> Failure {

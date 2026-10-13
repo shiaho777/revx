@@ -11,6 +11,7 @@ pub mod jni;
 pub mod kotlin;
 pub mod lift;
 pub mod loopnorm;
+pub mod philower;
 pub mod region;
 pub mod render;
 pub mod signature;

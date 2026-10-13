@@ -2,7 +2,7 @@ use crate::DexFile;
 use crate::structure::{GotoReason, StructuringDiagnostics};
 use std::collections::{BTreeMap, BTreeSet};
 
-pub const CENSUS_SCHEMA_VERSION: u32 = 5;
+pub const CENSUS_SCHEMA_VERSION: u32 = 6;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FinalGotoSite {
@@ -184,6 +184,7 @@ pub struct CensusCounts {
     pub fallback_by_reason: BTreeMap<String, usize>,
     pub nodes_split: usize,
     pub loop_norm_methods: usize,
+    pub phi_lower_methods: usize,
     pub unknown_methods: usize,
 }
 
@@ -219,6 +220,7 @@ impl CensusCounts {
         self.structured_try_count += other.structured_try_count;
         self.nodes_split += other.nodes_split;
         self.loop_norm_methods += other.loop_norm_methods;
+        self.phi_lower_methods += other.phi_lower_methods;
         self.unknown_methods += other.unknown_methods;
         for (reason, count) in &other.fallback_by_reason {
             *self.fallback_by_reason.entry(reason.clone()).or_default() += count;
@@ -341,6 +343,7 @@ pub fn census_dex_with_mode(
                     counts.structured_try_count = output.structured_try_count;
                     counts.nodes_split = output.nodes_split;
                     counts.loop_norm_methods = usize::from(output.nodes_split > 0);
+                    counts.phi_lower_methods = usize::from(output.phi_lowered);
                     if let Some(reason) = output.fallback_reason {
                         counts.fallback_by_reason.insert(reason.as_str().into(), 1);
                     }
@@ -361,6 +364,7 @@ pub fn census_dex_with_mode(
                         fallback_reason: output.fallback_reason,
                         structured_try_count: output.structured_try_count,
                         nodes_split: output.nodes_split,
+                        phi_lowered: output.phi_lowered,
                     });
                     let exception_counts = flow.counts();
                     report.exception_totals.add(&exception_counts);

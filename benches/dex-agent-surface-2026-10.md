@@ -18,7 +18,7 @@ Agent-facing evidence for the R5 synthetic matrix. JADX is not a CI dependency. 
 | SCC larger than split budget 32 | no | partial | `budget_exceeded` | same as legacy |
 | multi-entry SCC with protected block | no | partial | `loop_exception_intersection` | same as legacy |
 | try crosses loop back-edge | no | partial | `cross_region_edge` | same as legacy |
-| multi-entry loop with phi | no | partial | `unsupported_control_flow` | same as legacy |
+| multi-entry loop with phi | yes, after R6 lowering | complete | none | region `while` copies |
 
 Tests: `crates/revx-dex/tests/evidence.rs`, `crates/revx-dex/tests/r5_acceptance.rs`.
 

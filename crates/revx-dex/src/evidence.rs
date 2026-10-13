@@ -142,6 +142,7 @@ pub fn observe_dex(
                     fallback_reason: None,
                     structured_try_count: 0,
                     nodes_split: 0,
+                    phi_lowered: false,
                 }
             } else {
                 match dex.code_item(method.code_off) {
@@ -162,6 +163,7 @@ pub fn observe_dex(
                         fallback_reason: None,
                         structured_try_count: 0,
                         nodes_split: 0,
+                        phi_lowered: false,
                     },
                 }
             };

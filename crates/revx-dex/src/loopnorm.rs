@@ -119,7 +119,7 @@ pub fn normalize_loops_with_budget(output: &LiftOutput, budget: LoopNormBudget) 
     }
 }
 
-fn exception_blocks(flow: &ExceptionFlow) -> BTreeSet<BlockId> {
+pub(crate) fn exception_blocks(flow: &ExceptionFlow) -> BTreeSet<BlockId> {
     let mut blocks = BTreeSet::new();
     for region in &flow.regions {
         blocks.extend(region.protected_blocks.iter().copied());
@@ -477,7 +477,7 @@ fn remap_operand(op: &Operand, value_map: &HashMap<SsaValueId, SsaValueId>) -> O
     }
 }
 
-fn add_edge(cfg: &mut Cfg, from: BlockId, to: BlockId) {
+pub(crate) fn add_edge(cfg: &mut Cfg, from: BlockId, to: BlockId) {
     let succs = &mut cfg.succs[from.0 as usize];
     if !succs.contains(&to) {
         succs.push(to);
@@ -509,7 +509,7 @@ fn mirror_phi(
     }
 }
 
-fn retarget_edge(output: &mut LiftOutput, pred: BlockId, from: BlockId, to: BlockId) {
+pub(crate) fn retarget_edge(output: &mut LiftOutput, pred: BlockId, from: BlockId, to: BlockId) {
     for succ in &mut output.func.cfg.succs[pred.0 as usize] {
         if *succ == from {
             *succ = to;
@@ -573,7 +573,7 @@ fn dedup_blocks(blocks: &mut Vec<BlockId>) {
     blocks.retain(|block| seen.insert(*block));
 }
 
-fn edges_consistent(cfg: &Cfg) -> bool {
+pub(crate) fn edges_consistent(cfg: &Cfg) -> bool {
     let n = cfg.blocks.len();
     if cfg.preds.len() != n || cfg.succs.len() != n {
         return false;
