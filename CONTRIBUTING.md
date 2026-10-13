@@ -12,7 +12,7 @@ This project uses **Issue → PR → main → CI → merge**.
 5. **Merge only when CI is green.** The linked Issue then auto-closes via the PR keyword.
 6. Do **not** close the Issue early while the PR is open or CI is red. CI does not close Issues.
 
-Coding agents should follow the same loop in [AGENTS.md](AGENTS.md) (Delivery section).
+Coding agents should follow the same loop in [AGENTS.md](AGENTS.md) (Delivery section). DEX/APK agent routing lives in [skill/revx/SKILL.md](skill/revx/SKILL.md); `revx mcp install` copies it next to host MCP configs.
 
 ### Exemptions
 

@@ -981,6 +981,86 @@ hypotheses:
             }
             lines.join("\n")
         }
+        CapabilityResponse::DexDecompile(payload) => {
+            let mut lines = vec![
+                "# dex_decompile".to_string(),
+                format!("methods: {}", payload.methods.len()),
+                format!("unknowns: {}", payload.unknowns.len()),
+            ];
+            for method in payload.methods.iter().take(40) {
+                let coverage = match method.evidence.coverage.status {
+                    revx_core::CoverageStatus::Complete => "complete",
+                    revx_core::CoverageStatus::Partial => "partial",
+                    revx_core::CoverageStatus::Unknown => "unknown",
+                };
+                let reason = method
+                    .fallback_reason
+                    .as_deref()
+                    .or(method.evidence.coverage.reason.as_deref())
+                    .unwrap_or("-");
+                lines.push(format!(
+                    "- {}  {}  coverage={}  reason={}  view={}/{}",
+                    method.evidence.evidence_id,
+                    method.signature,
+                    coverage,
+                    reason,
+                    method.view.offset,
+                    method.view.total
+                ));
+            }
+            if payload.methods.len() > 40 {
+                lines.push(format!("- ... {} more", payload.methods.len() - 40));
+            }
+            if !payload.unknowns.is_empty() {
+                lines.push("\n## Unknowns".to_string());
+                for unknown in payload.unknowns.iter().take(20) {
+                    lines.push(format!(
+                        "- {}  {}  {}",
+                        unknown.unknown_id, unknown.reason, unknown.question
+                    ));
+                }
+            }
+            lines.push("\nnext: inspect_analysis_view(evidence_id) | list_unknowns".to_string());
+            lines.join("\n")
+        }
+        CapabilityResponse::InspectAnalysisView(payload) => {
+            let mut lines = vec![
+                "# inspect_analysis_view".to_string(),
+                format!("evidence_id: {}", payload.view.evidence_id),
+                format!(
+                    "offset: {}  limit: {}  total: {}  truncated: {}",
+                    payload.view.offset,
+                    payload.view.limit,
+                    payload.view.total,
+                    payload.view.truncated
+                ),
+            ];
+            if let Some(next) = payload.view.next_offset {
+                lines.push(format!("next_offset: {next}"));
+            }
+            lines.push(format!("coverage: {:?}", payload.coverage.status));
+            if !payload.view.text.is_empty() {
+                lines.push("\n## Text".to_string());
+                lines.push(payload.view.text.clone());
+            }
+            lines.join("\n")
+        }
+        CapabilityResponse::ListUnknowns(payload) => {
+            let mut lines = vec![
+                "# list_unknowns".to_string(),
+                format!("total: {}", payload.total),
+            ];
+            for unknown in &payload.unknowns {
+                lines.push(format!(
+                    "- {}  {}  {}",
+                    unknown.unknown_id, unknown.reason, unknown.question
+                ));
+            }
+            if let Some(next) = payload.next_offset {
+                lines.push(format!("next_offset: {next}"));
+            }
+            lines.join("\n")
+        }
     };
     truncate_chars(&body, MAX_CHARS)
 }

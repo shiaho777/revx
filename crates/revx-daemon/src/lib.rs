@@ -3,33 +3,36 @@ use revx_analysis::analyze_streaming;
 use revx_core::{
     AgentInteractionBrief, AgentNextAction, AnalysisBriefRequest, AnalysisBriefResponse,
     AnalysisHotFunction, AnalysisImportHit, AnalysisProfile, AnalysisRunRequest,
-    AnalysisRunResponse, AnalysisStatusRequest, AnalysisStringHit, BinaryListResponse,
-    BinarySurveyRequest, BinarySurveyResponse, CallgraphSliceRequest, CallgraphSliceResponse,
-    CapabilityEnvelope, CapabilityError, CapabilityReply, CapabilityRequest, CapabilityResponse,
-    DecompileCacheEntry, DecompileCacheStatusRequest, DecompileCacheStatusResponse,
-    DecompileFunctionRequest, DecompileFunctionResponse, DecompileStrategy,
-    DisassembleFunctionRequest, DisassembleFunctionResponse, Evidence, EvidenceGraphRequest,
-    EvidencePackRequest, EvidencePackResponse, EvidenceProvenance, FunctionProfileRequest,
-    FunctionProfileResponse, FunctionSearchHit, FunctionSearchRequest, FunctionSearchResponse,
-    HypothesisCreateRequest, HypothesisCreateResponse, HypothesisUpdateRequest,
-    HypothesisUpdateResponse, IbcAdvanceRequest, IbcAdvanceResponse, IbcStatusRequest,
-    IbcStatusResponse, InvestigationRunRequest, InvestigationRunResponse, ObjectAnalysisStatus,
-    ObjectAnalysisSummary, ObjectAnalyzeBinaryRequest, ObjectAnalyzeBinaryResponse,
-    ObjectAnalyzeRequest, ObjectAnalyzeResponse, ObjectCarveIdentifyRequest,
-    ObjectCarveIdentifyResponse, ObjectCarveIdentifyResult, ObjectCarveSignaturesRequest,
-    ObjectCarveSignaturesResponse, ObjectExtractRangeRequest, ObjectExtractRangeResponse,
-    ObjectIdentifyRequest, ObjectIdentifyResponse, ObjectKind, ObjectMaterializeRequest,
-    ObjectMaterializeResponse, ObjectPipelineRequest, ObjectPipelineResponse, ObjectPipelineStage,
-    ObjectPipelineStep, ObjectPluginListRequest, ObjectPluginListResponse, ObjectPluginRunRequest,
-    ObjectPluginRunResponse, ObjectProfileRequest, ObjectProfileResponse,
-    ObjectRegisterBinaryRequest, ObjectRegisterBinaryResponse, ObjectSearchRequest,
-    ObjectSearchResponse, ObjectSignatureScanRequest, ObjectSignatureScanResponse,
-    ProjectOpenRequest, ProjectOpenResponse, ProjectStatusRequest, ProjectStatusResponse, Report,
-    ReportGenerateRequest, ReportGenerateResponse, SearchBytesRequest, StringSearchRequest,
-    StringSearchResponse, SymbolicConstraint, SymbolicConstraintOp, SymbolicDomain,
-    SymbolicLinearExpr, SymbolicSolveRequest, SymbolicSolveResponse, SymbolicSolveStatus,
-    TraceImportRequest, TraceImportResponse, TraceQueryRequest, TraceQueryResponse,
-    UniversalObject, XrefsQueryRequest, XrefsQueryResponse,
+    AnalysisRunResponse, AnalysisStatusRequest, AnalysisStringHit, AnalysisViewPage,
+    BinaryListResponse, BinarySurveyRequest, BinarySurveyResponse, CallgraphSliceRequest,
+    CallgraphSliceResponse, CapabilityEnvelope, CapabilityError, CapabilityReply,
+    CapabilityRequest, CapabilityResponse, Coverage, DecompileCacheEntry,
+    DecompileCacheStatusRequest, DecompileCacheStatusResponse, DecompileFunctionRequest,
+    DecompileFunctionResponse, DecompileStrategy, DexDecompileRequest, DexDecompileResponse,
+    DisassembleFunctionRequest, DisassembleFunctionResponse, Evidence, EvidenceDetail,
+    EvidenceGraphRequest, EvidencePackRequest, EvidencePackResponse, EvidenceProvenance,
+    FunctionProfileRequest, FunctionProfileResponse, FunctionSearchHit, FunctionSearchRequest,
+    FunctionSearchResponse, HypothesisCreateRequest, HypothesisCreateResponse,
+    HypothesisUpdateRequest, HypothesisUpdateResponse, IbcAdvanceRequest, IbcAdvanceResponse,
+    IbcStatusRequest, IbcStatusResponse, InspectAnalysisViewRequest, InspectAnalysisViewResponse,
+    InvestigationRunRequest, InvestigationRunResponse, ListUnknownsRequest, ListUnknownsResponse,
+    ObjectAnalysisStatus, ObjectAnalysisSummary, ObjectAnalyzeBinaryRequest,
+    ObjectAnalyzeBinaryResponse, ObjectAnalyzeRequest, ObjectAnalyzeResponse,
+    ObjectCarveIdentifyRequest, ObjectCarveIdentifyResponse, ObjectCarveIdentifyResult,
+    ObjectCarveSignaturesRequest, ObjectCarveSignaturesResponse, ObjectExtractRangeRequest,
+    ObjectExtractRangeResponse, ObjectIdentifyRequest, ObjectIdentifyResponse, ObjectKind,
+    ObjectMaterializeRequest, ObjectMaterializeResponse, ObjectPipelineRequest,
+    ObjectPipelineResponse, ObjectPipelineStage, ObjectPipelineStep, ObjectPluginListRequest,
+    ObjectPluginListResponse, ObjectPluginRunRequest, ObjectPluginRunResponse,
+    ObjectProfileRequest, ObjectProfileResponse, ObjectRegisterBinaryRequest,
+    ObjectRegisterBinaryResponse, ObjectSearchRequest, ObjectSearchResponse,
+    ObjectSignatureScanRequest, ObjectSignatureScanResponse, ProjectOpenRequest,
+    ProjectOpenResponse, ProjectStatusRequest, ProjectStatusResponse, Report,
+    ReportGenerateRequest, ReportGenerateResponse, ResidualUnknown, SearchBytesRequest,
+    StringSearchRequest, StringSearchResponse, SymbolicConstraint, SymbolicConstraintOp,
+    SymbolicDomain, SymbolicLinearExpr, SymbolicSolveRequest, SymbolicSolveResponse,
+    SymbolicSolveStatus, TraceImportRequest, TraceImportResponse, TraceQueryRequest,
+    TraceQueryResponse, UniversalObject, XrefsQueryRequest, XrefsQueryResponse,
 };
 use revx_loader::{identify_object_graph, load_binary};
 use revx_workspace::Workspace;
@@ -56,11 +59,20 @@ use mcp_tools::*;
 const IBC_CONTINUUM_LEDGER_CACHE: &str = "ibc_continuum_ledger.json";
 
 #[derive(Clone)]
+struct RetainedAnalysis {
+    text: String,
+    coverage: Coverage,
+    unknown_ids: Vec<String>,
+}
+
+#[derive(Clone)]
 pub struct CapabilityService {
     workspace_root: PathBuf,
     workspace: std::sync::OnceLock<Workspace>,
     ibc_ledger: std::sync::Arc<std::sync::Mutex<revx_analysis::IbcContinuumLedger>>,
     ibc_ledger_loaded: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    analysis_store: std::sync::Arc<std::sync::Mutex<BTreeMap<String, RetainedAnalysis>>>,
+    unknown_store: std::sync::Arc<std::sync::Mutex<BTreeMap<String, ResidualUnknown>>>,
 }
 
 impl CapabilityService {
@@ -75,6 +87,8 @@ impl CapabilityService {
                 },
             )),
             ibc_ledger_loaded: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            analysis_store: std::sync::Arc::new(std::sync::Mutex::new(BTreeMap::new())),
+            unknown_store: std::sync::Arc::new(std::sync::Mutex::new(BTreeMap::new())),
         }
     }
 
@@ -112,6 +126,91 @@ impl CapabilityService {
         if let Ok(guard) = self.ibc_ledger.lock() {
             let _ = ws.write_cache_json(IBC_CONTINUUM_LEDGER_CACHE, &*guard);
         }
+    }
+
+    fn run_dex_decompile(&self, request: DexDecompileRequest) -> Result<DexDecompileResponse> {
+        let data = std::fs::read(&request.path)
+            .with_context(|| format!("failed to read {}", request.path))?;
+        let dex = revx_dex::DexFile::parse(data)
+            .map_err(|error| anyhow::anyhow!("DEX parse failed: {error}"))?;
+        let detail = request.detail.unwrap_or(EvidenceDetail::Summary);
+        let (methods, unknowns) = revx_dex::evidence::observe_dex(
+            &dex,
+            request.class.as_deref(),
+            request.method.as_deref(),
+            request.limit.unwrap_or(20),
+            request.view_offset.unwrap_or(0),
+            request
+                .view_limit
+                .unwrap_or(revx_dex::evidence::DEFAULT_VIEW_LINES),
+            detail.is_complete(),
+        );
+        if let Ok(mut store) = self.analysis_store.lock() {
+            for method in &methods {
+                store.insert(
+                    method.evidence.evidence_id.clone(),
+                    RetainedAnalysis {
+                        text: method.source_text.clone(),
+                        coverage: method.evidence.coverage.clone(),
+                        unknown_ids: method.evidence.unknown_ids.clone(),
+                    },
+                );
+            }
+        }
+        if let Ok(mut store) = self.unknown_store.lock() {
+            for unknown in &unknowns {
+                store.insert(unknown.unknown_id.clone(), unknown.clone());
+            }
+        }
+        Ok(DexDecompileResponse { methods, unknowns })
+    }
+
+    fn run_inspect_analysis_view(
+        &self,
+        request: InspectAnalysisViewRequest,
+    ) -> Result<InspectAnalysisViewResponse> {
+        let retained = self
+            .analysis_store
+            .lock()
+            .ok()
+            .and_then(|store| store.get(&request.evidence_id).cloned())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "unknown evidence_id {}; call dex_decompile first",
+                    request.evidence_id
+                )
+            })?;
+        let view = AnalysisViewPage::from_text(
+            request.evidence_id,
+            &retained.text,
+            request.offset.unwrap_or(0),
+            request
+                .limit
+                .unwrap_or(revx_dex::evidence::DEFAULT_VIEW_LINES),
+        );
+        Ok(InspectAnalysisViewResponse {
+            view,
+            coverage: retained.coverage,
+            unknown_ids: retained.unknown_ids,
+        })
+    }
+
+    fn run_list_unknowns(&self, request: ListUnknownsRequest) -> Result<ListUnknownsResponse> {
+        let store = self
+            .unknown_store
+            .lock()
+            .map_err(|_| anyhow::anyhow!("unknown ledger is busy"))?;
+        let all: Vec<ResidualUnknown> = store.values().cloned().collect();
+        let total = all.len();
+        let offset = request.offset.unwrap_or(0).min(total);
+        let limit = request.limit.unwrap_or(total.saturating_sub(offset));
+        let end = offset.saturating_add(limit).min(total);
+        let truncated = end < total;
+        Ok(ListUnknownsResponse {
+            total,
+            next_offset: truncated.then_some(end),
+            unknowns: all[offset..end].to_vec(),
+        })
     }
 
     fn continuum_namespace(&self, ws: &Workspace, hint: Option<&str>) -> String {
@@ -1362,6 +1461,15 @@ impl CapabilityService {
                     artifact,
                 }))
             }
+            CapabilityRequest::DexDecompile(request) => Ok(CapabilityResponse::DexDecompile(
+                self.run_dex_decompile(request)?,
+            )),
+            CapabilityRequest::InspectAnalysisView(request) => Ok(
+                CapabilityResponse::InspectAnalysisView(self.run_inspect_analysis_view(request)?),
+            ),
+            CapabilityRequest::ListUnknowns(request) => Ok(CapabilityResponse::ListUnknowns(
+                self.run_list_unknowns(request)?,
+            )),
         }
     }
 }
@@ -6029,6 +6137,9 @@ int main(int argc, char **argv) {
         assert!(names.iter().any(|name| name == "artifact_list"));
         assert!(names.iter().any(|name| name == "search_bytes"));
         assert!(names.iter().any(|name| name == "object_search_content"));
+        assert!(names.iter().any(|name| name == "dex_decompile"));
+        assert!(names.iter().any(|name| name == "inspect_analysis_view"));
+        assert!(names.iter().any(|name| name == "list_unknowns"));
 
         let object_analyze = tools
             .iter()
@@ -6353,6 +6464,21 @@ int main(int argc, char **argv) {
         )
         .unwrap();
         assert!(matches!(brief, CapabilityRequest::AnalysisBrief(_)));
+
+        let dex = tool_name_to_request(
+            "dex_decompile",
+            serde_json::json!({ "path": "/tmp/classes.dex" }),
+        )
+        .unwrap();
+        assert!(matches!(dex, CapabilityRequest::DexDecompile(_)));
+        let view = tool_name_to_request(
+            "inspect_analysis_view",
+            serde_json::json!({ "evidence_id": "ev_test" }),
+        )
+        .unwrap();
+        assert!(matches!(view, CapabilityRequest::InspectAnalysisView(_)));
+        let unknowns = tool_name_to_request("list_unknowns", serde_json::json!({})).unwrap();
+        assert!(matches!(unknowns, CapabilityRequest::ListUnknowns(_)));
     }
 
     #[test]

@@ -78,6 +78,8 @@ CI 门禁是仓内冻结的合成能力矩阵，不是未入库的私有 DEX。
 
 R1–R5 到此结束。新格式、协程和 phi 降级不在这条主线上追加。
 
+Agent 表面（DEX evidence / skill）见 [DEX agent surface](benches/dex-agent-surface-2026-10.md)。它把已冻结的区域树结果交给 MCP，不扩大结构化范围。
+
 ## 已知降级（v1 冻结）
 
 - phi、多出口区域、循环内 switch：`unsupported_control_flow`，整方法 legacy。

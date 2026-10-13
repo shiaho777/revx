@@ -232,6 +232,18 @@ fn census_reports_method_identity_and_totals() {
     assert_eq!(m.class, "Lcom/example/Foo;");
     assert_eq!(m.signature, "Lcom/example/Foo;->m0()V");
     assert_eq!(m.status, "completed");
+    assert!(
+        m.evidence_id
+            .as_ref()
+            .is_some_and(|id| id.starts_with("ev_"))
+    );
+    assert_eq!(
+        m.unknown_id.is_some(),
+        m.region
+            .as_ref()
+            .and_then(|region| region.fallback_reason)
+            .is_some()
+    );
     let counts = m.counts.as_ref().expect("counts");
     assert_eq!(counts.final_goto_count, 0);
     assert_eq!(counts.by_reason.unknown, 0);
@@ -312,7 +324,7 @@ fn census_aggregates_the_rendered_methods_exception_flow() {
     dex.data.extend_from_slice(&[1, 0, 1]);
     dex.classes[0].class_data.as_mut().unwrap().virtual_methods[0].code_off = offset;
     let report = census::census_dex(&dex, None);
-    assert_eq!(report.schema_version, 4);
+    assert_eq!(report.schema_version, census::CENSUS_SCHEMA_VERSION);
     assert_eq!(report.selection.completed_methods, 1);
     let method = &report.methods[0];
     let flow = method.exception_flow.as_ref().unwrap();

@@ -165,6 +165,29 @@ struct DexDecompileArgs {
     method: Option<String>,
     #[arg(long, default_value_t = 20)]
     limit: usize,
+    #[arg(long)]
+    json: bool,
+    #[arg(long, value_enum, default_value_t = EvidenceDetailValue::Complete)]
+    detail: EvidenceDetailValue,
+    #[arg(long, default_value_t = 0)]
+    view_offset: usize,
+    #[arg(long, default_value_t = revx_dex::evidence::DEFAULT_VIEW_LINES)]
+    view_limit: usize,
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum EvidenceDetailValue {
+    Summary,
+    Complete,
+}
+
+impl From<EvidenceDetailValue> for revx_core::EvidenceDetail {
+    fn from(value: EvidenceDetailValue) -> Self {
+        match value {
+            EvidenceDetailValue::Summary => Self::Summary,
+            EvidenceDetailValue::Complete => Self::Complete,
+        }
+    }
 }
 
 #[derive(Args)]
@@ -681,6 +704,7 @@ enum McpHost {
     Cursor,
     Claude,
     Codex,
+    Grok,
 }
 
 #[derive(Subcommand)]
@@ -956,6 +980,7 @@ fn cmd_dex_goto_census(args: DexGotoCensusArgs) -> Result<()> {
                     "structured_try_count": census.totals.structured_try_count,
                     "nodes_split": census.totals.nodes_split,
                     "loop_norm_methods": census.totals.loop_norm_methods,
+                    "unknown_methods": census.totals.unknown_methods,
                     "fallback_by_reason": census.totals.fallback_by_reason,
                 },
                 "exception_totals": exception_counts_json(&census.exception_totals),
@@ -974,6 +999,8 @@ fn cmd_dex_goto_census(args: DexGotoCensusArgs) -> Result<()> {
                         "nodes_split": r.nodes_split,
                         "fallback_reason": r.fallback_reason.map(|reason| reason.as_str()),
                     })),
+                    "evidence_id": m.evidence_id,
+                    "unknown_id": m.unknown_id,
                     "final_goto_count": m.counts.as_ref().map(|c| c.final_goto_count).unwrap_or(0),
                     "final_goto_line_count": m.counts.as_ref().map(|c| c.final_goto_line_count).unwrap_or(0),
                     "by_reason": {
@@ -1265,19 +1292,33 @@ fn cmd_dex_decompile(args: DexDecompileArgs) -> Result<()> {
         fs::read(&args.path).with_context(|| format!("failed to read {}", args.path.display()))?;
     let dex =
         revx_dex::DexFile::parse(data).map_err(|e| anyhow::anyhow!("DEX parse failed: {e}"))?;
-    let methods = revx_dex::render::decompile_dex(
+    let detail: revx_core::EvidenceDetail = args.detail.into();
+    let (methods, unknowns) = revx_dex::evidence::observe_dex(
         &dex,
         args.class.as_deref(),
         args.method.as_deref(),
         args.limit,
+        args.view_offset,
+        args.view_limit,
+        detail.is_complete(),
     );
-    println!("// {} methods decompiled", methods.len());
-    for mc in &methods {
+    if args.json {
         println!(
-            "// {} (regs={} insns={})",
-            mc.signature, mc.registers, mc.insn_units
+            "{}",
+            serde_json::json!({
+                "methods": methods,
+                "unknowns": unknowns,
+            })
         );
-        println!("{}", mc.pseudocode);
+        return Ok(());
+    }
+    println!("// {} methods decompiled", methods.len());
+    for method in &methods {
+        println!(
+            "// {} coverage={:?} evidence={}",
+            method.signature, method.evidence.coverage.status, method.evidence.evidence_id
+        );
+        println!("{}", method.source_text);
         println!();
     }
     Ok(())
@@ -1945,13 +1986,27 @@ fn cmd_mcp_install(
             McpHost::Cursor,
             McpHost::Claude,
             McpHost::Codex,
+            McpHost::Grok,
         ]
     } else {
         hosts
     };
 
+    let skill_dir = prefix.join("share/revx/skill/revx/references");
+    fs::create_dir_all(&skill_dir)?;
+    let skill_root = prefix.join("share/revx/skill/revx");
+    fs::write(
+        skill_root.join("SKILL.md"),
+        include_str!("../../../skill/revx/SKILL.md"),
+    )?;
+    fs::write(
+        skill_dir.join("dex.md"),
+        include_str!("../../../skill/revx/references/dex.md"),
+    )?;
+
     println!("installed: {}", engine_dst.display());
     println!("workspace: {}", project.display());
+    println!("skill: {}", skill_root.display());
 
     for host in host_list {
         let body = render_mcp_host_config(host, &engine_dst, &project);
@@ -1960,6 +2015,7 @@ fn cmd_mcp_install(
             McpHost::Cursor => "cursor.mcp.json",
             McpHost::Claude => "claude_desktop.mcp.json",
             McpHost::Codex => "codex.mcp.json",
+            McpHost::Grok => "grok.mcp.json",
         };
         let path = conf_dir.join(name);
         if write_config {
@@ -2079,7 +2135,7 @@ fn render_mcp_host_config(host: McpHost, engine: &Path, workspace: &Path) -> Str
     let engine_s = engine.display().to_string();
     let workspace_s = workspace.display().to_string();
     match host {
-        McpHost::Generic | McpHost::Codex | McpHost::Cursor | McpHost::Claude => {
+        McpHost::Generic | McpHost::Codex | McpHost::Cursor | McpHost::Claude | McpHost::Grok => {
             if std::env::var_os("REVX_MCP_STDIO").is_some() {
                 serde_json::json!({
                     "mcpServers": {

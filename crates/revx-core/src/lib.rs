@@ -1,9 +1,11 @@
+pub mod agent;
 pub mod compound;
 pub mod intern;
 pub mod limits;
 pub mod model;
 pub mod project;
 
+pub use agent::*;
 pub use compound::*;
 pub use intern::*;
 pub use limits::*;

@@ -17,7 +17,7 @@ R4 把无 phi 的多入口循环归一化后交给 R3 区域树。R5 把这条�
 | try 跨过循环回边 | 回退 `cross_region_edge`，文本与 legacy 相同 |
 | 多入口循环带 phi | incoming 按新前驱重映射；区域树仍拒绝 phi，回退 `unsupported_control_flow`，文本与 legacy 相同 |
 
-普查 schema 为 4。`nodes_split` 与 `loop_norm_methods` 只统计真正走区域树的拆分，回退方法计 0。final goto 的 `by_reason.unknown` 仍等于最终 goto 数。
+普查 schema 为 5。`nodes_split` 与 `loop_norm_methods` 只统计真正走区域树的拆分，回退方法计 0。`unknown_methods` 统计带结构化 unknown 的方法。final goto 的 `by_reason.unknown` 仍等于最终 goto 数。
 
 矩阵在 debug 测试进程里的墙上时间上限是 5 秒。这只约束这组合成图，不替代 R3 报告里的私有语料 RSS。
 
