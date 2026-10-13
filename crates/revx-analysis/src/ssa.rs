@@ -2089,7 +2089,7 @@ pub struct SsaInstruction {
 // ─── CFG ───────────────────────────────────────────────────────────────────
 
 /// Control Flow Graph built from basic blocks.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct Cfg {
     pub blocks: Vec<CfgBlock>,
     pub preds: Vec<Vec<BlockId>>,
@@ -2097,7 +2097,7 @@ pub struct Cfg {
     pub entry: BlockId,
 }
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct CfgBlock {
     pub id: BlockId,
     pub start_addr: u64,
@@ -2280,7 +2280,7 @@ impl Cfg {
 
 // ─── Dominator Tree ────────────────────────────────────────────────────────
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct DominatorTree {
     pub idom: Vec<Option<BlockId>>,
     pub rpo: Vec<BlockId>,
@@ -2678,7 +2678,7 @@ fn block_defs_mut(defs: &mut Vec<BlockDefMap>, block: BlockId) -> &mut BlockDefM
 }
 
 /// SSA function: the result of SSA construction for a single function.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct SsaFunction {
     pub cfg: Cfg,
     pub dom_tree: DominatorTree,

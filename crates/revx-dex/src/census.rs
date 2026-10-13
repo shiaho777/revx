@@ -2,7 +2,7 @@ use crate::DexFile;
 use crate::structure::{GotoReason, StructuringDiagnostics};
 use std::collections::{BTreeMap, BTreeSet};
 
-pub const CENSUS_SCHEMA_VERSION: u32 = 3;
+pub const CENSUS_SCHEMA_VERSION: u32 = 4;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FinalGotoSite {
@@ -182,6 +182,8 @@ pub struct CensusCounts {
     pub legacy_methods: usize,
     pub structured_try_count: usize,
     pub fallback_by_reason: BTreeMap<String, usize>,
+    pub nodes_split: usize,
+    pub loop_norm_methods: usize,
 }
 
 impl CensusCounts {
@@ -214,6 +216,8 @@ impl CensusCounts {
         self.region_methods += other.region_methods;
         self.legacy_methods += other.legacy_methods;
         self.structured_try_count += other.structured_try_count;
+        self.nodes_split += other.nodes_split;
+        self.loop_norm_methods += other.loop_norm_methods;
         for (reason, count) in &other.fallback_by_reason {
             *self.fallback_by_reason.entry(reason.clone()).or_default() += count;
         }
@@ -329,6 +333,8 @@ pub fn census_dex_with_mode(
                     counts.region_methods = usize::from(output.used_region_path);
                     counts.legacy_methods = usize::from(!output.used_region_path);
                     counts.structured_try_count = output.structured_try_count;
+                    counts.nodes_split = output.nodes_split;
+                    counts.loop_norm_methods = usize::from(output.nodes_split > 0);
                     if let Some(reason) = output.fallback_reason {
                         counts.fallback_by_reason.insert(reason.as_str().into(), 1);
                     }
@@ -336,6 +342,7 @@ pub fn census_dex_with_mode(
                         used: output.used_region_path,
                         fallback_reason: output.fallback_reason,
                         structured_try_count: output.structured_try_count,
+                        nodes_split: output.nodes_split,
                     });
                     let exception_counts = flow.counts();
                     report.exception_totals.add(&exception_counts);

@@ -53,17 +53,39 @@ Issue #82。边界：独立 try 区域的区域树路径 + 整方法回退；共
 验收重点已达成首版：合成 CFG-vs-Region 执行轨迹等价（菱形、循环、异常注入）、真实 DEX switch 回归、四种异常回退原因精确断言、预算回退。
 共享/入口可达 handler、嵌套 try/catch 的完整结构化仍未攻克（structured_try_count=7/1,731），其主因分布见报告；具体数值目标在后续阶段冻结。
 
-## R4 — 多入口循环归一化
+## R4 — 多入口循环归一化：已交付
 
-SCC 检测、预算受限的节点拆分及 phi 重映射；连接 R3 区域表示。
-验收需包含多入口/嵌套循环、异常区间与循环相交、代码扩张限制以及运行语义对照。
-不能安全处理的情况保留说明，不承诺任意输入 goto 归零。
+SCC 检测、预算受限的整分量节点拆分，以及拆分后的 phi incoming 重映射。归一化结果只在区域树校验通过时进入 R3 渲染；失败则整方法回退 legacy，伪代码与 legacy 路径一致。
 
-## R5 — 固定范围的发布验收
+- 无 phi 的多入口循环拆成两个单入口循环，CFG 轨迹与区域树轨迹一致。
+- 嵌套自然循环不拆分，内外层副作用顺序保持。
+- 默认新增块预算 32。放不下的 SCC 不拆，回退原因 `budget_exceeded`。
+- SCC 含受保护块或 handler 时不拆，回退原因 `loop_exception_intersection`。
+- try 区间跨过循环回边时保持 `cross_region_edge`，不把异常边并进普通 CFG。
+- 带 phi 的不可约循环会重映射 incoming，但区域树仍拒绝 phi，整方法回退 `unsupported_control_flow`。
+- 不承诺任意输入 goto 归零。
 
-复跑冻结语料、正确性回归和同配置性能基线，检查格式能力清单和所有已知降级。
-完成这一发布版本的验收后关闭 R1–R5；新格式、协程等独立需求进入后续版本，不在本主线无限追加。
-“世界最强”不是可执行的发布条件，应以公开、可复现的专项比较结果说明优势与限制。
+验收见 `crates/revx-dex/tests/loop_norm.rs` 与 [R5 报告](benches/r5-acceptance-2026-10.md)。
+
+## R5 — 固定范围的发布验收：已交付
+
+CI 门禁是仓内冻结的合成能力矩阵，不是未入库的私有 DEX。
+
+- 矩阵：`crates/revx-dex/tests/r5_acceptance.rs`。嵌套循环、多入口循环、扩张预算、循环与异常相交、跨循环 try、phi 不可约循环，各自有固定采用或回退原因。回退路径的文本与 legacy 相同。
+- 普查 schema v4 增加 `nodes_split` 与 `loop_norm_methods`。final goto 归因仍是 `unknown`。
+- 同配置性能：该矩阵在 debug 测试里 5 秒内跑完。这不是 R3 那份私有语料的 RSS 数字，也不外推成全文件性能承诺。
+- 私有语料 SHA-256 `656331a8…` 不在仓库里，本机也没有 `/tmp/revx-dex-corpus/classes.dex`，所以 R5 没有复跑那份 APK。R3 报告里的数字继续只描述那一次本地观测。
+
+R1–R5 到此结束。新格式、协程和 phi 降级不在这条主线上追加。
+
+## 已知降级（v1 冻结）
+
+- phi、多出口区域、循环内 switch：`unsupported_control_flow`，整方法 legacy。
+- 共享 handler、普通入口可达 handler、重叠 try：各自的既有回退原因。
+- 多入口循环碰到异常元数据：`loop_exception_intersection`。
+- 拆分预算不够：`budget_exceeded`。
+- final goto 根因：`unknown`。
+- 跨进程反编译文本漂移仍然存在。
 
 ## 已知限制与工程规则
 

@@ -2248,6 +2248,7 @@ impl<'a> DexMethodLifter<'a> {
     }
 }
 
+#[derive(Clone)]
 pub struct LiftOutput {
     pub func: SsaFunction,
     pub value_types: crate::types::ValueTypes,
