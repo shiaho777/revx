@@ -2,7 +2,7 @@ use crate::DexFile;
 use crate::structure::{GotoReason, StructuringDiagnostics};
 use std::collections::{BTreeMap, BTreeSet};
 
-pub const CENSUS_SCHEMA_VERSION: u32 = 4;
+pub const CENSUS_SCHEMA_VERSION: u32 = 5;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FinalGotoSite {
@@ -184,6 +184,7 @@ pub struct CensusCounts {
     pub fallback_by_reason: BTreeMap<String, usize>,
     pub nodes_split: usize,
     pub loop_norm_methods: usize,
+    pub unknown_methods: usize,
 }
 
 impl CensusCounts {
@@ -218,6 +219,7 @@ impl CensusCounts {
         self.structured_try_count += other.structured_try_count;
         self.nodes_split += other.nodes_split;
         self.loop_norm_methods += other.loop_norm_methods;
+        self.unknown_methods += other.unknown_methods;
         for (reason, count) in &other.fallback_by_reason {
             *self.fallback_by_reason.entry(reason.clone()).or_default() += count;
         }
@@ -240,6 +242,8 @@ pub struct MethodCensus {
     pub exception_counts: Option<crate::exception::ExceptionFlowCounts>,
     pub exception_flow: Option<crate::exception::ExceptionFlow>,
     pub region: Option<crate::region::RegionPathInfo>,
+    pub evidence_id: Option<String>,
+    pub unknown_id: Option<String>,
 }
 
 #[derive(Debug)]
@@ -306,6 +310,8 @@ pub fn census_dex_with_mode(
             exception_counts: None,
             exception_flow: None,
             region: None,
+            evidence_id: None,
+            unknown_id: None,
         };
         if method.code_off == 0 {
             report.selection.skipped_codeless_methods += 1;
@@ -338,6 +344,18 @@ pub fn census_dex_with_mode(
                     if let Some(reason) = output.fallback_reason {
                         counts.fallback_by_reason.insert(reason.as_str().into(), 1);
                     }
+                    let (observation, unknown) = crate::evidence::observe_region(
+                        &row.class,
+                        &row.signature,
+                        row.method_idx,
+                        &output,
+                        0,
+                        crate::evidence::DEFAULT_VIEW_LINES,
+                        false,
+                    );
+                    row.evidence_id = Some(observation.evidence.evidence_id);
+                    row.unknown_id = unknown.map(|item| item.unknown_id);
+                    counts.unknown_methods = usize::from(row.unknown_id.is_some());
                     row.region = Some(crate::region::RegionPathInfo {
                         used: output.used_region_path,
                         fallback_reason: output.fallback_reason,

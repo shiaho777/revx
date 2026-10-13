@@ -2022,6 +2022,9 @@ pub enum CapabilityRequest {
     ReportGenerate(ReportGenerateRequest),
     TraceImport(TraceImportRequest),
     TraceQuery(TraceQueryRequest),
+    DexDecompile(crate::DexDecompileRequest),
+    InspectAnalysisView(crate::InspectAnalysisViewRequest),
+    ListUnknowns(crate::ListUnknownsRequest),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2072,6 +2075,9 @@ pub enum CapabilityResponse {
     ReportGenerate(ReportGenerateResponse),
     TraceImport(TraceImportResponse),
     TraceQuery(TraceQueryResponse),
+    DexDecompile(crate::DexDecompileResponse),
+    InspectAnalysisView(crate::InspectAnalysisViewResponse),
+    ListUnknowns(crate::ListUnknownsResponse),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

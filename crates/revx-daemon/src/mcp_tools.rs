@@ -137,6 +137,15 @@ pub(crate) fn tool_name_to_request(
         "trace_query" => Ok(CapabilityRequest::TraceQuery(serde_json::from_value(
             arguments,
         )?)),
+        "dex_decompile" => Ok(CapabilityRequest::DexDecompile(serde_json::from_value(
+            arguments,
+        )?)),
+        "inspect_analysis_view" => Ok(CapabilityRequest::InspectAnalysisView(
+            serde_json::from_value(arguments)?,
+        )),
+        "list_unknowns" => Ok(CapabilityRequest::ListUnknowns(parse_empty_or_default(
+            arguments,
+        )?)),
         _ => anyhow::bail!("unknown tool: {name}"),
     }
 }
@@ -757,6 +766,47 @@ pub(crate) fn mcp_tools_manifest() -> Vec<serde_json::Value> {
                 "type": "object",
                 "properties": {
                     "kind": { "type": ["string", "null"] },
+                    "limit": { "type": ["integer", "null"] }
+                }
+            }),
+        ),
+        tool_manifest(
+            "dex_decompile",
+            "Decompile DEX methods with evidence IDs and coverage. Default detail=summary: pageable view, no full pseudocode. Follow inspect_analysis_view or list_unknowns. Fallback is partial coverage, not absence.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string" },
+                    "class": { "type": ["string", "null"] },
+                    "method": { "type": ["string", "null"] },
+                    "limit": { "type": ["integer", "null"] },
+                    "detail": { "type": ["string", "null"], "enum": ["summary", "complete", null] },
+                    "view_offset": { "type": ["integer", "null"] },
+                    "view_limit": { "type": ["integer", "null"] }
+                },
+                "required": ["path"]
+            }),
+        ),
+        tool_manifest(
+            "inspect_analysis_view",
+            "Page retained DEX pseudocode by evidence_id from dex_decompile. offset/limit are line indexes. Follow coverage.next_offset.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "evidence_id": { "type": "string" },
+                    "offset": { "type": ["integer", "null"] },
+                    "limit": { "type": ["integer", "null"] }
+                },
+                "required": ["evidence_id"]
+            }),
+        ),
+        tool_manifest(
+            "list_unknowns",
+            "List open structuring unknowns retained in this MCP session after dex_decompile",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "offset": { "type": ["integer", "null"] },
                     "limit": { "type": ["integer", "null"] }
                 }
             }),
