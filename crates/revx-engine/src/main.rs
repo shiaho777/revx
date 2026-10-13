@@ -980,6 +980,7 @@ fn cmd_dex_goto_census(args: DexGotoCensusArgs) -> Result<()> {
                     "structured_try_count": census.totals.structured_try_count,
                     "nodes_split": census.totals.nodes_split,
                     "loop_norm_methods": census.totals.loop_norm_methods,
+                    "phi_lower_methods": census.totals.phi_lower_methods,
                     "unknown_methods": census.totals.unknown_methods,
                     "fallback_by_reason": census.totals.fallback_by_reason,
                 },
@@ -997,6 +998,7 @@ fn cmd_dex_goto_census(args: DexGotoCensusArgs) -> Result<()> {
                         "used": r.used,
                         "structured_try_count": r.structured_try_count,
                         "nodes_split": r.nodes_split,
+                        "phi_lowered": r.phi_lowered,
                         "fallback_reason": r.fallback_reason.map(|reason| reason.as_str()),
                     })),
                     "evidence_id": m.evidence_id,
@@ -1084,12 +1086,13 @@ fn cmd_dex_goto_census(args: DexGotoCensusArgs) -> Result<()> {
         }
     }
     eprintln!(
-        "// structuring: region={} legacy={} structured_try={} nodes_split={} loop_norm_methods={}",
+        "// structuring: region={} legacy={} structured_try={} nodes_split={} loop_norm_methods={} phi_lower_methods={}",
         census.totals.region_methods,
         census.totals.legacy_methods,
         census.totals.structured_try_count,
         census.totals.nodes_split,
-        census.totals.loop_norm_methods
+        census.totals.loop_norm_methods,
+        census.totals.phi_lower_methods
     );
     eprintln!("// final goto provenance: unknown; raw emission counts are not final counts");
     Ok(())

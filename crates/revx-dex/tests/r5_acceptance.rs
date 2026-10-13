@@ -66,7 +66,7 @@ fn frozen_capability_matrix_matches_v1_acceptance() {
         },
         Row {
             name: "phi-irreducible",
-            expect: Expect::Fallback(RegionFallbackReason::UnsupportedShape),
+            expect: Expect::Region { min_splits: 2 },
         },
     ];
     let started = Instant::now();
@@ -88,9 +88,10 @@ fn census_schema_records_loop_normalization() {
     let dex = DexFile::parse(ret_dex()).unwrap();
     let census = census::census_dex(&dex, None);
     assert_eq!(census.schema_version, CENSUS_SCHEMA_VERSION);
-    assert_eq!(CENSUS_SCHEMA_VERSION, 5);
+    assert_eq!(CENSUS_SCHEMA_VERSION, 6);
     assert_eq!(census.totals.nodes_split, 0);
     assert_eq!(census.totals.loop_norm_methods, 0);
+    assert_eq!(census.totals.phi_lower_methods, 0);
     assert_eq!(census.totals.unknown_methods, 0);
     assert_eq!(
         census.totals.final_goto_count,

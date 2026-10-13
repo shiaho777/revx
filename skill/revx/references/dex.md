@@ -29,4 +29,4 @@ Missing coverage is unknown, not absence.
 - CLI `revx dex decompile <path> --json --detail summary`
 - CLI `revx dex goto-census <path> --json`
 
-Census schema v5 adds `evidence_id`, `unknown_id`, and `unknown_methods`.
+Census schema v6 adds `phi_lower_methods` on top of evidence/unknown ids.

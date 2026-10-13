@@ -109,6 +109,40 @@ fn phi_irreducible() -> (DexFile, revx_dex::lift::LiftOutput) {
     (dex, out)
 }
 
+fn try_crosses_loop() -> (DexFile, revx_dex::lift::LiftOutput) {
+    let (mut dex, mut out) = build(vec![
+        vec![call("head"), SsaOp::Jump { target: BlockId(1) }],
+        vec![call("body"), branch(0, 2)],
+        vec![call("exit"), SsaOp::Return { value: None }],
+        vec![
+            SsaOp::Call {
+                target: Operand::Symbol("__exception".into()),
+                args: vec![],
+            },
+            call("handler"),
+            SsaOp::Jump { target: BlockId(2) },
+        ],
+    ]);
+    dex.types.push("Ljava/lang/Exception;".into());
+    out.exception_flow
+        .regions
+        .push(revx_dex::exception::ExceptionRegion {
+            try_index: 0,
+            start: 1,
+            insn_count: 1,
+            end: Some(2),
+            valid_range: true,
+            protected_blocks: vec![BlockId(1)],
+            handlers: vec![revx_dex::exception::HandlerRef {
+                kind: revx_dex::exception::HandlerKind::Typed { type_idx: 0 },
+                addr: 3,
+                block: Some(BlockId(3)),
+                ordinary_entry_reachable: false,
+            }],
+        });
+    (dex, out)
+}
+
 fn observe(
     dex: &DexFile,
     out: &revx_dex::lift::LiftOutput,
@@ -148,7 +182,7 @@ fn region_path_is_complete_observation() {
 
 #[test]
 fn fallback_is_partial_with_open_unknown() {
-    let (dex, out) = phi_irreducible();
+    let (dex, out) = try_crosses_loop();
     let info = revx_dex::render::build_try_info(&dex, &[]);
     let (auto, _) = structure_lifted(&dex, &info, &out, StructuringMode::Auto);
     let (legacy, _) = structure_lifted(&dex, &info, &out, StructuringMode::Legacy);
@@ -164,16 +198,13 @@ fn fallback_is_partial_with_open_unknown() {
         true,
     );
     assert_eq!(record.evidence.coverage.status, CoverageStatus::Partial);
-    assert_eq!(
-        record.fallback_reason.as_deref(),
-        Some("unsupported_control_flow")
-    );
+    assert_eq!(record.fallback_reason.as_deref(), Some("cross_region_edge"));
     let unknown = unknown.expect("unknown");
     assert!(unknown.unknown_id.starts_with("unk_"));
     assert_eq!(unknown.unknown_id.len(), 4 + 64);
     assert_eq!(unknown.status, "open");
     assert_eq!(unknown.domain, "dex.structuring");
-    assert_eq!(unknown.reason, "unsupported_control_flow");
+    assert_eq!(unknown.reason, "cross_region_edge");
     assert_eq!(unknown.evidence_id, record.evidence.evidence_id);
     assert_eq!(
         record.evidence.unknown_ids,
@@ -218,8 +249,20 @@ fn view_pages_concatenate_to_full_text() {
 }
 
 #[test]
-fn summary_omits_full_pseudocode() {
+fn phi_irreducible_is_complete_observation() {
     let (dex, out) = phi_irreducible();
+    let (record, unknown) = observe(&dex, &out, true, 0, DEFAULT_VIEW_LINES);
+    assert!(record.used_region_path);
+    assert_eq!(record.evidence.coverage.status, CoverageStatus::Complete);
+    assert!(record.evidence.unknown_ids.is_empty());
+    assert!(unknown.is_none());
+    let text = record.pseudocode.as_deref().expect("complete text");
+    assert!(text.contains("while (true)"));
+}
+
+#[test]
+fn summary_omits_full_pseudocode() {
+    let (dex, out) = try_crosses_loop();
     let (record, _) = observe(&dex, &out, false, 0, 2);
     assert!(record.pseudocode.is_none());
     assert!(!record.view.text.is_empty());

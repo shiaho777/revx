@@ -495,9 +495,8 @@ fn phi_incomings_follow_the_retargeted_predecessors() {
     let info = revx_dex::render::build_try_info(&_dex, &[]);
     let (auto, _) = structure_lifted(&_dex, &info, &out, StructuringMode::Auto);
     let (legacy, _) = structure_lifted(&_dex, &info, &out, StructuringMode::Legacy);
-    assert_eq!(
-        auto.fallback_reason,
-        Some(RegionFallbackReason::UnsupportedShape)
-    );
-    assert_eq!(auto.pseudocode, legacy.pseudocode);
+    assert!(auto.used_region_path, "{:?}", auto.fallback_reason);
+    assert!(auto.phi_lowered);
+    assert!(auto.pseudocode.contains("while (true)"));
+    assert_ne!(auto.pseudocode, legacy.pseudocode);
 }

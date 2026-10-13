@@ -76,13 +76,25 @@ CI 门禁是仓内冻结的合成能力矩阵，不是未入库的私有 DEX。
 - 同配置性能：该矩阵在 debug 测试里 5 秒内跑完。这不是 R3 那份私有语料的 RSS 数字，也不外推成全文件性能承诺。
 - 私有语料 SHA-256 `656331a8…` 不在仓库里，本机也没有 `/tmp/revx-dex-corpus/classes.dex`，所以 R5 没有复跑那份 APK。R3 报告里的数字继续只描述那一次本地观测。
 
-R1–R5 到此结束。新格式、协程和 phi 降级不在这条主线上追加。
+R1–R5 到此结束。新格式和协程不在这条主线上追加。
 
-Agent 表面（DEX evidence / skill）见 [DEX agent surface](benches/dex-agent-surface-2026-10.md)。它把已冻结的区域树结果交给 MCP，不扩大结构化范围。
+Agent 表面（DEX evidence / skill）见 [DEX agent surface](benches/dex-agent-surface-2026-10.md)。它把区域树结果交给 MCP，不扩大结构化范围。
+
+## R6 — Phi 降级：已交付
+
+Issue #89。边界：在区域树 walk 之前销毁 SSA phi；失败则整方法回退 legacy，文本与 `--mode legacy` 相同。
+
+- 前驱边上插入拷贝；关键边拆分消耗与循环归一化共用的新增块预算（默认 32 的剩余额度）。
+- Auto 路径：循环归一化 → phi 降级 → 区域树。只有树校验通过才采用降级后的 CFG。
+- 菱形汇合 phi、循环携带 phi、带 phi 的多入口循环走区域树；CFG 轨迹与区域树轨迹一致。
+- 共享 handler、普通入口可达 handler、跨回边 try、多出口、循环内 switch 的回退原因不变。
+- 普查 schema v6 增加 `phi_lower_methods`。final goto 归因仍是 `unknown`。
+
+验收见 `crates/revx-dex/tests/phi_lower.rs`、`crates/revx-dex/tests/r5_acceptance.rs` 与 [R6 报告](benches/r6-phi-lowering-2026-10.md)。
 
 ## 已知降级（v1 冻结）
 
-- phi、多出口区域、循环内 switch：`unsupported_control_flow`，整方法 legacy。
+- 多出口区域、循环内 switch：`unsupported_control_flow`，整方法 legacy。
 - 共享 handler、普通入口可达 handler、重叠 try：各自的既有回退原因。
 - 多入口循环碰到异常元数据：`loop_exception_intersection`。
 - 拆分预算不够：`budget_exceeded`。
