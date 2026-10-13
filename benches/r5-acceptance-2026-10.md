@@ -14,7 +14,7 @@ R4 把无 phi 的多入口循环归一化后交给 R3 区域树。R5 把这条�
 | 两入口循环 | 区域树，`nodes_split >= 2`，拆分后的调用轨迹与原 CFG 一致 |
 | SCC 大于默认新增块预算 32 | 不拆分，回退 `budget_exceeded`，文本与 legacy 相同 |
 | 多入口 SCC 含受保护块 | 不拆分，回退 `loop_exception_intersection`，文本与 legacy 相同 |
-| try 跨过循环回边 | 回退 `cross_region_edge`，文本与 legacy 相同 |
+| try 跨过循环回边 | R5 冻结时回退 `cross_region_edge`。R7 把这一行改成区域树，见 [R7 报告](r7-handler-structure-2026-10.md) |
 | 多入口循环带 phi | incoming 按新前驱重映射；R5 冻结时区域树仍拒绝 phi。R6 把这一行改成区域树，见 [R6 报告](r6-phi-lowering-2026-10.md) |
 
 普查 schema 为 5。`nodes_split` 与 `loop_norm_methods` 只统计真正走区域树的拆分，回退方法计 0。`unknown_methods` 统计带结构化 unknown 的方法。final goto 的 `by_reason.unknown` 仍等于最终 goto 数。

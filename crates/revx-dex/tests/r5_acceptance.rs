@@ -62,7 +62,7 @@ fn frozen_capability_matrix_matches_v1_acceptance() {
         },
         Row {
             name: "try-crosses-loop",
-            expect: Expect::Fallback(RegionFallbackReason::NestedOrCrossScope),
+            expect: Expect::Region { min_splits: 0 },
         },
         Row {
             name: "phi-irreducible",
@@ -115,6 +115,8 @@ fn run_row(name: &str) -> (bool, usize, Option<RegionFallbackReason>) {
     if !auto.used_region_path {
         assert_eq!(auto.pseudocode, legacy.pseudocode, "{name}");
         assert_eq!(auto.nodes_split, 0, "{name}");
+    } else if name == "try-crosses-loop" {
+        assert!(auto.structured_try_count >= 1, "{name}");
     }
     (
         auto.used_region_path,

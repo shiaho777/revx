@@ -109,18 +109,24 @@ fn phi_irreducible() -> (DexFile, revx_dex::lift::LiftOutput) {
     (dex, out)
 }
 
-fn try_crosses_loop() -> (DexFile, revx_dex::lift::LiftOutput) {
+fn overlapping_tries() -> (DexFile, revx_dex::lift::LiftOutput) {
     let (mut dex, mut out) = build(vec![
-        vec![call("head"), SsaOp::Jump { target: BlockId(1) }],
-        vec![call("body"), branch(0, 2)],
-        vec![call("exit"), SsaOp::Return { value: None }],
+        vec![call("a"), SsaOp::Jump { target: BlockId(1) }],
+        vec![call("b"), SsaOp::Jump { target: BlockId(2) }],
+        vec![call("c"), SsaOp::Return { value: None }],
         vec![
             SsaOp::Call {
                 target: Operand::Symbol("__exception".into()),
                 args: vec![],
             },
-            call("handler"),
-            SsaOp::Jump { target: BlockId(2) },
+            SsaOp::Return { value: None },
+        ],
+        vec![
+            SsaOp::Call {
+                target: Operand::Symbol("__exception".into()),
+                args: vec![],
+            },
+            SsaOp::Return { value: None },
         ],
     ]);
     dex.types.push("Ljava/lang/Exception;".into());
@@ -128,6 +134,22 @@ fn try_crosses_loop() -> (DexFile, revx_dex::lift::LiftOutput) {
         .regions
         .push(revx_dex::exception::ExceptionRegion {
             try_index: 0,
+            start: 0,
+            insn_count: 2,
+            end: Some(2),
+            valid_range: true,
+            protected_blocks: vec![BlockId(0), BlockId(1)],
+            handlers: vec![revx_dex::exception::HandlerRef {
+                kind: revx_dex::exception::HandlerKind::Typed { type_idx: 0 },
+                addr: 3,
+                block: Some(BlockId(3)),
+                ordinary_entry_reachable: false,
+            }],
+        });
+    out.exception_flow
+        .regions
+        .push(revx_dex::exception::ExceptionRegion {
+            try_index: 1,
             start: 1,
             insn_count: 1,
             end: Some(2),
@@ -135,8 +157,8 @@ fn try_crosses_loop() -> (DexFile, revx_dex::lift::LiftOutput) {
             protected_blocks: vec![BlockId(1)],
             handlers: vec![revx_dex::exception::HandlerRef {
                 kind: revx_dex::exception::HandlerKind::Typed { type_idx: 0 },
-                addr: 3,
-                block: Some(BlockId(3)),
+                addr: 4,
+                block: Some(BlockId(4)),
                 ordinary_entry_reachable: false,
             }],
         });
@@ -182,7 +204,7 @@ fn region_path_is_complete_observation() {
 
 #[test]
 fn fallback_is_partial_with_open_unknown() {
-    let (dex, out) = try_crosses_loop();
+    let (dex, out) = overlapping_tries();
     let info = revx_dex::render::build_try_info(&dex, &[]);
     let (auto, _) = structure_lifted(&dex, &info, &out, StructuringMode::Auto);
     let (legacy, _) = structure_lifted(&dex, &info, &out, StructuringMode::Legacy);
@@ -262,7 +284,7 @@ fn phi_irreducible_is_complete_observation() {
 
 #[test]
 fn summary_omits_full_pseudocode() {
-    let (dex, out) = try_crosses_loop();
+    let (dex, out) = overlapping_tries();
     let (record, _) = observe(&dex, &out, false, 0, 2);
     assert!(record.pseudocode.is_none());
     assert!(!record.view.text.is_empty());

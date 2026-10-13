@@ -125,6 +125,9 @@ impl Builder<'_> {
         }
         let mut nodes = Vec::new();
         loop {
+            if Some(current) == stop {
+                break;
+            }
             if let Some(&(head, exit)) = self.loops.last() {
                 if current == exit {
                     nodes.push(Region::Break);
@@ -134,9 +137,6 @@ impl Builder<'_> {
                     nodes.push(Region::Continue);
                     break;
                 }
-            }
-            if Some(current) == stop {
-                break;
             }
             self.work += 1;
             if self.work > 4096 {
@@ -166,6 +166,7 @@ impl Builder<'_> {
                     .iter()
                     .flat_map(|b| self.output.func.cfg.succs[b.0 as usize].iter().copied())
                     .filter(|b| !protected.contains(b))
+                    .filter(|b| !self.loops.iter().any(|(head, _)| head == b))
                     .collect();
                 if exits.len() > 1 {
                     return Err(Failure::NestedOrCrossScope);
@@ -801,7 +802,24 @@ pub fn structure_lifted(
         .as_ref()
         .is_some_and(|item| item.report.phis_destroyed > 0);
     let lowered = phi.as_ref().and_then(|item| item.lift.as_ref());
-    let subject = lowered.unwrap_or(base);
+    let after_phi = lowered.unwrap_or(base);
+    let remaining_handlers = remaining.saturating_sub(phi_splits);
+    let handlers = if mode == StructuringMode::Auto {
+        Some(crate::handlerprep::prepare_handlers_with_budget(
+            after_phi,
+            crate::handlerprep::HandlerPrepBudget {
+                max_new_blocks: remaining_handlers,
+            },
+        ))
+    } else {
+        None
+    };
+    let handler_splits = handlers
+        .as_ref()
+        .map(|item| item.report.nodes_split)
+        .unwrap_or(0);
+    let prepared_handlers = handlers.as_ref().and_then(|item| item.lift.as_ref());
+    let subject = prepared_handlers.unwrap_or(after_phi);
     let reason = if mode == StructuringMode::Auto {
         match build_region_tree(subject, dex)
             .and_then(|tree| render_region_tree(&tree, subject, dex).map(|text| (tree, text)))
@@ -813,7 +831,7 @@ pub fn structure_lifted(
                         used_region_path: true,
                         fallback_reason: None,
                         structured_try_count: tree.structured_try_count,
-                        nodes_split: loop_splits + phi_splits,
+                        nodes_split: loop_splits + phi_splits + handler_splits,
                         phi_lowered: phi_destroyed,
                     },
                     Default::default(),

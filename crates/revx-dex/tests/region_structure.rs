@@ -89,37 +89,31 @@ fn legacy_mode_matches_existing_pipeline() {
 }
 
 #[test]
-fn shared_handler_falls_back_to_legacy() {
+fn shared_handler_uses_the_region_path() {
     let dex = dex();
     let code = code(
         &[0x0000, 0x0000, 0x000e, 0x000d, 0x000e],
         vec![region(0, 1, &[(0, 3)], None), region(1, 2, &[(0, 3)], None)],
     );
     let res = structure_method(&dex, &code, 0, StructuringMode::Auto);
-    assert!(!res.used_region_path);
-    assert_eq!(
-        res.fallback_reason,
-        Some(RegionFallbackReason::SharedHandler)
+    assert!(
+        res.used_region_path,
+        "fallback {:?}\n{}",
+        res.fallback_reason, res.pseudocode
     );
+    assert_eq!(res.structured_try_count, 2);
     let output = lift_method_to_ssa(&dex, &code, 0);
-    let (expected, _) = revx_dex::render::render_method_pseudocode_with_diagnostics(
+    let (legacy, _) = revx_dex::render::render_method_pseudocode_with_diagnostics(
         &output,
         &revx_dex::render::build_try_info(&dex, &code.tries),
     );
-    assert_eq!(res.pseudocode, expected);
+    assert_ne!(res.pseudocode, legacy);
 }
 
 #[test]
 fn exception_boundaries_have_precise_whole_method_fallbacks() {
     let dex = dex();
     let cases = [
-        (
-            code(
-                &[0x0000, 0x000d, 0x000e],
-                vec![region(0, 1, &[(0, 1)], None)],
-            ),
-            RegionFallbackReason::OrdinaryReachableHandler,
-        ),
         (
             code(
                 &[0x000e, 0x000d, 0x000e],
@@ -146,6 +140,28 @@ fn exception_boundaries_have_precise_whole_method_fallbacks() {
         assert!(!auto.used_region_path);
         assert_eq!(auto.pseudocode, legacy.pseudocode);
     }
+}
+
+#[test]
+fn ordinary_reachable_handler_uses_the_region_path() {
+    let dex = dex();
+    let code = code(
+        &[0x0000, 0x000d, 0x000e],
+        vec![region(0, 1, &[(0, 1)], None)],
+    );
+    let res = structure_method(&dex, &code, 0, StructuringMode::Auto);
+    assert!(
+        res.used_region_path,
+        "fallback {:?}\n{}",
+        res.fallback_reason, res.pseudocode
+    );
+    assert_eq!(res.structured_try_count, 1);
+    let output = lift_method_to_ssa(&dex, &code, 0);
+    let (legacy, _) = revx_dex::render::render_method_pseudocode_with_diagnostics(
+        &output,
+        &revx_dex::render::build_try_info(&dex, &code.tries),
+    );
+    assert_ne!(res.pseudocode, legacy);
 }
 
 #[test]

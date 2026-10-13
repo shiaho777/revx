@@ -29,4 +29,4 @@ Missing coverage is unknown, not absence.
 - CLI `revx dex decompile <path> --json --detail summary`
 - CLI `revx dex goto-census <path> --json`
 
-Census schema v6 adds `phi_lower_methods` on top of evidence/unknown ids.
+Census schema v6 adds `phi_lower_methods` on top of evidence/unknown ids. R7 puts shared handlers, ordinary-reachable handlers, and try-in-loop on the region path; overlapping tries still use `cross_region_edge`.

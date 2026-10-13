@@ -61,7 +61,7 @@ SCC 检测、预算受限的整分量节点拆分，以及拆分后的 phi incom
 - 嵌套自然循环不拆分，内外层副作用顺序保持。
 - 默认新增块预算 32。放不下的 SCC 不拆，回退原因 `budget_exceeded`。
 - SCC 含受保护块或 handler 时不拆，回退原因 `loop_exception_intersection`。
-- try 区间跨过循环回边时保持 `cross_region_edge`，不把异常边并进普通 CFG。
+- try 区间跨过循环回边时，R7 走区域树；仍不把异常边并进普通 CFG。
 - 带 phi 的不可约循环会重映射 incoming，但区域树仍拒绝 phi，整方法回退 `unsupported_control_flow`。
 - 不承诺任意输入 goto 归零。
 
@@ -87,15 +87,27 @@ Issue #89。边界：在区域树 walk 之前销毁 SSA phi；失败则整方法
 - 前驱边上插入拷贝；关键边拆分消耗与循环归一化共用的新增块预算（默认 32 的剩余额度）。
 - Auto 路径：循环归一化 → phi 降级 → 区域树。只有树校验通过才采用降级后的 CFG。
 - 菱形汇合 phi、循环携带 phi、带 phi 的多入口循环走区域树；CFG 轨迹与区域树轨迹一致。
-- 共享 handler、普通入口可达 handler、跨回边 try、多出口、循环内 switch 的回退原因不变。
+- 跨回边 try、共享 handler、普通入口可达 handler 的区域化见 R7。多出口、循环内 switch 的回退原因不变。
 - 普查 schema v6 增加 `phi_lower_methods`。final goto 归因仍是 `unknown`。
 
 验收见 `crates/revx-dex/tests/phi_lower.rs`、`crates/revx-dex/tests/r5_acceptance.rs` 与 [R6 报告](benches/r6-phi-lowering-2026-10.md)。
 
+## R7 — 共享 handler、入口可达 handler、循环内 try：已交付
+
+Issue #91。边界：在 phi 降级之后、区域树 walk 之前给每个 try 独占的 catch 入口；循环内 try 把回边收成 `continue`。失败则整方法回退 legacy，文本与 `--mode legacy` 相同。不包装 JADX。
+
+- Auto 路径：循环归一化 → phi 降级 → handler 预处理 → 区域树。预处理消耗与前两步共用的新增块预算剩余额度。
+- 普通入口落入 `move-exception` 时拆出 `__exception` 入口，普通前驱改接到后续块。
+- 多个 try 引用同一 handler 块时，按异常-only 前缀克隆，catch 体各自独占。
+- 循环内 try：保护块的回边不算第二出口；join 仍是循环出口，catch 在 join 处停下。
+- 重叠 try、循环与异常相交、多出口、循环内 switch 保持既有回退。普查 schema 仍为 6。
+
+验收见 `crates/revx-dex/tests/handler_structure.rs`、`crates/revx-dex/tests/r5_acceptance.rs` 与 [R7 报告](benches/r7-handler-structure-2026-10.md)。
+
 ## 已知降级（v1 冻结）
 
 - 多出口区域、循环内 switch：`unsupported_control_flow`，整方法 legacy。
-- 共享 handler、普通入口可达 handler、重叠 try：各自的既有回退原因。
+- 重叠 try：`cross_region_edge`。
 - 多入口循环碰到异常元数据：`loop_exception_intersection`。
 - 拆分预算不够：`budget_exceeded`。
 - final goto 根因：`unknown`。

@@ -18,7 +18,7 @@
 | 多入口循环带 phi | 区域树，`nodes_split >= 2` |
 | 关键边 phi，预算充足 | 区域树 |
 | 关键边 phi，拆分预算 0 | 不改写，保留 phi |
-| try 跨过循环回边 | 仍回退 `cross_region_edge` |
+| try 跨过循环回边 | R6 时回退 `cross_region_edge`。R7 把这一行改成区域树，见 [R7 报告](r7-handler-structure-2026-10.md) |
 | SCC 大于拆分预算 32 | 仍回退 `budget_exceeded` |
 
 普查 schema 为 6。`phi_lower_methods` 统计区域路径上真正销毁过 phi 的方法。回退方法的 `nodes_split` 与 `phi_lowered` 为 0。

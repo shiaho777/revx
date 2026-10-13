@@ -415,12 +415,10 @@ fn try_that_crosses_a_loop_back_edge_keeps_an_explicit_fallback() {
     let info = revx_dex::render::build_try_info(&dex, &[]);
     let (auto, _) = structure_lifted(&dex, &info, &out, StructuringMode::Auto);
     let (legacy, _) = structure_lifted(&dex, &info, &out, StructuringMode::Legacy);
-    assert!(!auto.used_region_path);
-    assert_eq!(
-        auto.fallback_reason,
-        Some(RegionFallbackReason::NestedOrCrossScope)
-    );
-    assert_eq!(auto.pseudocode, legacy.pseudocode);
+    assert!(auto.used_region_path, "{:?}", auto.fallback_reason);
+    assert_eq!(auto.structured_try_count, 1);
+    assert!(auto.pseudocode.contains("try {"));
+    assert_ne!(auto.pseudocode, legacy.pseudocode);
 }
 
 #[test]
