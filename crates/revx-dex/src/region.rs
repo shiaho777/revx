@@ -17,6 +17,7 @@ pub enum RegionFallbackReason {
     OrdinaryReachableHandler,
     InvalidTryMetadata,
     NestedOrCrossScope,
+    LoopExceptionIntersection,
     UnsupportedShape,
     Budget,
     ValidationFailed,
@@ -29,6 +30,7 @@ impl RegionFallbackReason {
             Self::OrdinaryReachableHandler => "ordinary_reachable_handler",
             Self::InvalidTryMetadata => "invalid_exception_metadata",
             Self::NestedOrCrossScope => "cross_region_edge",
+            Self::LoopExceptionIntersection => "loop_exception_intersection",
             Self::UnsupportedShape => "unsupported_control_flow",
             Self::Budget => "budget_exceeded",
             Self::ValidationFailed => "validation_failed",
@@ -41,6 +43,7 @@ pub struct RegionPathInfo {
     pub used: bool,
     pub fallback_reason: Option<RegionFallbackReason>,
     pub structured_try_count: usize,
+    pub nodes_split: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -91,6 +94,7 @@ pub struct RegionResult {
     pub used_region_path: bool,
     pub fallback_reason: Option<RegionFallbackReason>,
     pub structured_try_count: usize,
+    pub nodes_split: usize,
 }
 
 struct Builder<'a> {
@@ -755,9 +759,16 @@ pub fn structure_lifted(
     output: &LiftOutput,
     mode: StructuringMode,
 ) -> (RegionResult, crate::structure::StructuringDiagnostics) {
+    let prepared = if mode == StructuringMode::Auto {
+        Some(crate::loopnorm::normalize_loops(output))
+    } else {
+        None
+    };
+    let normalized = prepared.as_ref().and_then(|item| item.lift.as_ref());
+    let subject = normalized.unwrap_or(output);
     let reason = if mode == StructuringMode::Auto {
-        match build_region_tree(output, dex)
-            .and_then(|tree| render_region_tree(&tree, output, dex).map(|text| (tree, text)))
+        match build_region_tree(subject, dex)
+            .and_then(|tree| render_region_tree(&tree, subject, dex).map(|text| (tree, text)))
         {
             Ok((tree, pseudocode)) => {
                 return (
@@ -766,11 +777,15 @@ pub fn structure_lifted(
                         used_region_path: true,
                         fallback_reason: None,
                         structured_try_count: tree.structured_try_count,
+                        nodes_split: prepared
+                            .as_ref()
+                            .map(|item| item.report.nodes_split)
+                            .unwrap_or(0),
                     },
                     Default::default(),
                 );
             }
-            Err(reason) => Some(reason),
+            Err(reason) => Some(explained_failure(prepared.as_ref(), reason)),
         }
     } else {
         None
@@ -783,7 +798,35 @@ pub fn structure_lifted(
             used_region_path: false,
             fallback_reason: reason,
             structured_try_count: 0,
+            nodes_split: 0,
         },
         diagnostics,
     )
+}
+
+fn explained_failure(
+    prepared: Option<&crate::loopnorm::LoopNormOutcome>,
+    build_reason: Failure,
+) -> Failure {
+    let Some(prepared) = prepared else {
+        return build_reason;
+    };
+    if prepared.report.multi_entry_after == 0 {
+        return build_reason;
+    }
+    let shape_failure = matches!(
+        build_reason,
+        Failure::UnsupportedShape | Failure::NestedOrCrossScope | Failure::ValidationFailed
+    );
+    if !shape_failure {
+        return build_reason;
+    }
+    match prepared.report.refusal {
+        Some(crate::loopnorm::LoopNormRefusal::ExpansionBudget) => Failure::Budget,
+        Some(crate::loopnorm::LoopNormRefusal::ExceptionIntersection) => {
+            Failure::LoopExceptionIntersection
+        }
+        Some(crate::loopnorm::LoopNormRefusal::PhiShape) => Failure::UnsupportedShape,
+        None => build_reason,
+    }
 }

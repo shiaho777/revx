@@ -954,6 +954,8 @@ fn cmd_dex_goto_census(args: DexGotoCensusArgs) -> Result<()> {
                     "region_methods": census.totals.region_methods,
                     "legacy_methods": census.totals.legacy_methods,
                     "structured_try_count": census.totals.structured_try_count,
+                    "nodes_split": census.totals.nodes_split,
+                    "loop_norm_methods": census.totals.loop_norm_methods,
                     "fallback_by_reason": census.totals.fallback_by_reason,
                 },
                 "exception_totals": exception_counts_json(&census.exception_totals),
@@ -969,6 +971,7 @@ fn cmd_dex_goto_census(args: DexGotoCensusArgs) -> Result<()> {
                     "region": m.region.as_ref().map(|r| serde_json::json!({
                         "used": r.used,
                         "structured_try_count": r.structured_try_count,
+                        "nodes_split": r.nodes_split,
                         "fallback_reason": r.fallback_reason.map(|reason| reason.as_str()),
                     })),
                     "final_goto_count": m.counts.as_ref().map(|c| c.final_goto_count).unwrap_or(0),
@@ -1053,6 +1056,14 @@ fn cmd_dex_goto_census(args: DexGotoCensusArgs) -> Result<()> {
             println!("{}\t{}", m.signature, exception_summary(counts));
         }
     }
+    eprintln!(
+        "// structuring: region={} legacy={} structured_try={} nodes_split={} loop_norm_methods={}",
+        census.totals.region_methods,
+        census.totals.legacy_methods,
+        census.totals.structured_try_count,
+        census.totals.nodes_split,
+        census.totals.loop_norm_methods
+    );
     eprintln!("// final goto provenance: unknown; raw emission counts are not final counts");
     Ok(())
 }
