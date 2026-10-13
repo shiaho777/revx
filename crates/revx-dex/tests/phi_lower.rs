@@ -409,17 +409,14 @@ fn multi_entry_loop_with_phi_uses_the_region_path() {
 }
 
 #[test]
-fn try_across_back_edge_still_falls_back_with_identical_legacy_text() {
+fn try_across_back_edge_uses_the_region_path() {
     let (dex, out) = try_crosses_loop();
     let auto = structured(&dex, &out);
     let legacy = legacy_text(&dex, &out);
-    assert!(!auto.used_region_path);
-    assert_eq!(
-        auto.fallback_reason,
-        Some(RegionFallbackReason::NestedOrCrossScope)
-    );
-    assert_eq!(auto.pseudocode, legacy);
-    assert!(!auto.phi_lowered);
+    assert!(auto.used_region_path, "{:?}", auto.fallback_reason);
+    assert_eq!(auto.structured_try_count, 1);
+    assert!(auto.pseudocode.contains("try {"));
+    assert_ne!(auto.pseudocode, legacy);
 }
 
 #[test]

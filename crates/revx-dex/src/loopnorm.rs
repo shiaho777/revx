@@ -351,7 +351,10 @@ fn peel(output: &mut LiftOutput, scc: &BTreeSet<BlockId>, entry: BlockId) -> boo
     edges_consistent(&output.func.cfg)
 }
 
-fn clone_block(func: &mut SsaFunction, src: BlockId) -> (BlockId, HashMap<SsaValueId, SsaValueId>) {
+pub(crate) fn clone_block(
+    func: &mut SsaFunction,
+    src: BlockId,
+) -> (BlockId, HashMap<SsaValueId, SsaValueId>) {
     let new_id = BlockId(func.cfg.blocks.len() as u32);
     let src_block = func.cfg.blocks[src.0 as usize].clone();
     let mut value_map = HashMap::new();
@@ -437,7 +440,7 @@ fn rewrite_copy(
     }
 }
 
-fn remap_op_operands(op: &mut SsaOp, value_map: &HashMap<SsaValueId, SsaValueId>) {
+pub(crate) fn remap_op_operands(op: &mut SsaOp, value_map: &HashMap<SsaValueId, SsaValueId>) {
     match op {
         SsaOp::Load { addr } => *addr = remap_operand(addr, value_map),
         SsaOp::Store { addr, value } => {
@@ -466,7 +469,7 @@ fn remap_op_operands(op: &mut SsaOp, value_map: &HashMap<SsaValueId, SsaValueId>
     }
 }
 
-fn remap_operand(op: &Operand, value_map: &HashMap<SsaValueId, SsaValueId>) -> Operand {
+pub(crate) fn remap_operand(op: &Operand, value_map: &HashMap<SsaValueId, SsaValueId>) -> Operand {
     match op {
         Operand::Value(id) => Operand::Value(value_map.get(id).copied().unwrap_or(*id)),
         Operand::Deref { base, offset } => Operand::Deref {
@@ -558,7 +561,10 @@ fn strip_phi_pred(func: &mut SsaFunction, block: BlockId, pred: BlockId) {
     }
 }
 
-fn copy_types(types: &mut crate::types::ValueTypes, value_map: &HashMap<SsaValueId, SsaValueId>) {
+pub(crate) fn copy_types(
+    types: &mut crate::types::ValueTypes,
+    value_map: &HashMap<SsaValueId, SsaValueId>,
+) {
     let extra: Vec<_> = value_map
         .iter()
         .filter_map(|(old, new)| types.get(old).cloned().map(|ty| (*new, ty)))

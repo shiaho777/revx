@@ -6,6 +6,7 @@ pub mod census;
 pub mod classgen;
 pub mod evidence;
 pub mod exception;
+pub mod handlerprep;
 pub mod insns;
 pub mod jni;
 pub mod kotlin;
