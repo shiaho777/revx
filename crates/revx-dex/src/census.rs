@@ -1,13 +1,38 @@
 use crate::DexFile;
+use crate::lift::LiftOutput;
 use crate::structure::{GotoReason, StructuringDiagnostics};
+use revx_analysis::ssa::BlockId;
 use std::collections::{BTreeMap, BTreeSet};
 
-pub const CENSUS_SCHEMA_VERSION: u32 = 6;
+pub const CENSUS_SCHEMA_VERSION: u32 = 7;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FinalGotoProvenance {
+    IrreducibleLoop,
+    Handler,
+    Switch,
+    Unstructured,
+    #[default]
+    Unknown,
+}
+
+impl FinalGotoProvenance {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::IrreducibleLoop => "irreducible_loop",
+            Self::Handler => "handler",
+            Self::Switch => "switch",
+            Self::Unstructured => "unstructured",
+            Self::Unknown => "unknown",
+        }
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FinalGotoSite {
     pub line: usize,
     pub target: String,
+    pub provenance: FinalGotoProvenance,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -126,6 +151,7 @@ pub fn count_final_gotos(text: &str) -> FinalGotoScan {
             result.sites.push(FinalGotoSite {
                 line: token.line,
                 target: target.text.into(),
+                provenance: FinalGotoProvenance::Unknown,
             });
             *result.target_counts.entry(target.text.into()).or_default() += 1;
         }
@@ -155,10 +181,78 @@ pub fn count_final_gotos(text: &str) -> FinalGotoScan {
     result
 }
 
+pub fn attribute_final_gotos(scan: &mut FinalGotoScan, output: &LiftOutput) {
+    let handlers = handler_blocks(output);
+    let irreducible = crate::loopnorm::multi_entry_scc_blocks(&output.func.cfg);
+    let mut switch_targets = BTreeSet::new();
+    for cases in output.switch_cases.values() {
+        for (_, target) in cases {
+            switch_targets.insert(*target);
+        }
+    }
+    let n = output.func.cfg.blocks.len();
+    for site in &mut scan.sites {
+        site.provenance =
+            classify_target(&site.target, n, &handlers, &irreducible, &switch_targets);
+    }
+}
+
+fn classify_target(
+    target: &str,
+    block_count: usize,
+    handlers: &BTreeSet<BlockId>,
+    irreducible: &BTreeSet<BlockId>,
+    switch_targets: &BTreeSet<BlockId>,
+) -> FinalGotoProvenance {
+    let Some(block) = parse_label(target) else {
+        return FinalGotoProvenance::Unknown;
+    };
+    if (block.0 as usize) >= block_count {
+        return FinalGotoProvenance::Unknown;
+    }
+    if handlers.contains(&block) {
+        FinalGotoProvenance::Handler
+    } else if irreducible.contains(&block) {
+        FinalGotoProvenance::IrreducibleLoop
+    } else if switch_targets.contains(&block) {
+        FinalGotoProvenance::Switch
+    } else {
+        FinalGotoProvenance::Unstructured
+    }
+}
+
+fn parse_label(target: &str) -> Option<BlockId> {
+    target
+        .strip_prefix('L')
+        .and_then(|n| n.parse::<u32>().ok())
+        .map(BlockId)
+}
+
+fn handler_blocks(output: &LiftOutput) -> BTreeSet<BlockId> {
+    let mut blocks = BTreeSet::new();
+    for region in &output.exception_flow.regions {
+        for handler in &region.handlers {
+            if let Some(block) = handler.block {
+                blocks.insert(block);
+            }
+        }
+    }
+    for shared in &output.exception_flow.shared_handlers {
+        if let Some(block) = shared.block {
+            blocks.insert(block);
+        }
+    }
+    blocks
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ReasonCounts {
     pub revisit: usize,
     pub forward_revisit: usize,
+    pub irreducible_loop: usize,
+    pub handler: usize,
+    pub switch: usize,
+    pub unstructured: usize,
     pub unknown: usize,
 }
 
@@ -166,6 +260,10 @@ impl ReasonCounts {
     fn add(&mut self, other: &Self) {
         self.revisit += other.revisit;
         self.forward_revisit += other.forward_revisit;
+        self.irreducible_loop += other.irreducible_loop;
+        self.handler += other.handler;
+        self.switch += other.switch;
+        self.unstructured += other.unstructured;
         self.unknown += other.unknown;
     }
 }
@@ -188,15 +286,26 @@ pub struct CensusCounts {
     pub unknown_methods: usize,
 }
 
+fn reason_counts(scan: &FinalGotoScan) -> ReasonCounts {
+    let mut counts = ReasonCounts::default();
+    for site in &scan.sites {
+        match site.provenance {
+            FinalGotoProvenance::IrreducibleLoop => counts.irreducible_loop += 1,
+            FinalGotoProvenance::Handler => counts.handler += 1,
+            FinalGotoProvenance::Switch => counts.switch += 1,
+            FinalGotoProvenance::Unstructured => counts.unstructured += 1,
+            FinalGotoProvenance::Unknown => counts.unknown += 1,
+        }
+    }
+    counts
+}
+
 impl CensusCounts {
     fn from_scan(scan: &FinalGotoScan, diagnostics: &StructuringDiagnostics) -> Self {
         let mut result = Self {
             final_goto_count: scan.count,
             final_goto_line_count: scan.line_count,
-            by_reason: ReasonCounts {
-                unknown: scan.count,
-                ..Default::default()
-            },
+            by_reason: reason_counts(scan),
             raw_emission_count: diagnostics.goto_emissions.len(),
             bailed_methods: usize::from(diagnostics.bailed),
             ..Default::default()
@@ -330,13 +439,14 @@ pub fn census_dex_with_mode(
                         let info = crate::render::build_try_info(dex, &code.tries);
                         let (result, diagnostics) =
                             crate::region::structure_lifted(dex, &info, &lifted, mode);
-                        (result, diagnostics, lifted.exception_flow)
+                        (result, diagnostics, lifted)
                     }))
                     .map_err(|_| "decompilation panicked".into())
                 });
             match result {
-                Ok((output, diagnostics, flow)) => {
-                    let scan = count_final_gotos(&output.pseudocode);
+                Ok((output, diagnostics, lifted)) => {
+                    let mut scan = count_final_gotos(&output.pseudocode);
+                    attribute_final_gotos(&mut scan, &lifted);
                     let mut counts = CensusCounts::from_scan(&scan, &diagnostics);
                     counts.region_methods = usize::from(output.used_region_path);
                     counts.legacy_methods = usize::from(!output.used_region_path);
@@ -366,7 +476,7 @@ pub fn census_dex_with_mode(
                         nodes_split: output.nodes_split,
                         phi_lowered: output.phi_lowered,
                     });
-                    let exception_counts = flow.counts();
+                    let exception_counts = lifted.exception_flow.counts();
                     report.exception_totals.add(&exception_counts);
                     report.totals.add(&counts);
                     report.selection.completed_methods += 1;
@@ -375,7 +485,7 @@ pub fn census_dex_with_mode(
                     row.final_scan = Some(scan);
                     row.raw_diagnostics = Some(diagnostics);
                     row.exception_counts = Some(exception_counts);
-                    row.exception_flow = Some(flow);
+                    row.exception_flow = Some(lifted.exception_flow);
                 }
                 Err(error) => {
                     row.status = "failed";

@@ -88,14 +88,18 @@ fn census_schema_records_loop_normalization() {
     let dex = DexFile::parse(ret_dex()).unwrap();
     let census = census::census_dex(&dex, None);
     assert_eq!(census.schema_version, CENSUS_SCHEMA_VERSION);
-    assert_eq!(CENSUS_SCHEMA_VERSION, 6);
+    assert_eq!(CENSUS_SCHEMA_VERSION, 7);
     assert_eq!(census.totals.nodes_split, 0);
     assert_eq!(census.totals.loop_norm_methods, 0);
     assert_eq!(census.totals.phi_lower_methods, 0);
     assert_eq!(census.totals.unknown_methods, 0);
     assert_eq!(
         census.totals.final_goto_count,
-        census.totals.by_reason.unknown
+        census.totals.by_reason.irreducible_loop
+            + census.totals.by_reason.handler
+            + census.totals.by_reason.switch
+            + census.totals.by_reason.unstructured
+            + census.totals.by_reason.unknown
     );
 }
 

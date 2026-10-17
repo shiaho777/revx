@@ -855,6 +855,16 @@ async fn main() -> Result<()> {
     }
 }
 
+fn final_reason_json(c: &revx_dex::census::ReasonCounts) -> serde_json::Value {
+    serde_json::json!({
+        "irreducible_loop": c.irreducible_loop,
+        "handler": c.handler,
+        "switch": c.switch,
+        "unstructured": c.unstructured,
+        "unknown": c.unknown,
+    })
+}
+
 fn exception_counts_json(c: &revx_dex::exception::ExceptionFlowCounts) -> serde_json::Value {
     serde_json::json!({
         "try_regions": c.try_regions,
@@ -960,11 +970,7 @@ fn cmd_dex_goto_census(args: DexGotoCensusArgs) -> Result<()> {
                 "totals": {
                     "final_goto_count": census.totals.final_goto_count,
                     "final_goto_line_count": census.totals.final_goto_line_count,
-                    "by_reason": {
-                        "revisit": census.totals.by_reason.revisit,
-                        "forward_revisit": census.totals.by_reason.forward_revisit,
-                        "unknown": census.totals.by_reason.unknown,
-                    },
+                    "by_reason": final_reason_json(&census.totals.by_reason),
                     "raw_emission_count": census.totals.raw_emission_count,
                     "raw_by_reason": {
                         "revisit": census.totals.raw_by_reason.revisit,
@@ -986,7 +992,7 @@ fn cmd_dex_goto_census(args: DexGotoCensusArgs) -> Result<()> {
                 },
                 "exception_totals": exception_counts_json(&census.exception_totals),
                 "exception_flow_meaning": revx_dex::exception::EXCEPTION_FLOW_MEANING,
-                "final_provenance": "unknown",
+                "final_provenance": "classified",
                 "methods": census.methods.iter().map(|m| serde_json::json!({
                     "class": m.class,
                     "method_idx": m.method_idx,
@@ -1005,15 +1011,11 @@ fn cmd_dex_goto_census(args: DexGotoCensusArgs) -> Result<()> {
                     "unknown_id": m.unknown_id,
                     "final_goto_count": m.counts.as_ref().map(|c| c.final_goto_count).unwrap_or(0),
                     "final_goto_line_count": m.counts.as_ref().map(|c| c.final_goto_line_count).unwrap_or(0),
-                    "by_reason": {
-                        "revisit": m.counts.as_ref().map(|c| c.by_reason.revisit).unwrap_or(0),
-                        "forward_revisit": m.counts.as_ref().map(|c| c.by_reason.forward_revisit).unwrap_or(0),
-                        "unknown": m.counts.as_ref().map(|c| c.by_reason.unknown).unwrap_or(0),
-                    },
+                    "by_reason": m.counts.as_ref().map(|c| final_reason_json(&c.by_reason)).unwrap_or_else(|| final_reason_json(&Default::default())),
                     "final_goto_sites": m.final_scan.as_ref().map(|s| s.sites.iter().map(|site| serde_json::json!({
                         "line": site.line,
                         "target": site.target,
-                        "provenance": "unknown",
+                        "provenance": site.provenance.as_str(),
                     })).collect::<Vec<_>>()).unwrap_or_default(),
                     "target_counts": m.final_scan.as_ref().map(|s| s.target_counts.clone()).unwrap_or_default(),
                     "dangling_final_targets": m.final_scan.as_ref().map(|s| s.dangling_targets.clone()).unwrap_or_default(),
@@ -1044,7 +1046,7 @@ fn cmd_dex_goto_census(args: DexGotoCensusArgs) -> Result<()> {
     );
     println!("// {}", exception_summary(&census.exception_totals));
     println!(
-        "// exception flow is conservative: metadata-derived block-to-handler edges, not proven runtime dispatch; final goto provenance unknown"
+        "// exception flow is conservative: metadata-derived block-to-handler edges, not proven runtime dispatch"
     );
     if census.selection.truncated {
         eprintln!(
@@ -1094,7 +1096,14 @@ fn cmd_dex_goto_census(args: DexGotoCensusArgs) -> Result<()> {
         census.totals.loop_norm_methods,
         census.totals.phi_lower_methods
     );
-    eprintln!("// final goto provenance: unknown; raw emission counts are not final counts");
+    eprintln!(
+        "// final goto provenance: irreducible_loop={} handler={} switch={} unstructured={} unknown={}",
+        census.totals.by_reason.irreducible_loop,
+        census.totals.by_reason.handler,
+        census.totals.by_reason.switch,
+        census.totals.by_reason.unstructured,
+        census.totals.by_reason.unknown
+    );
     Ok(())
 }
 

@@ -3,7 +3,7 @@ use crate::lift::Insn;
 use revx_analysis::ssa::{BlockId, Cfg};
 use std::collections::{BTreeMap, BTreeSet};
 
-pub const EXCEPTION_FLOW_MEANING: &str = "Conservative metadata-derived block-to-handler edges for every protected block; not instruction-level may-throw analysis or proven runtime dispatch. Normal CFG is unchanged; final goto provenance remains unknown.";
+pub const EXCEPTION_FLOW_MEANING: &str = "Conservative metadata-derived block-to-handler edges for every protected block; not instruction-level may-throw analysis or proven runtime dispatch. Normal CFG is unchanged.";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HandlerKind {
