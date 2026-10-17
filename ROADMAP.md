@@ -23,7 +23,7 @@ PR #79 / Issue #78。
 
 `revx dex goto-census <path> --json [--limit N]` 分别报告最终文本 goto 和结构化阶段发射诊断。
 最终计数跳过字符串/注释，不按目标标签去重。后处理可能删除、转换或复制文本，因此 final 不保证小于 raw。
-最终 goto 的根因仍为 `unknown`；最初设想的五类根因分类尚未交付。
+最终 goto 的根因在 R1 交付时为 `unknown`；五类根因分类见 R9。
 
 单个本地 DEX 的历史观测为：30,261 个定义方法，28,903 个有代码方法处理完成、0 个处理失败、1,358 个无代码方法；最终 goto 2,924，raw 4,508。
 它不能替代来源未核实的 3,280，也不证明比其他语料或工具更优。见 [R1 报告](benches/goto-census-2026-09.md)。
@@ -116,13 +116,26 @@ Issue #93。边界：循环只吸收「前驱全在循环内」的出口；switc
 
 验收见 `crates/revx-dex/tests/multi_exit.rs`、`crates/revx-dex/tests/switch_lift.rs` 与 [R8 报告](benches/r8-multi-exit-2026-10.md)。
 
+## R9 — 最终 goto 根因分类：已交付
+
+Issue #95。边界：只给最终文本里剩下的 `goto L<n>;` 标根因，不改变区域/legacy 文本。raw 的 revisit / forward-revisit 仍是发射路径名称。普查 schema 7。不包装 JADX。私有 APK 不入库。
+
+- `irreducible_loop`：目标在多入口循环 SCC 里。
+- `handler`：目标是 handler 块。
+- `switch`：目标是 switch case 目标。
+- `unstructured`：其余仍在 CFG 内的跳转。
+- `unknown`：悬空或无法解析的标签。
+- `final_goto_count` 等于五类计数之和。
+
+验收见 `crates/revx-dex/tests/goto_provenance.rs` 与 [R9 报告](benches/r9-goto-provenance-2026-10.md)。
+
 ## 已知降级（v1 冻结）
 
 - 两个循环出口都与循环外代码汇合：`unsupported_control_flow`，整方法 legacy。
 - 重叠 try：`cross_region_edge`。
 - 多入口循环碰到异常元数据：`loop_exception_intersection`。
 - 拆分预算不够：`budget_exceeded`。
-- final goto 根因：`unknown`。
+- 悬空 `goto` 标签：`unknown`。
 - 跨进程反编译文本漂移仍然存在。
 
 ## 已知限制与工程规则

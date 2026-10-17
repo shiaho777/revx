@@ -22,8 +22,9 @@ Agent-facing evidence for the R5 synthetic matrix. JADX is not a CI dependency. 
 | loop with two return tails | yes, after R8 | complete | none | `while (true)` with both tails |
 | switch arms rejoin | yes, after R8 | complete | none | join emitted once |
 | switch inside loop | yes, after R8 | complete | none | `switch` in `while (true)` |
+| leftover `goto L<n>;` | census v7 | n/a | site `provenance` | `irreducible_loop` / `handler` / `switch` / `unstructured` / `unknown` |
 
-Tests: `crates/revx-dex/tests/evidence.rs`, `crates/revx-dex/tests/r5_acceptance.rs`.
+Tests: `crates/revx-dex/tests/evidence.rs`, `crates/revx-dex/tests/r5_acceptance.rs`, `crates/revx-dex/tests/goto_provenance.rs`.
 
 ## What this does not claim
 

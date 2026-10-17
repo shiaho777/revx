@@ -144,6 +144,14 @@ fn multi_entry_count(cfg: &Cfg) -> usize {
         .count()
 }
 
+pub(crate) fn multi_entry_scc_blocks(cfg: &Cfg) -> BTreeSet<BlockId> {
+    cyclic_sccs(cfg)
+        .into_iter()
+        .filter(|scc| entries(scc, cfg).len() > 1)
+        .flatten()
+        .collect()
+}
+
 fn cyclic_sccs(cfg: &Cfg) -> Vec<BTreeSet<BlockId>> {
     tarjan(cfg)
         .into_iter()
