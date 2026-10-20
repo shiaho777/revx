@@ -129,6 +129,17 @@ Issue #95。边界：只给最终文本里剩下的 `goto L<n>;` 标根因，不
 
 验收见 `crates/revx-dex/tests/goto_provenance.rs` 与 [R9 报告](benches/r9-goto-provenance-2026-10.md)。
 
+## R10 — Native SSA 区域树默认打开：已交付
+
+Issue #97。边界：自研 ARM64/x64 `named_layered` 用后支配汇合做 if/else 与 while，成功则采用，失败整函数回退线性块发射。不包装 Ghidra。不关闭 #59（NativeCrypto_decrypt 的 A2 指标仍是后续工作）。
+
+- 两臂汇合点走反向 CFG 的后支配树，菱形不再被当成退化 early-exit。
+- 循环头的回边识别 `while (cond)`。
+- 空 then/else 臂继续走主路径，共享 cleanup 只发射一次。
+- 超过 96 块仍走线性 `// bb` 发射。`REVX_REGION_TREE=0` 可关掉区域 walk。
+
+验收见 `crates/revx-analysis/tests/native_region.rs` 与 [R10 报告](benches/r10-native-region-2026-10.md)。
+
 ## 已知降级（v1 冻结）
 
 - 两个循环出口都与循环外代码汇合：`unsupported_control_flow`，整方法 legacy。
