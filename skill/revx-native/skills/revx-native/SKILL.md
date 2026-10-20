@@ -119,7 +119,9 @@ revx survey [--binary-id ID]             # corpus overview
 ```
 
 Decompile quality is best on full-profile runs with metadata; fast-profile
-runs return compact summaries suited to triage.
+runs return compact summaries suited to triage. Simple diamonds and natural
+loops render as `if` / `while` on the default SSA path; oversized or
+unstructured functions stay linear. NativeCrypto_decrypt A2 remains open.
 
 ## Deliverables
 
