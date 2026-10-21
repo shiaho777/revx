@@ -3101,13 +3101,36 @@ fn apply_semantic_names(text: &str) -> String {
     }
     let mut out: Vec<String> = Vec::new();
     for line in &lines {
-        let mut l = line.to_string();
-        for (old, new) in &name_map {
-            l = replace_token(&l, old, new);
-        }
-        out.push(l);
+        out.push(replace_tokens_once(line, &name_map));
     }
     out.join("\n")
+}
+
+fn replace_tokens_once(line: &str, name_map: &HashMap<String, String>) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut chars = line.char_indices().peekable();
+    while let Some((start, c)) = chars.next() {
+        if c.is_alphanumeric() || c == '_' {
+            let mut end = start + c.len_utf8();
+            while let Some(&(idx, next)) = chars.peek() {
+                if next.is_alphanumeric() || next == '_' {
+                    end = idx + next.len_utf8();
+                    chars.next();
+                } else {
+                    break;
+                }
+            }
+            let token = &line[start..end];
+            if let Some(replacement) = name_map.get(token) {
+                out.push_str(replacement);
+            } else {
+                out.push_str(token);
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 fn looks_like_java_type(s: &str) -> bool {
@@ -4115,6 +4138,50 @@ mod concat_tests {
         let after_ts = after_paren.and_then(|r| r.strip_suffix(".toString()"));
         eprintln!("after_toString: {after_ts:?}");
         assert!(after_ts.is_some(), "toString strip should work");
+    }
+}
+
+#[cfg(test)]
+mod semantic_name_tests {
+    use super::apply_semantic_names;
+    use std::env;
+    use std::fs;
+    use std::process::Command;
+
+    fn renamed() -> String {
+        apply_semantic_names("    v10 = this.v1;\n    v1 = this.size;\n")
+    }
+
+    #[test]
+    fn semantic_rename_replaces_each_original_token_once() {
+        let want = "    v1 = this.size;\n    size = this.size;";
+        if let Ok(path) = env::var("REVX_DRIFT_OUT") {
+            fs::write(path, renamed()).unwrap();
+            return;
+        }
+        let exe = env::current_exe().unwrap();
+        for i in 0..4 {
+            let path =
+                env::temp_dir().join(format!("revx-semantic-{}-{i}.txt", std::process::id()));
+            let output = Command::new(&exe)
+                .args([
+                    "--exact",
+                    "render::semantic_name_tests::semantic_rename_replaces_each_original_token_once",
+                    "--test-threads=1",
+                ])
+                .env("REVX_DRIFT_OUT", &path)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "child failed\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let got = fs::read_to_string(&path).unwrap();
+            let _ = fs::remove_file(&path);
+            assert_eq!(got, want, "process {i}");
+        }
     }
 }
 

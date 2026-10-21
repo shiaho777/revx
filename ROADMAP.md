@@ -140,6 +140,17 @@ Issue #97。边界：自研 ARM64/x64 `named_layered` 用后支配汇合做 if/e
 
 验收见 `crates/revx-analysis/tests/native_region.rs` 与 [R10 报告](benches/r10-native-region-2026-10.md)。
 
+## R11 — 跨进程伪代码稳定：已交付
+
+Issue #99。边界：同一条 DEX 管线对同一输入在独立进程里字节相同。不把渲染结果再排序来假装等价，也不改区域树回退原因或普查 schema。
+
+- join phi 按 Dalvik 寄存器号升序分配。拷贝语句和临时名不再跟着进程内的 `HashMap` 种子变。
+- 语义重命名对一行里的原始 token 只替换一次，后写入的名字不会再吃掉前一个替换结果。
+- legacy 路径上同一行的多个 `L<n>:` 按块号升序插入。
+- ARM64 菱形（`x0`–`x3`）的文本本来就是 `return x0 + x1`，跨进程已经相同。本阶段不改 native phi 分配。
+
+验收见 `crates/revx-dex/tests/output_stability.rs`、`crates/revx-analysis/tests/output_stability.rs` 与 [R11 报告](benches/r11-pseudocode-stability-2026-10.md)。
+
 ## 已知降级（v1 冻结）
 
 - 两个循环出口都与循环外代码汇合：`unsupported_control_flow`，整方法 legacy。
@@ -147,11 +158,11 @@ Issue #97。边界：自研 ARM64/x64 `named_layered` 用后支配汇合做 if/e
 - 多入口循环碰到异常元数据：`loop_exception_intersection`。
 - 拆分预算不够：`budget_exceeded`。
 - 悬空 `goto` 标签：`unknown`。
-- 跨进程反编译文本漂移仍然存在。
+- Native SSA 的 phi 仍按寄存器名集合的迭代顺序分配 id。R11 的 ARM64 菱形文本不包含这些 id。
 
 ## 已知限制与工程规则
 
-- main 上已有跨进程反编译文本漂移（临时变量编号、语句顺序）。原因尚未确证；排序输出或统一变量名不能证明语义等价。R2 用同一份 IR 检验诊断路径，不掩盖跨进程验收的限制。
+- DEX 方法伪代码在独立进程间字节相同（R11）。原因是 join phi 的 `HashMap` 迭代序，以及语义重命名的连环替换。把最终文本排序不能代替这个修复，也不证明和另一种反编译器语义等价。R2 仍用同一份 IR 检验诊断路径。
 - 每个 PR：fmt、clippy、check、workspace tests 及最新 CI 全绿才合并。保留命令真实退出码，不用截断输出推断成功。
 - 不上传本地 APK/DEX、完整私有分析结果、缓存或凭证。默认 CI 运行合成测试，不依赖未提供的外部语料。
 - 算法实现遵守依赖与源代码许可证；不复制未经许可的代码。路线图不以对第三方工具的未经核实评价作为技术依据。
