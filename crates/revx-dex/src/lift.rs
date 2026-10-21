@@ -1500,7 +1500,7 @@ impl<'a> DexMethodLifter<'a> {
         if preds.is_empty() {
             return;
         }
-        let mut common: HashMap<u16, Vec<(BlockId, SsaValueId)>> = HashMap::new();
+        let mut common: BTreeMap<u16, Vec<(BlockId, SsaValueId)>> = BTreeMap::new();
         for &pred in &preds {
             if let Some(defs) = self.block_defs.get(&pred) {
                 for (&reg, &id) in defs {

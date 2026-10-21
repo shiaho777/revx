@@ -84,7 +84,7 @@ fn finish_render(
     if r.lines.is_empty() {
         return ("    <empty>".to_string(), r.bailed);
     }
-    let mut insertions: Vec<(usize, String)> = Vec::new();
+    let mut insertions: Vec<(usize, u32, String)> = Vec::new();
     let existing_labels: HashSet<String> = r
         .lines
         .iter()
@@ -101,13 +101,13 @@ fn finish_render(
                     .get(start)
                     .map(|l| l.len() - l.trim_start().len())
                     .unwrap_or(0);
-                insertions.push((start, format!("{}{}", " ".repeat(indent), label)));
+                insertions.push((start, target.0, format!("{}{}", " ".repeat(indent), label)));
             }
         }
     }
-    insertions.sort_by_key(|(i, _)| *i);
-    for (i, (pos, label)) in insertions.iter().enumerate() {
-        r.lines.insert(pos + i, label.clone());
+    insertions.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+    for (i, (pos, _, label)) in insertions.iter().enumerate() {
+        r.lines.insert(*pos + i, label.clone());
     }
     let mut orphans: Vec<&CfgBlock> = r
         .func
