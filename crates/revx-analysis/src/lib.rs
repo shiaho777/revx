@@ -50,8 +50,8 @@ const ARM64_ARRAY_LIKE_MIN_STRIDE_HITS: usize = 16;
 const ARM64_SP_ROOT_BUFFER_MIN_END: i64 = 0x20;
 const ARM64_SP_ROOT_BUFFER_MIN_STORES: usize = 2;
 
-const MAX_CFG_BLOCKS: usize = 48;
-const MAX_CFG_INSTRUCTIONS: usize = 192;
+const MAX_CFG_BLOCKS: usize = 80;
+const MAX_CFG_INSTRUCTIONS: usize = 320;
 const MAX_HEAVY_ANALYSIS_INSTS: usize = 256;
 const MAX_HEAVY_ANALYSIS_BLOCKS: usize = 48;
 const MAX_SSA_INSTS: usize = 128;
@@ -82,11 +82,21 @@ fn analysis_limit_boost(profile: AnalysisProfile) -> usize {
 }
 
 fn ssa_inst_limit(profile: AnalysisProfile) -> usize {
-    MAX_SSA_INSTS.saturating_mul(analysis_limit_boost(profile))
+    let base = MAX_SSA_INSTS.saturating_mul(analysis_limit_boost(profile));
+    if profile == AnalysisProfile::Full && !resource::lean_mode() && !resource::micro_mode() {
+        base.max(384)
+    } else {
+        base
+    }
 }
 
 fn ssa_block_limit(profile: AnalysisProfile) -> usize {
-    MAX_SSA_BLOCKS.saturating_mul(analysis_limit_boost(profile))
+    let base = MAX_SSA_BLOCKS.saturating_mul(analysis_limit_boost(profile));
+    if profile == AnalysisProfile::Full && !resource::lean_mode() && !resource::micro_mode() {
+        base.max(80)
+    } else {
+        base
+    }
 }
 
 fn linear_ssa_inst_limit(profile: AnalysisProfile) -> usize {
@@ -116,7 +126,7 @@ fn pending_stream_batch_size() -> usize {
 
 const MAX_DATA_REF_SCAN_INSTS: usize = 256;
 const MAX_GLOBAL_REFERENCES: usize = 512;
-const MAX_SHARED_STRING_MAP: usize = 64;
+const MAX_SHARED_STRING_MAP: usize = 256;
 
 fn data_ref_scan_limit() -> usize {
     revx_core::analysis_caps()
@@ -3341,13 +3351,53 @@ fn cfg_window_before(
 #[allow(clippy::nonminimal_bool)]
 #[allow(clippy::duplicated_attributes)]
 #[allow(clippy::collapsible_match)]
+struct Arm64CfgQueue {
+    near: BTreeSet<u64>,
+    far: VecDeque<u64>,
+    cursor: u64,
+}
+
+const ARM64_CFG_NEAR: u64 = 0x100;
+
+impl Arm64CfgQueue {
+    fn new(start: u64) -> Self {
+        Self {
+            near: BTreeSet::from([start]),
+            far: VecDeque::new(),
+            cursor: start,
+        }
+    }
+
+    fn note(&mut self, addr: u64) {
+        if addr > self.cursor {
+            self.cursor = addr;
+        }
+    }
+
+    fn push(&mut self, addr: u64) {
+        if addr <= self.cursor.saturating_add(ARM64_CFG_NEAR) {
+            self.near.insert(addr);
+        } else {
+            self.far.push_back(addr);
+        }
+    }
+
+    fn pop(&mut self, insts: usize, limit: usize) -> Option<u64> {
+        let spine_cap = limit.saturating_sub(64).max(limit / 2);
+        if !self.near.is_empty() && (insts < spine_cap || self.far.is_empty()) {
+            return self.near.pop_first();
+        }
+        self.far.pop_front().or_else(|| self.near.pop_first())
+    }
+}
+
 fn decode_arm64_cfg_with_references(
     code_regions: &[CodeRegion],
     start: u64,
     max_end: u64,
     executable: &[(u64, u64)],
 ) -> (Vec<Instruction>, Vec<Reference>) {
-    let mut queue = VecDeque::from([start]);
+    let mut queue = Arm64CfgQueue::new(start);
     let estimated_blocks = ((max_end.saturating_sub(start) / 16) as usize)
         .max(4)
         .min(cfg_block_limit());
@@ -3359,7 +3409,7 @@ fn decode_arm64_cfg_with_references(
     let mut all_refs = Vec::with_capacity(estimated_blocks);
     let mut saw_br = false;
 
-    while let Some(block_start) = queue.pop_front() {
+    while let Some(block_start) = queue.pop(instruction_map.len(), cfg_inst_limit()) {
         if visited_blocks.len() >= cfg_block_limit() || instruction_map.len() >= cfg_inst_limit() {
             break;
         }
@@ -3372,6 +3422,7 @@ fn decode_arm64_cfg_with_references(
         if !is_executable_address(executable, block_start) {
             continue;
         }
+        queue.note(block_start);
         let Some((bytes, base)) = code_slice(code_regions, block_start, max_end) else {
             continue;
         };
@@ -3404,7 +3455,7 @@ fn decode_arm64_cfg_with_references(
             {
                 for reference in &table_refs {
                     if reference.to >= start && reference.to < max_end {
-                        queue.push_back(reference.to);
+                        queue.push(reference.to);
                     }
                 }
                 expanded_refs.extend(table_refs);
@@ -3418,7 +3469,7 @@ fn decode_arm64_cfg_with_references(
                 ReferenceKind::Jump => {
                     has_implicit_fallthrough = false;
                     if reference.to >= start && reference.to < max_end {
-                        queue.push_back(reference.to);
+                        queue.push(reference.to);
                     }
                 }
                 ReferenceKind::IndirectJump => {
@@ -3427,16 +3478,16 @@ fn decode_arm64_cfg_with_references(
                         && reference.to < max_end
                         && is_resolved_code_target(reference.to)
                     {
-                        queue.push_back(reference.to);
+                        queue.push(reference.to);
                     }
                 }
                 ReferenceKind::BranchTrue
                 | ReferenceKind::BranchFalse
                 | ReferenceKind::Branch
-                | ReferenceKind::Fallthrough => {
-                    if reference.to >= start && reference.to < max_end {
-                        queue.push_back(reference.to);
-                    }
+                | ReferenceKind::Fallthrough
+                    if reference.to >= start && reference.to < max_end =>
+                {
+                    queue.push(reference.to);
                 }
                 _ => {}
             }
@@ -3455,7 +3506,7 @@ fn decode_arm64_cfg_with_references(
             && next >= start
             && next < max_end
         {
-            queue.push_back(next);
+            queue.push(next);
         }
     }
 
@@ -3484,14 +3535,14 @@ fn decode_arm64_cfg_with_references(
                         && reference.to < max_end
                         && !instruction_map.contains_key(&reference.to)
                     {
-                        queue.push_back(reference.to);
+                        queue.push(reference.to);
                     }
                 }
                 final_extra.extend(table_refs);
             }
         }
     }
-    while let Some(block_start) = queue.pop_front() {
+    while let Some(block_start) = queue.pop(instruction_map.len(), cfg_inst_limit()) {
         if visited_blocks.len() >= cfg_block_limit() || instruction_map.len() >= cfg_inst_limit() {
             break;
         }
@@ -3504,6 +3555,7 @@ fn decode_arm64_cfg_with_references(
         if !is_executable_address(executable, block_start) {
             continue;
         }
+        queue.note(block_start);
         let Some((bytes, base)) = code_slice(code_regions, block_start, max_end) else {
             continue;
         };
@@ -3533,7 +3585,7 @@ fn decode_arm64_cfg_with_references(
             {
                 for reference in &table_refs {
                     if reference.to >= start && reference.to < max_end {
-                        queue.push_back(reference.to);
+                        queue.push(reference.to);
                     }
                 }
                 expanded_refs.extend(table_refs);
@@ -3545,7 +3597,7 @@ fn decode_arm64_cfg_with_references(
                 ReferenceKind::Jump => {
                     has_implicit_fallthrough = false;
                     if reference.to >= start && reference.to < max_end {
-                        queue.push_back(reference.to);
+                        queue.push(reference.to);
                     }
                 }
                 ReferenceKind::IndirectJump => {
@@ -3554,16 +3606,16 @@ fn decode_arm64_cfg_with_references(
                         && reference.to < max_end
                         && is_resolved_code_target(reference.to)
                     {
-                        queue.push_back(reference.to);
+                        queue.push(reference.to);
                     }
                 }
                 ReferenceKind::BranchTrue
                 | ReferenceKind::BranchFalse
                 | ReferenceKind::Branch
-                | ReferenceKind::Fallthrough => {
-                    if reference.to >= start && reference.to < max_end {
-                        queue.push_back(reference.to);
-                    }
+                | ReferenceKind::Fallthrough
+                    if reference.to >= start && reference.to < max_end =>
+                {
+                    queue.push(reference.to);
                 }
                 _ => {}
             }
@@ -3580,7 +3632,7 @@ fn decode_arm64_cfg_with_references(
             && next >= start
             && next < max_end
         {
-            queue.push_back(next);
+            queue.push(next);
         }
     }
     all_refs.extend(final_extra);
@@ -4132,9 +4184,10 @@ fn polish_jni_argument_names(function_name: &str, arguments: &mut [Variable]) ->
     }
     for (index, arg) in arguments.iter_mut().enumerate() {
         if !arg.name.starts_with("arg_") {
-            continue; // already named (debug hints)
+            continue;
         }
-        match index {
+        let slot = jni_register_index(&arg.location).unwrap_or(index);
+        match slot {
             0 => {
                 arg.name = "env".to_string();
                 arg.type_name = Some("JNIEnv *".to_string());
@@ -4152,6 +4205,14 @@ fn polish_jni_argument_names(function_name: &str, arguments: &mut [Variable]) ->
         }
     }
     true
+}
+
+fn jni_register_index(location: &str) -> Option<usize> {
+    let rest = location
+        .strip_prefix('x')
+        .or_else(|| location.strip_prefix('w'))?;
+    let index = rest.parse::<usize>().ok()?;
+    if index <= 7 { Some(index) } else { None }
 }
 
 fn polish_argument_names(function_name: &str, arguments: &mut [Variable]) {
@@ -10297,8 +10358,8 @@ mod tests {
         extract_x64_data_references, find_executable_range, function_recovery_budget,
         infer_arm64_argument_type, infer_arm64_return_statement, infer_arm64_stack_arg_bytes,
         infer_arm64_stack_slot_type, infer_return_type, is_string_address, memory_function_cap,
-        next_hard_boundary, promote_data_reference_kinds, reclassify_string_references,
-        recover_arm64_locals, split_basic_blocks,
+        next_hard_boundary, polish_jni_argument_names, promote_data_reference_kinds,
+        reclassify_string_references, recover_arm64_locals, split_basic_blocks,
     };
     use revx_core::{
         AnalysisProfile, Architecture, BasicBlock, BinaryFormat, BinaryImage, DebugImportSummary,
@@ -10320,6 +10381,43 @@ mod tests {
         std::path::PathBuf::from("/dev/null/revx-no-sample")
     }
     use std::sync::Arc;
+
+    fn jni_arg(name: &str, location: &str) -> Variable {
+        Variable {
+            name: name.to_string(),
+            role: VariableRole::Argument,
+            storage: VariableStorage::Register,
+            type_name: Some("void *".to_string()),
+            confidence: 0.6,
+            location: location.to_string(),
+            evidence_ids: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn jni_names_follow_the_register_not_the_packed_index() {
+        let mut skipped_thiz = vec![
+            jni_arg("arg_0", "x0"),
+            jni_arg("arg_2", "x2"),
+            jni_arg("arg_3", "x3"),
+            jni_arg("arg_4", "x4"),
+        ];
+        assert!(polish_jni_argument_names(
+            "Java_com_webtoapp_core_crypto_NativeCrypto_decrypt",
+            &mut skipped_thiz
+        ));
+        let names: Vec<_> = skipped_thiz.iter().map(|arg| arg.name.as_str()).collect();
+        assert_eq!(names, ["env", "a2", "a3", "a4"]);
+        let mut dense = vec![
+            jni_arg("arg_0", "x0"),
+            jni_arg("arg_1", "x1"),
+            jni_arg("arg_2", "x2"),
+            jni_arg("arg_3", "x3"),
+        ];
+        assert!(polish_jni_argument_names("Java_pkg_Cls_m", &mut dense));
+        let names: Vec<_> = dense.iter().map(|arg| arg.name.as_str()).collect();
+        assert_eq!(names, ["env", "thiz", "a2", "a3"]);
+    }
 
     #[test]
     fn arm64_ret_block_does_not_fall_through_into_next_function() {

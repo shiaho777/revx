@@ -807,7 +807,6 @@ fn is_trivial_stack_prologue_store(rendered: &str) -> bool {
         || lhs.contains("x29")
         || lhs.starts_with("flag_tmp")
         || lhs.starts_with("*flag_tmp")
-        || lhs.starts_with("*(")
 }
 
 fn simplify_addr_expr(text: &str) -> String {
@@ -838,12 +837,24 @@ fn collapse_nested_addr(text: &str) -> String {
         if off == 0 {
             return base;
         } else if off > 0 {
-            return format!("({base} + {off:#x})");
+            return format!("({} + {off:#x})", paren_expr(&base));
         } else {
-            return format!("({base} - {:#x})", -off);
+            return format!("({} - {:#x})", paren_expr(&base), -off);
         }
     }
     t.to_string()
+}
+
+fn paren_expr(text: &str) -> String {
+    let t = text.trim();
+    if t.starts_with('(') && balanced_outer_parens(t) {
+        return t.to_string();
+    }
+    if t.contains(['+', '-', '*', '/', '&', '|', '^', '<', '>']) {
+        format!("({t})")
+    } else {
+        t.to_string()
+    }
 }
 
 fn parse_addr_chain(text: &str) -> Option<(String, i64)> {
@@ -2232,7 +2243,7 @@ impl Cfg {
             }
         }
         for i in 0..n.saturating_sub(1) {
-            if succs[i].is_empty() {
+            if succs[i].is_empty() && block_can_fall_through(&blocks[i]) {
                 let to = BlockId((i + 1) as u32);
                 succs[i].push(to);
                 if !preds[i + 1].contains(&BlockId(i as u32)) {
@@ -4490,7 +4501,7 @@ fn parse_arm64_imm(text: &str) -> Option<i64> {
         .strip_prefix("0x")
         .or_else(|| token.strip_prefix("0X"))
     {
-        return i64::from_str_radix(hex, 16).ok();
+        return u64::from_str_radix(hex, 16).ok().map(|v| v as i64);
     }
     if let Some(neg) = token
         .strip_prefix("-0x")
@@ -4602,13 +4613,7 @@ fn lift_arm64_instruction(
         "ldr" | "ldrb" | "ldrh" | "ldrsw" | "ldrsh" | "ldrsb" | "ldur" | "ldurb" | "ldurh"
         | "ldursw" => {
             if let Some(dst) = extract_dest_reg_ref(text) {
-                let offset = extract_mem_offset(text);
-                let addr_operand = if let Some(base_reg) = extract_mem_base_ref(text) {
-                    let base_op = lookup_or_symbol(func, base_reg, block);
-                    deref_operand(base_op, offset)
-                } else {
-                    Operand::Symbol("unknown_addr".into())
-                };
+                let addr_operand = arm64_mem_addr(func, block, text, addr);
                 func.define(dst, block, SsaOp::Load { addr: addr_operand }, addr);
             }
         }
@@ -4620,13 +4625,7 @@ fn lift_arm64_instruction(
                     lhs.split_whitespace().last().unwrap_or("").trim(),
                     block,
                 );
-                let offset = extract_mem_offset(text);
-                let addr_operand = if let Some(base_reg) = extract_mem_base_ref(text) {
-                    let base_op = lookup_or_symbol(func, base_reg, block);
-                    deref_operand(base_op, offset)
-                } else {
-                    Operand::Symbol("unknown_addr".into())
-                };
+                let addr_operand = arm64_mem_addr(func, block, text, addr);
                 // Stores don't define a register, but we create a value for tracking.
                 let id = func.new_value_id();
                 let inst = SsaInstruction {
@@ -4973,6 +4972,26 @@ fn lift_arm64_instruction(
                 };
                 func.cfg.block_mut(block).insts.push(id);
                 func.values.push(inst);
+            }
+        }
+
+        "adr" => {
+            if let Some(dst) = extract_dest_reg_ref(text) {
+                let target = references
+                    .iter()
+                    .find(|r| r.from == addr && r.kind == revx_core::ReferenceKind::DataRef)
+                    .map(|r| r.to)
+                    .or_else(|| parse_branch_addr(addr, text));
+                if let Some(target) = target {
+                    func.define(
+                        dst,
+                        block,
+                        SsaOp::Copy {
+                            src: Operand::Constant(target as i64),
+                        },
+                        addr,
+                    );
+                }
             }
         }
 
@@ -5883,6 +5902,17 @@ fn opcode_token(text: &str) -> &str {
     if start == i { "" } else { &text[start..i] }
 }
 
+fn block_can_fall_through(block: &revx_core::BasicBlock) -> bool {
+    let Some(text) = block.instructions.last().map(|inst| inst.text.as_ref()) else {
+        return false;
+    };
+    let opcode = text.split_whitespace().next().unwrap_or("");
+    !matches!(
+        opcode,
+        "ret" | "retaa" | "retab" | "eret" | "b" | "br" | "braa" | "brab"
+    )
+}
+
 fn extract_dest_reg_ref(text: &str) -> Option<&str> {
     let rest = text.split_once(' ')?.1.trim();
     let tok = rest.split(',').next()?.trim();
@@ -5911,6 +5941,66 @@ fn extract_mem_offset(text: &str) -> i64 {
         }
     }
     0
+}
+
+fn extract_mem_index_reg(text: &str) -> Option<(&str, i64)> {
+    let start = text.find('[')?;
+    let inner = text[start + 1..].split(']').next()?;
+    let parts: Vec<&str> = inner.split(',').map(str::trim).collect();
+    if parts.len() < 2 || parse_arm64_imm(parts[1]).is_some() {
+        return None;
+    }
+    let reg = parts[1].split_whitespace().next()?;
+    if !looks_like_reg_name(reg) && reg != "sp" {
+        return None;
+    }
+    let shift = parts
+        .get(2)
+        .and_then(|tok| {
+            let tok = tok.trim();
+            if tok.starts_with("lsl") {
+                parse_arm64_imm(tok)
+            } else {
+                None
+            }
+        })
+        .unwrap_or(0);
+    Some((reg, shift))
+}
+
+fn arm64_mem_addr(func: &mut SsaFunction, block: BlockId, text: &str, addr: u64) -> Operand {
+    let Some(base_reg) = extract_mem_base_ref(text) else {
+        return Operand::Symbol("unknown_addr".into());
+    };
+    let base_op = lookup_or_symbol(func, base_reg, block);
+    let Some((index_reg, shift)) = extract_mem_index_reg(text) else {
+        return deref_operand(base_op, extract_mem_offset(text));
+    };
+    let mut index_op = lookup_or_symbol(func, index_reg, block);
+    if shift > 0 {
+        let shifted = func.define(
+            "__idx_shl",
+            block,
+            SsaOp::BinOp {
+                kind: BinOpKind::Shl,
+                lhs: index_op,
+                rhs: Operand::Constant(shift),
+            },
+            addr,
+        );
+        index_op = Operand::Value(shifted);
+    }
+    let sum = func.define(
+        "__idx_add",
+        block,
+        SsaOp::BinOp {
+            kind: BinOpKind::Add,
+            lhs: base_op,
+            rhs: index_op,
+        },
+        addr,
+    );
+    deref_operand(Operand::Value(sum), 0)
 }
 
 fn parse_imm_str(s: &str) -> Option<i64> {
@@ -6790,7 +6880,250 @@ fn rename_block_labels(lines: Vec<String>, labels: &HashMap<BlockId, String>) ->
 /// Final text-level cleanup shared by all render paths:
 /// - `X = X;` identity copies (call results echoing their only argument)
 /// - `return xzr;` → `return 0;`
+fn if_header_cond(line: &str) -> Option<&str> {
+    header_cond(line, "if (")
+}
+
+fn while_header_cond(line: &str) -> Option<&str> {
+    header_cond(line, "while (")
+}
+
+fn header_cond<'a>(line: &'a str, prefix: &str) -> Option<&'a str> {
+    let trimmed = line.trim();
+    let rest = trimmed.strip_prefix(prefix)?;
+    let cond = rest.strip_suffix(") {")?;
+    if cond.is_empty() { None } else { Some(cond) }
+}
+
+fn bare_goto_label(line: &str) -> Option<&str> {
+    let trimmed = line.trim();
+    let rest = trimmed.strip_prefix("goto ")?;
+    let label = rest.strip_suffix(';')?;
+    if label.is_empty() || label.contains(' ') {
+        None
+    } else {
+        Some(label)
+    }
+}
+
+fn matching_else_close(lines: &[String], body_start: usize) -> Option<usize> {
+    let mut depth = 1usize;
+    for (offset, line) in lines.iter().enumerate().skip(body_start) {
+        let trimmed = line.trim();
+        if trimmed == "} else {" {
+            depth = depth.checked_sub(1)?;
+            if depth == 0 {
+                return None;
+            }
+            depth += 1;
+        } else if trimmed.ends_with('{') {
+            depth += 1;
+        } else if trimmed == "}" {
+            depth -= 1;
+            if depth == 0 {
+                return Some(offset);
+            }
+        }
+    }
+    None
+}
+
+fn reindent_braces(lines: &[String]) -> Vec<String> {
+    let mut depth = 0i32;
+    let mut out = Vec::with_capacity(lines.len());
+    for line in lines {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            out.push(String::new());
+            continue;
+        }
+        if trimmed.starts_with('}') {
+            depth = depth.saturating_sub(1);
+        }
+        let level = if trimmed.starts_with("int ") {
+            0
+        } else {
+            depth.max(0) as usize
+        };
+        out.push(format!("{}{trimmed}", "    ".repeat(level)));
+        if trimmed.ends_with('{') {
+            depth += 1;
+        }
+    }
+    out
+}
+
+fn fold_same_target_gotos(lines: &[String]) -> Vec<String> {
+    let mut current = lines.to_vec();
+    loop {
+        let Some(next) = fold_same_target_gotos_once(&current) else {
+            return current;
+        };
+        current = next;
+    }
+}
+
+fn fold_same_target_gotos_once(lines: &[String]) -> Option<Vec<String>> {
+    for index in 0..lines.len() {
+        let Some(cond_a) = lines.get(index).and_then(|line| if_header_cond(line)) else {
+            continue;
+        };
+        let Some(label) = lines.get(index + 1).and_then(|line| bare_goto_label(line)) else {
+            continue;
+        };
+        if lines
+            .get(index + 2)
+            .is_none_or(|line| line.trim() != "} else {")
+        {
+            continue;
+        }
+        let Some(cond_b) = lines.get(index + 3).and_then(|line| if_header_cond(line)) else {
+            continue;
+        };
+        let Some(label_b) = lines.get(index + 4).and_then(|line| bare_goto_label(line)) else {
+            continue;
+        };
+        if label != label_b
+            || lines
+                .get(index + 5)
+                .is_none_or(|line| line.trim() != "} else {")
+        {
+            continue;
+        }
+        let Some(close_at) = matching_else_close(lines, index + 6) else {
+            continue;
+        };
+        let indent_len = lines[index].len() - lines[index].trim_start().len();
+        let indent = &lines[index][..indent_len];
+        let mut folded = Vec::with_capacity(lines.len().saturating_sub(4));
+        folded.extend_from_slice(&lines[..index]);
+        folded.push(format!("{indent}if (({cond_a}) || ({cond_b})) {{"));
+        folded.push(lines[index + 1].clone());
+        folded.push(lines[index + 2].clone());
+        folded.extend_from_slice(&lines[index + 6..close_at]);
+        folded.extend_from_slice(&lines[close_at + 1..]);
+        return Some(folded);
+    }
+    None
+}
+
+fn split_top_level<'a>(text: &'a str, needle: &str) -> Option<(&'a str, &'a str)> {
+    let mut depth = 0i32;
+    for (offset, ch) in text.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            _ if depth == 0 && text[offset..].starts_with(needle) => {
+                let lhs = text[..offset].trim();
+                let rhs = text[offset + needle.len()..].trim();
+                if !lhs.is_empty() && !rhs.is_empty() {
+                    return Some((lhs, rhs));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn plus_one_base(expr: &str) -> Option<&str> {
+    let wrapped = expr.trim();
+    let inner = wrapped.strip_prefix('(')?.strip_suffix(')')?.trim();
+    let (base, imm) = split_top_level(inner, " + ")?;
+    if imm != "0x1" && imm != "1" {
+        return None;
+    }
+    let base = base.trim();
+    Some(
+        base.strip_prefix('(')
+            .and_then(|rest| rest.strip_suffix(')'))
+            .map(str::trim)
+            .filter(|rest| !rest.is_empty())
+            .unwrap_or(base),
+    )
+}
+
+fn brace_close_after(lines: &[String], open_at: usize) -> Option<usize> {
+    let mut depth = 0i32;
+    for (offset, line) in lines.iter().enumerate().skip(open_at) {
+        let trimmed = line.trim();
+        if trimmed.ends_with('{') {
+            depth += 1;
+        }
+        if trimmed.starts_with('}') {
+            depth -= 1;
+            if depth == 0 {
+                return Some(offset);
+            }
+        }
+    }
+    None
+}
+
+fn sink_post_inc_while(lines: &[String]) -> Vec<String> {
+    let mut out = Vec::with_capacity(lines.len() + 4);
+    let mut index = 0usize;
+    while index < lines.len() {
+        let Some(cond) = lines.get(index).and_then(|line| if_header_cond(line)) else {
+            out.push(lines[index].clone());
+            index += 1;
+            continue;
+        };
+        let Some((lhs, rhs)) = split_top_level(cond, " != ") else {
+            out.push(lines[index].clone());
+            index += 1;
+            continue;
+        };
+        let Some(while_cond) = lines
+            .get(index + 1)
+            .and_then(|line| while_header_cond(line))
+        else {
+            out.push(lines[index].clone());
+            index += 1;
+            continue;
+        };
+        let Some((while_lhs, while_rhs)) = split_top_level(while_cond, " != ") else {
+            out.push(lines[index].clone());
+            index += 1;
+            continue;
+        };
+        if while_rhs != rhs || plus_one_base(while_lhs) != Some(lhs) {
+            out.push(lines[index].clone());
+            index += 1;
+            continue;
+        }
+        let Some(while_close) = brace_close_after(lines, index + 1) else {
+            out.push(lines[index].clone());
+            index += 1;
+            continue;
+        };
+        if lines
+            .get(while_close + 1)
+            .is_none_or(|line| line.trim() != "}")
+        {
+            out.push(lines[index].clone());
+            index += 1;
+            continue;
+        }
+        let body = &lines[index + 2..while_close];
+        if body.iter().any(|line| line.contains(&format!("{lhs} = "))) {
+            out.push(lines[index].clone());
+            index += 1;
+            continue;
+        }
+        let indent_len = lines[index + 1].len() - lines[index + 1].trim_start().len();
+        let indent = &lines[index + 1][..indent_len];
+        out.push(format!("{indent}while ({lhs} != {rhs}) {{"));
+        out.extend(body.iter().cloned());
+        out.push(format!("{indent}    {lhs} = ({lhs} + 0x1);"));
+        out.push(lines[while_close].clone());
+        index = while_close + 2;
+    }
+    out
+}
+
 fn polish_rendered_lines(lines: &[String]) -> Vec<String> {
+    let lines = reindent_braces(&fold_same_target_gotos(&sink_post_inc_while(lines)));
     lines
         .iter()
         .filter(|line| {
@@ -6826,6 +7159,9 @@ struct RegionWalk<'a> {
     emitted: HashSet<BlockId>,
     lines: Vec<String>,
     depth: usize,
+    stop: Option<BlockId>,
+    block_line: HashMap<BlockId, usize>,
+    goto_targets: HashSet<BlockId>,
 }
 
 const REGION_WALK_MAX_DEPTH: usize = 24;
@@ -6870,6 +7206,48 @@ impl<'a> RegionWalk<'a> {
             emitted: HashSet::new(),
             lines: Vec::new(),
             depth: 0,
+            stop: None,
+            block_line: HashMap::new(),
+            goto_targets: HashSet::new(),
+        }
+    }
+
+    fn note_block(&mut self, block: BlockId) {
+        self.block_line.entry(block).or_insert(self.lines.len());
+    }
+
+    fn emit_goto(&mut self, target: BlockId) {
+        if self.stop == Some(target) || target == self.exit_id {
+            return;
+        }
+        if let Some(lines) = self.android_log_return(target) {
+            for line in lines {
+                self.lines.push(format!("    {line}"));
+            }
+            return;
+        }
+        self.goto_targets.insert(target);
+        self.lines.push(format!("    goto bb{};", target.0));
+    }
+
+    fn insert_goto_labels(&mut self) {
+        let mut inserts = Vec::new();
+        for &target in &self.goto_targets {
+            let Some(&idx) = self.block_line.get(&target) else {
+                continue;
+            };
+            let addr = self
+                .func
+                .cfg
+                .blocks
+                .get(target.0 as usize)
+                .map(|block| block.start_addr)
+                .unwrap_or(0);
+            inserts.push((idx, format!("    // bb{} @ {addr:#x}", target.0)));
+        }
+        inserts.sort_by_key(|item| std::cmp::Reverse(item.0));
+        for (idx, line) in inserts {
+            self.lines.insert(idx, line);
         }
     }
 
@@ -6930,6 +7308,9 @@ impl<'a> RegionWalk<'a> {
     /// Chain of straight-line successors starting at `block` until a block
     /// with a branch/loop/multiple preds (not the chain start) or `stop`.
     fn straight_chain(&self, block: BlockId, stop: BlockId) -> Vec<BlockId> {
+        if self.emitted.contains(&block) || self.stop == Some(block) {
+            return Vec::new();
+        }
         let mut chain = vec![block];
         if block == stop {
             return chain;
@@ -6962,6 +7343,10 @@ impl<'a> RegionWalk<'a> {
 
     fn emit_lines(&mut self, blocks: &[BlockId]) {
         for &block in blocks {
+            if self.emitted.contains(&block) {
+                continue;
+            }
+            self.note_block(block);
             if let Some((lines, _, _)) = self.terminator(block) {
                 for line in lines {
                     self.lines.push(format!("    {line}"));
@@ -6989,15 +7374,39 @@ impl<'a> RegionWalk<'a> {
     }
 
     fn walk_inner(&mut self, block: BlockId) -> bool {
-        if self.emitted.contains(&block) {
-            return true; // already rendered via another path
+        if self.stop == Some(block) {
+            return true;
         }
+        if self.emitted.contains(&block) {
+            self.emit_goto(block);
+            return true;
+        }
+        self.note_block(block);
         if self.switch_blocks.contains(&block) {
             return false; // switch regions handled by dedicated emitter
         }
         let Some((prelude, jump, branch)) = self.terminator(block) else {
             return false;
         };
+        if let Some((cond, t, f)) = branch.clone()
+            && (t == block || f == block)
+        {
+            let (loop_cond, exit) = if t == block {
+                (cond, f)
+            } else {
+                (negate_condition_text(&cond), t)
+            };
+            self.lines.push(format!("    while ({loop_cond}) {{"));
+            for line in &prelude {
+                self.lines.push(format!("    {line}"));
+            }
+            self.emitted.insert(block);
+            self.lines.push("    }".to_string());
+            if exit == block {
+                return true;
+            }
+            return self.finish_join(exit);
+        }
         for line in &prelude {
             self.lines.push(format!("    {line}"));
         }
@@ -7049,6 +7458,9 @@ impl<'a> RegionWalk<'a> {
     }
 
     fn emit_if_else(&mut self, _block: BlockId, cond: &str, t: BlockId, f: BlockId) -> bool {
+        if self.emit_private_rejoin(cond, t, f) {
+            return true;
+        }
         let join = self.join_of(t, f);
         let join_is_virtual = join == self.exit_id;
         let t_chain = if t == join {
@@ -7076,36 +7488,91 @@ impl<'a> RegionWalk<'a> {
         if t == join && f == join {
             return self.finish_join(join);
         }
+        let join = self.refine_join(t, f, join);
+        let t_chain = if t == join {
+            Vec::new()
+        } else {
+            self.straight_chain(t, join)
+        };
+        let f_chain = if f == join {
+            Vec::new()
+        } else {
+            self.straight_chain(f, join)
+        };
         let t_lines = self.arm_lines(&t_chain);
         let f_lines = self.arm_lines(&f_chain);
-        let t_empty = t == join || t_lines.is_empty();
-        let f_empty = f == join || f_lines.is_empty();
+        let t_empty = t == join
+            || (t_lines.is_empty()
+                && self.chain_falls_into(&t_chain, join)
+                && !self.emitted.contains(&t));
+        let f_empty = f == join
+            || (f_lines.is_empty()
+                && self.chain_falls_into(&f_chain, join)
+                && !self.emitted.contains(&f));
         match (t_empty, f_empty) {
             (true, true) => {}
             (true, false) => {
                 self.lines
                     .push(format!("    if ({}) {{", negate_condition_text(cond)));
-                self.lines.extend(f_lines);
-                self.lines.push("    }".to_string());
+                for &b in &t_chain {
+                    self.emitted.insert(b);
+                }
+                if self.emitted.contains(&f) && f != join && self.stop != Some(f) {
+                    self.emit_goto(f);
+                    self.lines.push("    }".to_string());
+                    return self.finish_join(join);
+                }
+                if self.emit_self_loop_at(f) {
+                    self.lines.push("    }".to_string());
+                    return self.finish_join(join);
+                }
+                let before = self.lines.len();
+                self.push_arm(&f_chain);
+                let added = self.lines.len() > before;
                 for &b in &f_chain {
                     self.emitted.insert(b);
                 }
+                if !added && self.chain_has_branch(&f_chain) {
+                    return self.seal_open_branch(f_chain.last().copied(), join);
+                }
+                self.lines.push("    }".to_string());
                 return self.continue_arm(f_chain.last().copied(), join);
             }
             (false, true) => {
                 self.lines.push(format!("    if ({cond}) {{"));
-                self.lines.extend(t_lines);
-                self.lines.push("    }".to_string());
+                for &b in &f_chain {
+                    self.emitted.insert(b);
+                }
+                if self.emitted.contains(&t) && t != join && self.stop != Some(t) {
+                    self.emit_goto(t);
+                    self.lines.push("    }".to_string());
+                    return self.finish_join(join);
+                }
+                if self.emit_self_loop_at(t) {
+                    self.lines.push("    }".to_string());
+                    return self.finish_join(join);
+                }
+                let before = self.lines.len();
+                self.push_arm(&t_chain);
+                let added = self.lines.len() > before;
                 for &b in &t_chain {
                     self.emitted.insert(b);
                 }
+                if !added && self.chain_has_branch(&t_chain) {
+                    return self.seal_open_branch(t_chain.last().copied(), join);
+                }
+                self.lines.push("    }".to_string());
                 return self.continue_arm(t_chain.last().copied(), join);
             }
             (false, false) => {
                 self.lines.push(format!("    if ({cond}) {{"));
-                self.lines.extend(t_lines);
+                if !self.emit_arm_body(t, &t_chain, join) {
+                    return false;
+                }
                 self.lines.push("    } else {".to_string());
-                self.lines.extend(f_lines);
+                if !self.emit_arm_body(f, &f_chain, join) {
+                    return false;
+                }
                 self.lines.push("    }".to_string());
             }
         }
@@ -7161,6 +7628,9 @@ impl<'a> RegionWalk<'a> {
     fn arm_lines(&mut self, chain: &[BlockId]) -> Vec<String> {
         let mut out = Vec::new();
         for &b in chain {
+            if self.emitted.contains(&b) {
+                continue;
+            }
             if let Some((lines, _, _)) = self.terminator(b) {
                 for line in lines {
                     out.push(format!("    {line}"));
@@ -7168,6 +7638,261 @@ impl<'a> RegionWalk<'a> {
             }
         }
         out
+    }
+
+    fn push_arm(&mut self, chain: &[BlockId]) {
+        for &block in chain {
+            if self.emitted.contains(&block) {
+                continue;
+            }
+            self.note_block(block);
+            if let Some((lines, _, _)) = self.terminator(block) {
+                for line in lines {
+                    self.lines.push(format!("    {line}"));
+                }
+            }
+        }
+    }
+
+    fn emit_self_loop_at(&mut self, block: BlockId) -> bool {
+        let Some((cond, _)) = self.self_loop(block) else {
+            return false;
+        };
+        if self.emitted.contains(&block) {
+            return true;
+        }
+        self.lines.push(format!("    while ({cond}) {{"));
+        self.push_arm(&[block]);
+        self.emitted.insert(block);
+        self.lines.push("    }".to_string());
+        true
+    }
+
+    fn self_loop(&self, block: BlockId) -> Option<(String, BlockId)> {
+        let (_, _, branch) = self.terminator(block)?;
+        let (cond, t, f) = branch?;
+        if t == block && f != block {
+            Some((cond, f))
+        } else if f == block && t != block {
+            Some((negate_condition_text(&cond), t))
+        } else {
+            None
+        }
+    }
+
+    fn emit_arm_body(&mut self, head: BlockId, chain: &[BlockId], join: BlockId) -> bool {
+        if head != join && self.stop != Some(head) && self.emitted.contains(&head) {
+            self.emit_goto(head);
+            return true;
+        }
+        if self.self_loop(head).is_some() {
+            self.emit_self_loop_at(head);
+            return true;
+        }
+        let before = self.lines.len();
+        self.push_arm(chain);
+        for &block in chain {
+            self.emitted.insert(block);
+        }
+        if head != join
+            && let Some(lines) = self.android_log_return(head)
+        {
+            if self.lines.len() == before {
+                for line in lines {
+                    self.lines.push(format!("    {line}"));
+                }
+            } else if !self.lines.iter().any(|line| line.contains("return 0")) {
+                self.lines.push("    return 0;".to_string());
+            }
+            return true;
+        }
+        if head != join && !chain.is_empty() && !self.chain_falls_into(chain, join) {
+            return self.structure_open_end(chain, join);
+        }
+        true
+    }
+
+    fn android_log_return(&mut self, origin: BlockId) -> Option<Vec<String>> {
+        let mut setup = None;
+        let mut block = origin;
+        let mut log_block = None;
+        let mut call_line = None;
+        for _ in 0..3 {
+            let (lines, jump, branch) = self.terminator(block)?;
+            if !lines.is_empty()
+                && !lines
+                    .iter()
+                    .any(|line| line.contains("__android_log_print"))
+            {
+                return None;
+            }
+            if let Some(call) = lines
+                .iter()
+                .find(|line| line.contains("__android_log_print"))
+            {
+                if lines.iter().any(|line| {
+                    let trimmed = line.trim();
+                    trimmed.contains('(')
+                        && !trimmed.contains("__android_log_print")
+                        && !trimmed.starts_with("return")
+                }) {
+                    return None;
+                }
+                if !self.block_zeros_a_reg(block) || !self.failure_returns(block) {
+                    return None;
+                }
+                log_block = Some(block);
+                call_line = Some(call.clone());
+                break;
+            }
+            if branch.is_some() {
+                return None;
+            }
+            let next = jump.or_else(|| self.sole_successor(block))?;
+            if next == block {
+                return None;
+            }
+            setup.get_or_insert(block);
+            block = next;
+        }
+        let log_block = log_block?;
+        let mut call = call_line?;
+        if let Some(setup) = setup
+            && let Some((tag, msg)) = self.log_strings(setup)
+        {
+            call = format!("__android_log_print(6, {tag}, {msg});");
+        }
+        self.emitted.insert(log_block);
+        for &succ in self.func.cfg.successors(log_block) {
+            if self.func.cfg.predecessors(succ).len() == 1 && self.block_returns(succ) {
+                self.emitted.insert(succ);
+            }
+        }
+        Some(vec![call, "return 0;".to_string()])
+    }
+
+    fn failure_returns(&self, block: BlockId) -> bool {
+        if self.block_returns(block) {
+            return true;
+        }
+        let succs = self.func.cfg.successors(block);
+        if succs.is_empty() {
+            return false;
+        }
+        succs.iter().all(|succ| self.epilogue_block(*succ))
+            && succs
+                .iter()
+                .any(|succ| self.plain_return(*succ) || self.cookie_split(*succ))
+    }
+
+    fn epilogue_block(&self, block: BlockId) -> bool {
+        self.plain_return(block) || self.stack_fail(block) || self.cookie_split(block)
+    }
+
+    fn cookie_split(&self, block: BlockId) -> bool {
+        let Some((lines, _, branch)) = self.terminator(block) else {
+            return false;
+        };
+        if branch.is_none() {
+            return false;
+        }
+        if lines.iter().any(|line| {
+            let trimmed = line.trim();
+            trimmed.contains('(') && !trimmed.contains("stack_chk_fail")
+        }) {
+            return false;
+        }
+        let succs = self.func.cfg.successors(block);
+        succs.len() == 2
+            && succs
+                .iter()
+                .all(|succ| self.plain_return(*succ) || self.stack_fail(*succ))
+            && succs.iter().any(|succ| self.plain_return(*succ))
+    }
+
+    fn plain_return(&self, block: BlockId) -> bool {
+        if !self.block_returns(block) {
+            return false;
+        }
+        let Some((lines, _, branch)) = self.terminator(block) else {
+            return true;
+        };
+        if branch.is_some() {
+            return false;
+        }
+        let mut saw_return = false;
+        for line in &lines {
+            let trimmed = line.trim();
+            if trimmed.starts_with("return") {
+                saw_return = true;
+            } else if trimmed.contains('(') {
+                return false;
+            }
+        }
+        saw_return || lines.is_empty()
+    }
+
+    fn stack_fail(&self, block: BlockId) -> bool {
+        let Some((lines, _, _)) = self.terminator(block) else {
+            return false;
+        };
+        lines.iter().any(|line| line.contains("stack_chk_fail"))
+    }
+
+    fn log_strings(&self, block: BlockId) -> Option<(String, String)> {
+        if let (Some(tag), Some(msg)) = (
+            self.string_const(block, "x1"),
+            self.string_const(block, "x2"),
+        ) {
+            return Some((tag, msg));
+        }
+        let cfg_block = self.func.cfg.blocks.get(block.0 as usize)?;
+        let mut found = Vec::new();
+        for iid in &cfg_block.insts {
+            let Some(addr) = self.const_addr(*iid) else {
+                continue;
+            };
+            let Some(text) = lookup_render_string(addr) else {
+                continue;
+            };
+            let shown = format!("{text:?}");
+            if !found.contains(&shown) {
+                found.push(shown);
+            }
+        }
+        if found.len() >= 2 {
+            Some((found[0].clone(), found[1].clone()))
+        } else {
+            None
+        }
+    }
+
+    fn string_const(&self, block: BlockId, reg: &str) -> Option<String> {
+        let id = self.func.block_defs(block)?.get(reg).copied()?;
+        let addr = self.const_addr(id)?;
+        let text = lookup_render_string(addr)?;
+        Some(format!("{text:?}"))
+    }
+
+    fn const_addr(&self, id: SsaValueId) -> Option<u64> {
+        let inst = self.func.values.get(id.0 as usize)?;
+        match &inst.op {
+            SsaOp::Copy { src } => self.const_operand(src),
+            SsaOp::BinOp { kind, lhs, rhs } if *kind == BinOpKind::Add => Some(
+                self.const_operand(lhs)?
+                    .wrapping_add(self.const_operand(rhs)?),
+            ),
+            _ => None,
+        }
+        .map(|value| value as u64)
+    }
+
+    fn const_operand(&self, op: &Operand) -> Option<i64> {
+        match op {
+            Operand::Constant(value) => Some(*value),
+            Operand::Value(id) => self.const_addr(*id).map(|value| value as i64),
+            _ => None,
+        }
     }
 
     fn walk_branch_from(&mut self, from: BlockId, cond: &str, t: BlockId, f: BlockId) -> bool {
@@ -7262,6 +7987,9 @@ impl<'a> RegionWalk<'a> {
     }
 
     fn emit_while(&mut self, head: BlockId, cond: &str, body: BlockId, exit: BlockId) -> bool {
+        if body != head && self.emitted.contains(&body) {
+            return self.finish_join(exit);
+        }
         self.lines.push(format!("    while ({cond}) {{"));
         let mut body_ok = true;
         if body != exit && !self.emitted.contains(&body) {
@@ -7296,6 +8024,376 @@ impl<'a> RegionWalk<'a> {
         }
     }
 
+    fn chain_has_branch(&self, chain: &[BlockId]) -> bool {
+        chain.last().is_some_and(|block| {
+            self.terminator(*block)
+                .and_then(|(_, _, branch)| branch)
+                .is_some()
+        })
+    }
+
+    fn chain_falls_into(&self, chain: &[BlockId], join: BlockId) -> bool {
+        let Some(&last) = chain.last() else {
+            return true;
+        };
+        let Some((_, jump, branch)) = self.terminator(last) else {
+            return true;
+        };
+        if branch.is_some() {
+            return false;
+        }
+        match jump {
+            Some(target) => target == join,
+            None => self.sole_successor(last).is_none_or(|succ| succ == join),
+        }
+    }
+
+    fn sole_successor(&self, block: BlockId) -> Option<BlockId> {
+        let succs = self.func.cfg.succs.get(block.0 as usize)?;
+        if succs.len() == 1 {
+            Some(succs[0])
+        } else {
+            None
+        }
+    }
+
+    fn structure_open_end(&mut self, chain: &[BlockId], join: BlockId) -> bool {
+        let Some(&last) = chain.last() else {
+            return true;
+        };
+        let Some((_, jump, branch)) = self.terminator(last) else {
+            return true;
+        };
+        if self.depth > REGION_WALK_MAX_DEPTH {
+            return false;
+        }
+        self.depth += 1;
+        let prev = self.stop;
+        if self.stop.is_none() && join != self.exit_id {
+            self.stop = Some(join);
+        }
+        let ok = if let Some((cond, t, f)) = branch {
+            self.walk_branch_from(last, &cond, t, f)
+        } else if let Some(target) = jump {
+            if target == join || self.stop == Some(target) {
+                true
+            } else {
+                self.walk_chain(target)
+            }
+        } else if let Some(succ) = self.sole_successor(last) {
+            let shared = self.func.cfg.predecessors(succ).len() > 1;
+            if succ == join || self.stop == Some(succ) || succ == last || shared {
+                true
+            } else {
+                self.walk_chain(succ)
+            }
+        } else {
+            true
+        };
+        self.stop = prev;
+        self.depth -= 1;
+        ok
+    }
+
+    fn seal_open_branch(&mut self, last: Option<BlockId>, join: BlockId) -> bool {
+        let prev = self.stop;
+        if self.stop.is_none() && join != self.exit_id {
+            self.stop = Some(join);
+        }
+        let ok = self.continue_arm(last, join);
+        self.stop = prev;
+        self.lines.push("    }".to_string());
+        if !ok {
+            return false;
+        }
+        self.finish_join(join)
+    }
+
+    fn emit_private_rejoin(&mut self, cond: &str, t: BlockId, f: BlockId) -> bool {
+        let Some((fall, gate, join)) = self.private_rejoin(t, f) else {
+            return false;
+        };
+        if self.emitted.contains(&join) || self.emitted.contains(&gate) {
+            return false;
+        }
+        let Some((_, _, Some((gate_cond, gt, gf)))) = self.terminator(gate) else {
+            return false;
+        };
+        let g_hits = self.hits_join_direct(gt, join);
+        let f_hits = self.hits_join_direct(gf, join);
+        let (work, exit_side, exit_cond) = match (g_hits, f_hits) {
+            (false, true) => (gf, gt, gate_cond),
+            (true, false) => (gt, gf, negate_condition_text(&gate_cond)),
+            _ => return false,
+        };
+        if work == fall || exit_side == fall || self.block_reaches(exit_side, join) {
+            return false;
+        }
+        let work_chain = if work == join {
+            Vec::new()
+        } else {
+            self.straight_chain(work, join)
+        };
+        let work_tail = work_chain.last().copied().unwrap_or(work);
+        let preds = self.func.cfg.predecessors(join);
+        if preds.len() != 2 || !preds.contains(&fall) || !preds.contains(&work_tail) {
+            return false;
+        }
+        self.lines.push(format!("    if ({exit_cond}) {{"));
+        if self.exit_region_is_private(exit_side, gate, join) {
+            let prev = self.stop;
+            if self.stop.is_none() {
+                self.stop = Some(join);
+            }
+            let exit_chain = self.straight_chain(exit_side, join);
+            let ok = self.emit_arm_body(exit_side, &exit_chain, join);
+            self.stop = prev;
+            if !ok {
+                return false;
+            }
+        }
+        self.lines.push("    } else {".to_string());
+        let work_has_lines = work_chain.iter().any(|block| {
+            self.terminator(*block)
+                .is_some_and(|(lines, _, _)| !lines.is_empty())
+        });
+        if work_has_lines {
+            let inner = if fall == t {
+                cond.to_string()
+            } else {
+                negate_condition_text(cond)
+            };
+            self.lines.push(format!("    if ({inner}) {{"));
+            self.lines.push("    } else {".to_string());
+            self.push_arm(&work_chain);
+            self.lines.push("    }".to_string());
+        } else {
+            self.push_arm(&work_chain);
+        }
+        for &block in &work_chain {
+            self.emitted.insert(block);
+        }
+        self.emitted.insert(fall);
+        self.emitted.insert(gate);
+        if !self.finish_join(join) {
+            return false;
+        }
+        self.lines.push("    }".to_string());
+        true
+    }
+
+    fn private_rejoin(&self, t: BlockId, f: BlockId) -> Option<(BlockId, BlockId, BlockId)> {
+        if let Some(join) = self.fall_join(t)
+            && self.is_branch_gate(f)
+        {
+            return Some((t, f, join));
+        }
+        if let Some(join) = self.fall_join(f)
+            && self.is_branch_gate(t)
+        {
+            return Some((f, t, join));
+        }
+        None
+    }
+
+    fn fall_join(&self, block: BlockId) -> Option<BlockId> {
+        let (lines, jump, branch) = self.terminator(block)?;
+        if branch.is_some() || !lines.is_empty() {
+            return None;
+        }
+        let target = jump.or_else(|| self.sole_successor(block))?;
+        if target != block && self.func.cfg.predecessors(target).len() == 2 {
+            Some(target)
+        } else {
+            None
+        }
+    }
+
+    fn is_branch_gate(&self, block: BlockId) -> bool {
+        self.terminator(block)
+            .and_then(|(_, _, branch)| branch)
+            .is_some()
+    }
+
+    fn exit_region_is_private(&self, exit_side: BlockId, gate: BlockId, join: BlockId) -> bool {
+        let mut region = HashSet::new();
+        let mut stack = vec![exit_side];
+        while let Some(block) = stack.pop() {
+            if block == join || !region.insert(block) {
+                continue;
+            }
+            for &succ in self.func.cfg.successors(block) {
+                stack.push(succ);
+            }
+        }
+        region.iter().all(|block| {
+            self.func
+                .cfg
+                .predecessors(*block)
+                .iter()
+                .all(|pred| *pred == gate || region.contains(pred))
+        })
+    }
+
+    fn hits_join_direct(&self, block: BlockId, join: BlockId) -> bool {
+        if block == join {
+            return true;
+        }
+        let Some((_, jump, branch)) = self.terminator(block) else {
+            return false;
+        };
+        if branch.is_some() {
+            return false;
+        }
+        if let Some(target) = jump {
+            return target == join;
+        }
+        self.sole_successor(block) == Some(join)
+    }
+
+    fn refine_join(&self, t: BlockId, f: BlockId, join: BlockId) -> BlockId {
+        let Some(earlier) = self.shared_cont(t, f) else {
+            return join;
+        };
+        if earlier == join || !self.block_reaches(earlier, join) {
+            return join;
+        }
+        earlier
+    }
+
+    fn shared_cont(&self, t: BlockId, f: BlockId) -> Option<BlockId> {
+        let t_cont = self.cont_candidate(t);
+        let f_cont = self.cont_candidate(f);
+        match (t_cont, f_cont) {
+            (Some(a), Some(b)) if a == b && a != t && a != f => Some(a),
+            (Some(cont), None) if self.covered_by(f, cont) => Some(cont),
+            (None, Some(cont)) if self.covered_by(t, cont) => Some(cont),
+            _ => None,
+        }
+    }
+
+    fn cont_candidate(&self, block: BlockId) -> Option<BlockId> {
+        if self.func.cfg.predecessors(block).len() > 1 {
+            Some(block)
+        } else {
+            self.immediate_cont(block)
+        }
+    }
+
+    fn immediate_cont(&self, block: BlockId) -> Option<BlockId> {
+        let (_, jump, branch) = self.terminator(block)?;
+        if branch.is_some() {
+            return None;
+        }
+        let target = jump.or_else(|| self.sole_successor(block))?;
+        if target != block && self.func.cfg.predecessors(target).len() > 1 {
+            Some(target)
+        } else {
+            None
+        }
+    }
+
+    fn covered_by(&self, block: BlockId, cont: BlockId) -> bool {
+        let mut seen = HashSet::new();
+        self.cover_kind(block, cont, 0, &mut seen) == Some(true)
+    }
+
+    fn cover_kind(
+        &self,
+        block: BlockId,
+        cont: BlockId,
+        depth: usize,
+        seen: &mut HashSet<BlockId>,
+    ) -> Option<bool> {
+        if block == cont {
+            return Some(true);
+        }
+        if depth > 6 || !seen.insert(block) {
+            return None;
+        }
+        if self.block_returns(block) {
+            return Some(false);
+        }
+        let (_, jump, branch) = self.terminator(block)?;
+        if let Some((_, t, f)) = branch {
+            let left = self.cover_kind(t, cont, depth + 1, seen);
+            let right = self.cover_kind(f, cont, depth + 1, seen);
+            return match (left, right) {
+                (Some(true), Some(false))
+                | (Some(false), Some(true))
+                | (Some(true), Some(true)) => Some(true),
+                (Some(false), Some(false)) => Some(false),
+                _ => None,
+            };
+        }
+        if let Some(target) = jump {
+            if target == cont {
+                return Some(true);
+            }
+            return self.cover_kind(target, cont, depth + 1, seen);
+        }
+        match self.sole_successor(block) {
+            Some(succ) if succ == cont => Some(true),
+            Some(succ) => self.cover_kind(succ, cont, depth + 1, seen),
+            None => None,
+        }
+    }
+
+    fn block_zeros_a_reg(&self, block: BlockId) -> bool {
+        let Some(cfg_block) = self.func.cfg.blocks.get(block.0 as usize) else {
+            return false;
+        };
+        cfg_block.insts.iter().any(|iid| {
+            let Some(inst) = self.func.values.get(iid.0 as usize) else {
+                return false;
+            };
+            match &inst.op {
+                SsaOp::Copy {
+                    src: Operand::Symbol(name),
+                } => name == "xzr" || name == "wzr",
+                SsaOp::Copy {
+                    src: Operand::Constant(0),
+                } => true,
+                _ => false,
+            }
+        })
+    }
+
+    fn block_returns(&self, block: BlockId) -> bool {
+        let Some(cfg_block) = self.func.cfg.blocks.get(block.0 as usize) else {
+            return false;
+        };
+        cfg_block.insts.iter().any(|iid| {
+            matches!(
+                self.func.values.get(iid.0 as usize).map(|inst| &inst.op),
+                Some(SsaOp::Return { .. })
+            )
+        })
+    }
+
+    fn block_reaches(&self, from: BlockId, to: BlockId) -> bool {
+        if to == self.exit_id || from == to {
+            return true;
+        }
+        let mut seen = HashSet::new();
+        let mut stack = vec![from];
+        while let Some(block) = stack.pop() {
+            if !seen.insert(block) {
+                continue;
+            }
+            if seen.len() > self.func.cfg.blocks.len().saturating_add(1) {
+                return false;
+            }
+            if block == to {
+                return true;
+            }
+            for &succ in self.func.cfg.successors(block) {
+                stack.push(succ);
+            }
+        }
+        false
+    }
+
     fn continue_arm(&mut self, last: Option<BlockId>, join: BlockId) -> bool {
         let Some(last) = last else {
             return self.finish_join(join);
@@ -7319,11 +8417,21 @@ impl<'a> RegionWalk<'a> {
             }
             return self.walk_chain(target);
         }
+        if let Some(succ) = self.sole_successor(last)
+            && succ != join
+            && succ != last
+        {
+            return self.walk_chain(succ);
+        }
         self.finish_join(join)
     }
 
     fn finish_join(&mut self, join: BlockId) -> bool {
-        if join == self.exit_id || self.emitted.contains(&join) {
+        if join == self.exit_id || self.stop == Some(join) {
+            return true;
+        }
+        if self.emitted.contains(&join) {
+            self.emit_goto(join);
             return true;
         }
         self.walk_chain(join)
@@ -7331,7 +8439,11 @@ impl<'a> RegionWalk<'a> {
 
     /// Emit an unvisited straight-line run, then continue structurally.
     fn walk_chain(&mut self, block: BlockId) -> bool {
+        if self.stop == Some(block) {
+            return true;
+        }
         if self.emitted.contains(&block) {
+            self.emit_goto(block);
             return true;
         }
         let chain = self.straight_chain(block, block);
@@ -7432,10 +8544,7 @@ fn emit_ssa_region_tree(
         region_walk_trace(&format!("aborted: {name}"));
         return false;
     }
-    // any block left unrendered (unreachable or stray) => fallback keeps
-    // output complete
-    // Partial structuring: linearly emit whatever the walk could not place
-    // (stray joins, odd arms) so output is always complete.
+    walk.insert_goto_labels();
     for block in &func.cfg.blocks {
         if walk.emitted.contains(&block.id) || is_pure_jump_block(func, block.id) {
             continue;
@@ -8862,6 +9971,9 @@ fn emit_structured_switch(
 }
 
 fn is_pure_jump_block(func: &SsaFunction, block_id: BlockId) -> bool {
+    if log_argument_block(func, block_id) {
+        return false;
+    }
     let Some(block) = func.cfg.blocks.get(block_id.0 as usize) else {
         return false;
     };
@@ -8904,6 +10016,62 @@ fn is_pure_jump_block(func: &SsaFunction, block_id: BlockId) -> bool {
     // Empty fallthrough-only block: single successor, no side effects.
     let succs = func.cfg.successors(block_id);
     succs.len() == 1 && block.insts.is_empty()
+}
+
+fn log_argument_block(func: &SsaFunction, block_id: BlockId) -> bool {
+    let Some(block) = func.cfg.blocks.get(block_id.0 as usize) else {
+        return false;
+    };
+    let mut jump = None;
+    let mut address = false;
+    for &iid in &block.insts {
+        let Some(inst) = func.values.get(iid.0 as usize) else {
+            continue;
+        };
+        match &inst.op {
+            SsaOp::Jump { target } => jump = Some(*target),
+            SsaOp::Copy {
+                src: Operand::Constant(value),
+            } if *value > 0xfff => address = true,
+            SsaOp::BinOp {
+                kind: BinOpKind::Add,
+                lhs: Operand::Constant(lhs),
+                rhs: Operand::Constant(rhs),
+            } if lhs.wrapping_add(*rhs) > 0xfff => address = true,
+            SsaOp::BinOp {
+                kind: BinOpKind::Add,
+                lhs: Operand::Value(id),
+                rhs: Operand::Constant(rhs),
+            } => {
+                if let Some(SsaOp::Copy {
+                    src: Operand::Constant(lhs),
+                }) = func.values.get(id.0 as usize).map(|inst| &inst.op)
+                    && lhs.wrapping_add(*rhs) > 0xfff
+                {
+                    address = true;
+                }
+            }
+            _ => {}
+        }
+    }
+    let Some(target) = jump else {
+        return false;
+    };
+    if !address {
+        return false;
+    }
+    let Some(target_block) = func.cfg.blocks.get(target.0 as usize) else {
+        return false;
+    };
+    target_block.insts.iter().any(|iid| {
+        matches!(
+            func.values.get(iid.0 as usize).map(|inst| &inst.op),
+            Some(SsaOp::Call {
+                target: Operand::Symbol(name),
+                ..
+            }) if name.contains("android_log_print")
+        )
+    })
 }
 
 fn resolve_jump_target(func: &SsaFunction, start: BlockId) -> BlockId {
@@ -13182,7 +14350,23 @@ fn simplify_condition_text(text: String) -> String {
     while t.starts_with('(') && t.ends_with(')') && balanced_outer_parens(&t) {
         t = t[1..t.len() - 1].trim().to_string();
     }
+    if let Some(repaired) = unstick_deref_bang(&t) {
+        return naturalize_truthiness(&repaired);
+    }
     naturalize_truthiness(&t)
+}
+
+fn unstick_deref_bang(text: &str) -> Option<String> {
+    let (lhs, op, rhs) = split_relational(text)?;
+    if !matches!(op, "==" | "!=") {
+        return None;
+    }
+    let rest = lhs.trim().strip_prefix('!')?.trim();
+    if !rest.starts_with('*') {
+        return None;
+    }
+    let flipped = if op == "==" { "!=" } else { "==" };
+    Some(format!("{rest} {flipped} {rhs}"))
 }
 
 fn naturalize_truthiness(text: &str) -> String {
@@ -13349,7 +14533,14 @@ fn normalize_expr_spacing(text: &str) -> String {
                 if prev.is_none()
                     || matches!(
                         prev,
-                        Some('(') | Some(',') | Some('=') | Some('!') | Some('|') | Some('&')
+                        Some('(')
+                            | Some(',')
+                            | Some('=')
+                            | Some('!')
+                            | Some('|')
+                            | Some('&')
+                            | Some('<')
+                            | Some('>')
                     )
                 {
                     out.push(c);
@@ -13400,7 +14591,10 @@ fn is_simple_ident(text: &str) -> bool {
     }
     if t.starts_with('*') {
         let rest = t.trim_start_matches('*');
-        return is_simple_ident(rest) || (rest.starts_with('(') && rest.ends_with(')'));
+        if is_simple_ident(rest) {
+            return true;
+        }
+        return rest.starts_with('(') && balanced_outer_parens(rest);
     }
     t.chars()
         .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '.')
@@ -13432,6 +14626,9 @@ fn balanced_outer_parens(text: &str) -> bool {
 
 fn negate_condition_text(text: &str) -> String {
     let t = text.trim();
+    if let Some(repaired) = unstick_deref_bang(t) {
+        return repaired;
+    }
     if let Some(inner) = t.strip_prefix("!(").and_then(|s| s.strip_suffix(')')) {
         return naturalize_truthiness(inner);
     }
@@ -13677,6 +14874,45 @@ pub fn ssa_pseudocode_regions(
 
 #[cfg(test)]
 mod string_call_tests {
+    #[test]
+    fn post_inc_while_keeps_the_add_in_the_body() {
+        let lines = vec![
+            "    if (*(x29 - 0x40) != *(x29 - 0x38)) {".to_string(),
+            "    while (((*(x29 - 0x40)) + 0x1) != *(x29 - 0x38)) {".to_string(),
+            "    sub_5d6c((x29 - 0x28));".to_string(),
+            "    append((x29 - 0x58), (x29 - 0x28));".to_string(),
+            "    }".to_string(),
+            "    }".to_string(),
+        ];
+        let text = polish_rendered_lines(&lines).join("\n");
+        assert!(
+            text.contains("while (*(x29 - 0x40) != *(x29 - 0x38))"),
+            "{text}"
+        );
+        assert!(
+            text.contains("*(x29 - 0x40) = (*(x29 - 0x40) + 0x1);"),
+            "{text}"
+        );
+        assert!(!text.contains("+ 0x1) !="), "{text}");
+        let call = text.find("sub_5d6c").expect(&text);
+        let inc = text.find("= (*(x29 - 0x40) + 0x1)").expect(&text);
+        assert!(call < inc, "{text}");
+    }
+
+    #[test]
+    fn bang_on_deref_compare_flips_the_operator() {
+        let out = simplify_condition_text("!*(x29 - 0x40) == *(x29 - 0x38)".to_string());
+        assert_eq!(out, "*(x29 - 0x40) != *(x29 - 0x38)");
+        let neg = negate_condition_text("*(x29 - 0x40) == *(x29 - 0x38)");
+        assert_eq!(neg, "*(x29 - 0x40) != *(x29 - 0x38)", "negated to {neg}");
+        assert_eq!(simplify_condition_text("len < -8".to_string()), "len < -8");
+        assert_eq!(
+            simplify_addr_expr("((sp[0x78] >> 1) + 0x1)"),
+            "((sp[0x78] >> 1) + 0x1)"
+        );
+        assert_eq!(parse_arm64_imm("#0xfffffffffffffff8"), Some(-8));
+    }
+
     #[test]
     fn cse_replaces_repeated_call_text_with_result_name() {
         let lines = vec![
@@ -13999,6 +15235,167 @@ mod string_call_tests {
             text.contains('<') || text.contains("return"),
             "expected meaningful condition/control flow in:\n{text}"
         );
+    }
+
+    #[test]
+    fn arm64_ssa_indexed_store_keeps_the_index() {
+        let mk = |addr: u64, text: &str| Instruction {
+            address: addr,
+            bytes: Arc::from("00000000"),
+            text: Arc::from(text),
+        };
+        let blocks = vec![BasicBlock {
+            address: 0x1000,
+            size: 0xc,
+            instructions: vec![
+                mk(0x1000, "mov w8, #0x3a"),
+                mk(0x1004, "strh w8, [x23, x22]"),
+                mk(0x1008, "strb wzr, [x25, x24]"),
+            ],
+        }];
+        let ssa = lift_arm64_to_ssa(&blocks, &[], &[]);
+        let text =
+            render_ssa_pseudocode_named_layered(&ssa, "idx", &[], &HashMap::new(), &HashMap::new());
+        assert!(
+            text.contains("x23") && text.contains("x22") && text.contains("0x3a"),
+            "indexed strh dropped a register:\n{text}"
+        );
+        assert!(
+            text.contains("x25") && text.contains("x24") && text.contains('0'),
+            "indexed strb dropped a register:\n{text}"
+        );
+        assert!(
+            !text.contains("*x25 = 0") && !text.contains("*x23 = 0x3a"),
+            "store ignored the index:\n{text}"
+        );
+    }
+
+    #[test]
+    fn arm64_ssa_sign_bit_skips_the_following_call() {
+        let mk = |addr: u64, text: &str| Instruction {
+            address: addr,
+            bytes: Arc::from("00000000"),
+            text: Arc::from(text),
+        };
+        let blocks = vec![
+            BasicBlock {
+                address: 0x5420,
+                size: 0x8,
+                instructions: vec![mk(0x5420, "mov w23, w0"), mk(0x5424, "cbz w0, $+0x10")],
+            },
+            BasicBlock {
+                address: 0x5428,
+                size: 0x4,
+                instructions: vec![mk(0x5428, "tbnz w23, #0x1f, $+0x20")],
+            },
+            BasicBlock {
+                address: 0x542c,
+                size: 0x8,
+                instructions: vec![mk(0x542c, "bl $+0x100"), mk(0x5430, "b $+0xc")],
+            },
+            BasicBlock {
+                address: 0x5434,
+                size: 0x8,
+                instructions: vec![mk(0x5434, "mov x21, xzr"), mk(0x5438, "mov x25, xzr")],
+            },
+            BasicBlock {
+                address: 0x543c,
+                size: 0x8,
+                instructions: vec![mk(0x543c, "bl $+0x200"), mk(0x5440, "ret")],
+            },
+            BasicBlock {
+                address: 0x5448,
+                size: 0x10,
+                instructions: vec![
+                    mk(0x5448, "ldr x8, [x27, #0x28]"),
+                    mk(0x544c, "ldur x9, [x29, #-0x10]"),
+                    mk(0x5450, "cmp x8, x9"),
+                    mk(0x5454, "b.ne $+0x8"),
+                ],
+            },
+            BasicBlock {
+                address: 0x5458,
+                size: 0x4,
+                instructions: vec![mk(0x5458, "ret")],
+            },
+            BasicBlock {
+                address: 0x545c,
+                size: 0x8,
+                instructions: vec![mk(0x545c, "bl $+0x300"), mk(0x5460, "ret")],
+            },
+        ];
+        let refs = vec![
+            Reference {
+                from: 0x5424,
+                to: 0x5434,
+                kind: ReferenceKind::BranchTrue,
+            },
+            Reference {
+                from: 0x5424,
+                to: 0x5428,
+                kind: ReferenceKind::BranchFalse,
+            },
+            Reference {
+                from: 0x5428,
+                to: 0x5448,
+                kind: ReferenceKind::BranchTrue,
+            },
+            Reference {
+                from: 0x5454,
+                to: 0x545c,
+                kind: ReferenceKind::BranchTrue,
+            },
+            Reference {
+                from: 0x5454,
+                to: 0x5458,
+                kind: ReferenceKind::BranchFalse,
+            },
+            Reference {
+                from: 0x5428,
+                to: 0x542c,
+                kind: ReferenceKind::BranchFalse,
+            },
+            Reference {
+                from: 0x542c,
+                to: 0x100,
+                kind: ReferenceKind::Call,
+            },
+            Reference {
+                from: 0x5430,
+                to: 0x543c,
+                kind: ReferenceKind::Jump,
+            },
+            Reference {
+                from: 0x5438,
+                to: 0x543c,
+                kind: ReferenceKind::Fallthrough,
+            },
+            Reference {
+                from: 0x543c,
+                to: 0x200,
+                kind: ReferenceKind::Call,
+            },
+            Reference {
+                from: 0x5448,
+                to: 0x300,
+                kind: ReferenceKind::Call,
+            },
+        ];
+        let ssa = lift_arm64_to_ssa(&blocks, &refs, &[]);
+        let text = render_ssa_pseudocode_named_layered(
+            &ssa,
+            "sign",
+            &[],
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        assert!(text.contains("sub_100"), "alloc missing:\n{text}");
+        assert!(text.contains("sub_200"), "call missing:\n{text}");
+        let neg = text.find("x0 < 0").expect(&text);
+        let window = &text[neg..];
+        let ret = window.find("return").expect(&text);
+        let use_rel = window.find("sub_200").unwrap_or(usize::MAX);
+        assert!(ret < use_rel, "negative path falls into the call:\n{text}");
     }
 
     #[test]

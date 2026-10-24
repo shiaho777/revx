@@ -5090,7 +5090,7 @@ fn max_loaded_strings() -> usize {
         .ok()
         .and_then(|v| v.parse().ok())
         .filter(|v| *v >= 8)
-        .unwrap_or(32)
+        .unwrap_or(512)
 }
 
 fn max_string_bytes() -> usize {
@@ -5098,7 +5098,7 @@ fn max_string_bytes() -> usize {
         .ok()
         .and_then(|v| v.parse().ok())
         .filter(|v| *v >= 256)
-        .unwrap_or(4096)
+        .unwrap_or(16384)
 }
 
 fn extract_strings_capped(
