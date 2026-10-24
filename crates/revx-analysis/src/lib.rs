@@ -10358,8 +10358,8 @@ mod tests {
         extract_x64_data_references, find_executable_range, function_recovery_budget,
         infer_arm64_argument_type, infer_arm64_return_statement, infer_arm64_stack_arg_bytes,
         infer_arm64_stack_slot_type, infer_return_type, is_string_address, memory_function_cap,
-        next_hard_boundary, promote_data_reference_kinds, reclassify_string_references,
-        recover_arm64_locals, split_basic_blocks, polish_jni_argument_names,
+        next_hard_boundary, polish_jni_argument_names, promote_data_reference_kinds,
+        reclassify_string_references, recover_arm64_locals, split_basic_blocks,
     };
     use revx_core::{
         AnalysisProfile, Architecture, BasicBlock, BinaryFormat, BinaryImage, DebugImportSummary,

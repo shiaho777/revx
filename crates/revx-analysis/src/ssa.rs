@@ -4979,9 +4979,7 @@ fn lift_arm64_instruction(
             if let Some(dst) = extract_dest_reg_ref(text) {
                 let target = references
                     .iter()
-                    .find(|r| {
-                        r.from == addr && r.kind == revx_core::ReferenceKind::DataRef
-                    })
+                    .find(|r| r.from == addr && r.kind == revx_core::ReferenceKind::DataRef)
                     .map(|r| r.to)
                     .or_else(|| parse_branch_addr(addr, text));
                 if let Some(target) = target {
@@ -6942,7 +6940,11 @@ fn reindent_braces(lines: &[String]) -> Vec<String> {
         if trimmed.starts_with('}') {
             depth = depth.saturating_sub(1);
         }
-        let level = if trimmed.starts_with("int ") { 0 } else { depth.max(0) as usize };
+        let level = if trimmed.starts_with("int ") {
+            0
+        } else {
+            depth.max(0) as usize
+        };
         out.push(format!("{}{trimmed}", "    ".repeat(level)));
         if trimmed.ends_with('{') {
             depth += 1;
@@ -7072,7 +7074,10 @@ fn sink_post_inc_while(lines: &[String]) -> Vec<String> {
             index += 1;
             continue;
         };
-        let Some(while_cond) = lines.get(index + 1).and_then(|line| while_header_cond(line)) else {
+        let Some(while_cond) = lines
+            .get(index + 1)
+            .and_then(|line| while_header_cond(line))
+        else {
             out.push(lines[index].clone());
             index += 1;
             continue;
@@ -7092,7 +7097,10 @@ fn sink_post_inc_while(lines: &[String]) -> Vec<String> {
             index += 1;
             continue;
         };
-        if lines.get(while_close + 1).is_none_or(|line| line.trim() != "}") {
+        if lines
+            .get(while_close + 1)
+            .is_none_or(|line| line.trim() != "}")
+        {
             out.push(lines[index].clone());
             index += 1;
             continue;
@@ -7711,10 +7719,17 @@ impl<'a> RegionWalk<'a> {
         let mut call_line = None;
         for _ in 0..3 {
             let (lines, jump, branch) = self.terminator(block)?;
-            if !lines.is_empty() && !lines.iter().any(|line| line.contains("__android_log_print")) {
+            if !lines.is_empty()
+                && !lines
+                    .iter()
+                    .any(|line| line.contains("__android_log_print"))
+            {
                 return None;
             }
-            if let Some(call) = lines.iter().find(|line| line.contains("__android_log_print")) {
+            if let Some(call) = lines
+                .iter()
+                .find(|line| line.contains("__android_log_print"))
+            {
                 if lines.iter().any(|line| {
                     let trimmed = line.trim();
                     trimmed.contains('(')
@@ -7863,9 +7878,10 @@ impl<'a> RegionWalk<'a> {
         let inst = self.func.values.get(id.0 as usize)?;
         match &inst.op {
             SsaOp::Copy { src } => self.const_operand(src),
-            SsaOp::BinOp { kind, lhs, rhs } if *kind == BinOpKind::Add => {
-                Some(self.const_operand(lhs)?.wrapping_add(self.const_operand(rhs)?))
-            }
+            SsaOp::BinOp { kind, lhs, rhs } if *kind == BinOpKind::Add => Some(
+                self.const_operand(lhs)?
+                    .wrapping_add(self.const_operand(rhs)?),
+            ),
             _ => None,
         }
         .map(|value| value as u64)
@@ -8034,7 +8050,11 @@ impl<'a> RegionWalk<'a> {
 
     fn sole_successor(&self, block: BlockId) -> Option<BlockId> {
         let succs = self.func.cfg.succs.get(block.0 as usize)?;
-        if succs.len() == 1 { Some(succs[0]) } else { None }
+        if succs.len() == 1 {
+            Some(succs[0])
+        } else {
+            None
+        }
     }
 
     fn structure_open_end(&mut self, chain: &[BlockId], join: BlockId) -> bool {
@@ -8207,9 +8227,11 @@ impl<'a> RegionWalk<'a> {
             }
         }
         region.iter().all(|block| {
-            self.func.cfg.predecessors(*block).iter().all(|pred| {
-                *pred == gate || region.contains(pred)
-            })
+            self.func
+                .cfg
+                .predecessors(*block)
+                .iter()
+                .all(|pred| *pred == gate || region.contains(pred))
         })
     }
 
@@ -8297,9 +8319,9 @@ impl<'a> RegionWalk<'a> {
             let left = self.cover_kind(t, cont, depth + 1, seen);
             let right = self.cover_kind(f, cont, depth + 1, seen);
             return match (left, right) {
-                (Some(true), Some(false)) | (Some(false), Some(true)) | (Some(true), Some(true)) => {
-                    Some(true)
-                }
+                (Some(true), Some(false))
+                | (Some(false), Some(true))
+                | (Some(true), Some(true)) => Some(true),
                 (Some(false), Some(false)) => Some(false),
                 _ => None,
             };
@@ -14883,10 +14905,7 @@ mod string_call_tests {
         assert_eq!(out, "*(x29 - 0x40) != *(x29 - 0x38)");
         let neg = negate_condition_text("*(x29 - 0x40) == *(x29 - 0x38)");
         assert_eq!(neg, "*(x29 - 0x40) != *(x29 - 0x38)", "negated to {neg}");
-        assert_eq!(
-            simplify_condition_text("len < -8".to_string()),
-            "len < -8"
-        );
+        assert_eq!(simplify_condition_text("len < -8".to_string()), "len < -8");
         assert_eq!(
             simplify_addr_expr("((sp[0x78] >> 1) + 0x1)"),
             "((sp[0x78] >> 1) + 0x1)"
@@ -15235,13 +15254,8 @@ mod string_call_tests {
             ],
         }];
         let ssa = lift_arm64_to_ssa(&blocks, &[], &[]);
-        let text = render_ssa_pseudocode_named_layered(
-            &ssa,
-            "idx",
-            &[],
-            &HashMap::new(),
-            &HashMap::new(),
-        );
+        let text =
+            render_ssa_pseudocode_named_layered(&ssa, "idx", &[], &HashMap::new(), &HashMap::new());
         assert!(
             text.contains("x23") && text.contains("x22") && text.contains("0x3a"),
             "indexed strh dropped a register:\n{text}"
@@ -15381,10 +15395,7 @@ mod string_call_tests {
         let window = &text[neg..];
         let ret = window.find("return").expect(&text);
         let use_rel = window.find("sub_200").unwrap_or(usize::MAX);
-        assert!(
-            ret < use_rel,
-            "negative path falls into the call:\n{text}"
-        );
+        assert!(ret < use_rel, "negative path falls into the call:\n{text}");
     }
 
     #[test]
