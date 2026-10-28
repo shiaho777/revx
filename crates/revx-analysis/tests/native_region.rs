@@ -1,5 +1,6 @@
 use revx_analysis::ssa::{
     BlockId, Cfg, CfgBlock, Operand, SsaFunction, SsaOp, render_ssa_pseudocode_named_layered,
+    render_ssa_pseudocode_named_layered_with_strings,
 };
 use std::collections::HashMap;
 
@@ -313,6 +314,59 @@ fn named_layered_sign_bit_does_not_reach_the_call() {
     assert!(text.contains("alloc("), "{text}");
     assert!(text.contains("nulls("), "{text}");
     assert!(!text.contains("{\n    }"), "empty if:\n{text}");
+}
+
+#[test]
+fn named_layered_shared_log_keeps_the_setup_message() {
+    let mut func = fixture(
+        6,
+        &[(0, 1), (0, 2), (2, 1), (2, 3), (1, 4), (4, 5), (3, 5)],
+        vec![
+            vec![branch(1, 2)],
+            vec![jump(4)],
+            vec![branch(1, 3)],
+            vec![call("work"), jump(5)],
+            vec![
+                call("__android_log_print"),
+                SsaOp::Copy {
+                    src: Operand::Symbol("xzr".into()),
+                },
+                jump(5),
+            ],
+            vec![ret()],
+        ],
+    );
+    let setup = BlockId(1);
+    func.define(
+        "x1",
+        setup,
+        SsaOp::Copy {
+            src: Operand::Constant(0x2d9d),
+        },
+        0x531c,
+    );
+    func.define(
+        "x2",
+        setup,
+        SsaOp::Copy {
+            src: Operand::Constant(0x3355),
+        },
+        0x5324,
+    );
+    let mut strings = HashMap::new();
+    strings.insert(0x2d9d, "NativeCrypto".to_string());
+    strings.insert(0x3355, "Invalid parameters".to_string());
+    let text = render_ssa_pseudocode_named_layered_with_strings(
+        &func,
+        "logmsg",
+        &[],
+        &HashMap::new(),
+        &HashMap::new(),
+        &strings,
+    );
+    assert!(text.matches("Invalid parameters").count() >= 2, "{text}");
+    assert!(text.contains("NativeCrypto"), "{text}");
+    assert!(!text.contains("goto "), "{text}");
 }
 
 #[test]
