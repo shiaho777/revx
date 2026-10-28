@@ -7701,8 +7701,22 @@ impl<'a> RegionWalk<'a> {
                 for line in lines {
                     self.lines.push(format!("    {line}"));
                 }
-            } else if !self.lines.iter().any(|line| line.contains("return 0")) {
-                self.lines.push("    return 0;".to_string());
+            } else {
+                let idx = self
+                    .lines
+                    .iter()
+                    .rposition(|line| line.contains("__android_log_print"));
+                if let Some(call) = lines
+                    .iter()
+                    .find(|line| line.contains("__android_log_print"))
+                    && let Some(idx) = idx
+                    && idx >= before
+                {
+                    self.lines[idx] = format!("    {call}");
+                }
+                if !self.lines.iter().any(|line| line.contains("return 0")) {
+                    self.lines.push("    return 0;".to_string());
+                }
             }
             return true;
         }
@@ -7712,11 +7726,9 @@ impl<'a> RegionWalk<'a> {
         true
     }
 
-    fn android_log_return(&mut self, origin: BlockId) -> Option<Vec<String>> {
+    fn failure_log_site(&self, origin: BlockId) -> Option<(Option<BlockId>, BlockId, String)> {
         let mut setup = None;
         let mut block = origin;
-        let mut log_block = None;
-        let mut call_line = None;
         for _ in 0..3 {
             let (lines, jump, branch) = self.terminator(block)?;
             if !lines.is_empty()
@@ -7741,9 +7753,7 @@ impl<'a> RegionWalk<'a> {
                 if !self.block_zeros_a_reg(block) || !self.failure_returns(block) {
                     return None;
                 }
-                log_block = Some(block);
-                call_line = Some(call.clone());
-                break;
+                return Some((setup, block, call.clone()));
             }
             if branch.is_some() {
                 return None;
@@ -7755,8 +7765,11 @@ impl<'a> RegionWalk<'a> {
             setup.get_or_insert(block);
             block = next;
         }
-        let log_block = log_block?;
-        let mut call = call_line?;
+        None
+    }
+
+    fn android_log_return(&mut self, origin: BlockId) -> Option<Vec<String>> {
+        let (setup, log_block, mut call) = self.failure_log_site(origin)?;
         if let Some(setup) = setup
             && let Some((tag, msg)) = self.log_strings(setup)
         {
@@ -8256,6 +8269,9 @@ impl<'a> RegionWalk<'a> {
             return join;
         };
         if earlier == join || !self.block_reaches(earlier, join) {
+            return join;
+        }
+        if self.failure_log_site(earlier).is_some() {
             return join;
         }
         earlier
@@ -10066,10 +10082,7 @@ fn log_argument_block(func: &SsaFunction, block_id: BlockId) -> bool {
     target_block.insts.iter().any(|iid| {
         matches!(
             func.values.get(iid.0 as usize).map(|inst| &inst.op),
-            Some(SsaOp::Call {
-                target: Operand::Symbol(name),
-                ..
-            }) if name.contains("android_log_print")
+            Some(SsaOp::Call { .. })
         )
     })
 }
