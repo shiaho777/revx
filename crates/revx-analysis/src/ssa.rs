@@ -836,7 +836,11 @@ fn is_frame_prologue_noise(rendered: &str) -> bool {
     if rhs == "x30" || rhs == "lr" || rhs == "fp" || is_callee_saved_reg(rhs) {
         return true;
     }
-    if rhs.contains("var_sp") || rhs.contains("var_fp") {
+    let has_arith = rhs.contains('+') || rhs.contains('-') || rhs.contains('*');
+    if !has_arith && parse_frame_slot_name(rhs).is_some() {
+        return true;
+    }
+    if rhs.contains("&var_sp") || rhs.contains("&var_fp") {
         return true;
     }
     false
@@ -2315,11 +2319,13 @@ impl Cfg {
             }
         }
         for i in 0..n.saturating_sub(1) {
-            if succs[i].is_empty() && block_can_fall_through(&blocks[i]) {
+            if block_can_fall_through(&blocks[i]) {
                 let to = BlockId((i + 1) as u32);
-                succs[i].push(to);
-                if !preds[i + 1].contains(&BlockId(i as u32)) {
-                    preds[i + 1].push(BlockId(i as u32));
+                if !succs[i].contains(&to) {
+                    succs[i].push(to);
+                    if !preds[i + 1].contains(&BlockId(i as u32)) {
+                        preds[i + 1].push(BlockId(i as u32));
+                    }
                 }
             }
         }
@@ -3743,13 +3749,9 @@ fn frame_relative_offset(
             if !matches!(n.as_str(), "sp" | "x29" | "fp" | "x31") {
                 return None;
             }
-            if let Some(id) = reaching_def(func, &n, block)
-                && let Some(rel) =
-                    frame_relative_offset(func, &Operand::Value(id), block, depth + 1)
-            {
-                return Some(rel);
-            }
-            Some(0)
+            let id = lookup_reg_value_preferring_invariant(func, &n, block)
+                .or_else(|| reaching_def(func, &n, block))?;
+            frame_relative_offset(func, &Operand::Value(id), block, depth + 1)
         }
         Operand::Value(id) => frame_value_offset(func, *id, depth + 1),
         _ => None,
@@ -3757,23 +3759,32 @@ fn frame_relative_offset(
 }
 
 fn frame_value_offset(func: &SsaFunction, id: SsaValueId, depth: usize) -> Option<i64> {
+    frame_value_offset_inner(func, id, depth, id)
+}
+
+fn frame_value_offset_inner(
+    func: &SsaFunction,
+    id: SsaValueId,
+    depth: usize,
+    root: SsaValueId,
+) -> Option<i64> {
     if depth > 16 {
         return None;
     }
     let inst = func.values.get(id.0 as usize)?;
     match &inst.op {
-        SsaOp::Copy { src } => frame_operand_offset(func, src, depth + 1),
+        SsaOp::Copy { src } => frame_operand_offset_inner(func, src, depth + 1, root, id),
         SsaOp::BinOp {
             kind: BinOpKind::Add,
             lhs,
             rhs,
         } => {
-            if let Some(base) = frame_operand_offset(func, lhs, depth + 1)
+            if let Some(base) = frame_operand_offset_inner(func, lhs, depth + 1, root, id)
                 && let Some(c) = resolve_const_operand_static(func, rhs)
             {
                 return Some(base.wrapping_add(c));
             }
-            if let Some(base) = frame_operand_offset(func, rhs, depth + 1)
+            if let Some(base) = frame_operand_offset_inner(func, rhs, depth + 1, root, id)
                 && let Some(c) = resolve_const_operand_static(func, lhs)
             {
                 return Some(base.wrapping_add(c));
@@ -3785,9 +3796,21 @@ fn frame_value_offset(func: &SsaFunction, id: SsaValueId, depth: usize) -> Optio
             lhs,
             rhs,
         } => {
-            let base = frame_operand_offset(func, lhs, depth + 1)?;
+            let base = frame_operand_offset_inner(func, lhs, depth + 1, root, id)?;
             let c = resolve_const_operand_static(func, rhs)?;
             Some(base.wrapping_sub(c))
+        }
+        SsaOp::Phi { incoming } => {
+            let mut common: Option<i64> = None;
+            for (_, vid) in incoming {
+                let off = frame_value_offset_inner(func, *vid, depth + 1, root)?;
+                match common {
+                    None => common = Some(off),
+                    Some(prev) if prev == off => {}
+                    _ => return None,
+                }
+            }
+            common
         }
         _ => None,
     }
@@ -3807,26 +3830,34 @@ fn frame_operand_offset(func: &SsaFunction, op: &Operand, depth: usize) -> Optio
     }
 }
 
-fn value_is_sp_derived(func: &SsaFunction, id: SsaValueId, depth: usize) -> bool {
-    if depth > 16 {
-        return false;
+fn frame_operand_offset_inner(
+    func: &SsaFunction,
+    op: &Operand,
+    depth: usize,
+    root: SsaValueId,
+    self_id: SsaValueId,
+) -> Option<i64> {
+    match op {
+        Operand::Symbol(name) => {
+            let n = normalize_reg(name);
+            if !matches!(n.as_str(), "sp" | "x29" | "fp" | "x31") {
+                return None;
+            }
+            let block = func.values.get(self_id.0 as usize)?.block;
+            let def = lookup_reg_value_preferring_invariant(func, &n, block)?;
+            if def == self_id || def == root {
+                return Some(0);
+            }
+            frame_value_offset_inner(func, def, depth + 1, root)
+        }
+        Operand::Value(id) => {
+            if *id == root || *id == self_id {
+                return Some(0);
+            }
+            frame_value_offset_inner(func, *id, depth + 1, root)
+        }
+        _ => None,
     }
-    let Some(inst) = func.values.get(id.0 as usize) else {
-        return false;
-    };
-    match &inst.op {
-        SsaOp::Copy { src } => match src {
-            Operand::Symbol(name) => matches!(normalize_reg(name).as_str(), "sp" | "x31"),
-            Operand::Value(v) => value_is_sp_derived(func, *v, depth + 1),
-            _ => false,
-        },
-        SsaOp::BinOp { lhs, rhs, .. } => operand_is_sp_symbol(lhs) || operand_is_sp_symbol(rhs),
-        _ => false,
-    }
-}
-
-fn operand_is_sp_symbol(op: &Operand) -> bool {
-    matches!(op, Operand::Symbol(name) if matches!(normalize_reg(name).as_str(), "sp" | "x31"))
 }
 
 fn anchor_frame_mem_accesses(func: &mut SsaFunction) {
@@ -3839,22 +3870,16 @@ fn anchor_frame_mem_accesses(func: &mut SsaFunction) {
         let Operand::Deref { base, offset } = addr else {
             continue;
         };
-        let rel = if let Some(&base_rel) = func.frame_offsets.get(&inst.source_addr) {
-            Some(base_rel.wrapping_add(*offset))
-        } else {
-            match base.as_ref() {
-                Operand::Symbol(_) => frame_relative_offset(func, base, inst.block, 0),
-                Operand::Value(id) => {
-                    if value_is_sp_derived(func, *id, 0) {
-                        None
-                    } else {
-                        frame_relative_offset(func, base, inst.block, 0)
-                    }
-                }
-                _ => None,
-            }
-            .map(|r| r.wrapping_add(*offset))
+        let recomputed = match base.as_ref() {
+            Operand::Symbol(_) => frame_relative_offset(func, base, inst.block, 0),
+            Operand::Value(_) => frame_relative_offset(func, base, inst.block, 0),
+            _ => None,
         };
+        let rel = recomputed.map(|r| r.wrapping_add(*offset)).or_else(|| {
+            func.frame_offsets
+                .get(&inst.source_addr)
+                .map(|base_rel| base_rel.wrapping_add(*offset))
+        });
         if let Some(rel) = rel {
             updates.push((inst.id, rel));
         }
@@ -7642,6 +7667,7 @@ struct RegionWalk<'a> {
     block_line: HashMap<BlockId, usize>,
     goto_targets: HashSet<BlockId>,
     loop_head: Option<BlockId>,
+    loop_latch: Option<BlockId>,
 }
 
 const REGION_WALK_MAX_DEPTH: usize = 24;
@@ -7690,6 +7716,7 @@ impl<'a> RegionWalk<'a> {
             block_line: HashMap::new(),
             goto_targets: HashSet::new(),
             loop_head: None,
+            loop_latch: None,
         }
     }
 
@@ -7701,7 +7728,7 @@ impl<'a> RegionWalk<'a> {
         if self.stop == Some(target) || target == self.exit_id {
             return;
         }
-        if self.loop_head == Some(target) {
+        if self.loop_head == Some(target) || self.loop_latch == Some(target) {
             return;
         }
         if let Some(lines) = self.android_log_return(target) {
@@ -8491,12 +8518,15 @@ impl<'a> RegionWalk<'a> {
         }
         self.lines.push(format!("    while ({cond}) {{"));
         let prev_head = self.loop_head;
+        let prev_latch = self.loop_latch;
         self.loop_head = Some(head);
+        self.loop_latch = self.find_latch(head, body, exit);
         let mut body_ok = true;
         if body != exit && !self.emitted.contains(&body) {
             body_ok = self.walk_loop_body(body, head);
         }
         self.loop_head = prev_head;
+        self.loop_latch = prev_latch;
         self.lines.push("    }".to_string());
         if !body_ok {
             return false;
@@ -13802,6 +13832,9 @@ fn polish_call_arg_operand(
     if parse_frame_slot_name(&text).is_some() {
         return text;
     }
+    if operand_is_value_arithmetic(func, operand) {
+        return text;
+    }
     if let Some((base, off)) = parse_addr_chain(&text)
         && let Some(name) = frame_slot_name_from_parts(&base, off)
     {
@@ -13811,6 +13844,24 @@ fn polish_call_arg_operand(
         return format!("&{name}");
     }
     text
+}
+
+fn operand_is_value_arithmetic(func: &SsaFunction, operand: &Operand) -> bool {
+    let Operand::Value(id) = operand else {
+        return false;
+    };
+    let Some(inst) = func.values.get(id.0 as usize) else {
+        return false;
+    };
+    match &inst.op {
+        SsaOp::BinOp { kind, lhs, rhs } => {
+            matches!(kind, BinOpKind::Add | BinOpKind::Sub | BinOpKind::Mul)
+                && (operand_is_stack_slot_value(func, lhs)
+                    || operand_is_stack_slot_value(func, rhs))
+        }
+        SsaOp::Copy { src } => operand_is_value_arithmetic(func, src),
+        _ => false,
+    }
 }
 
 #[allow(clippy::collapsible_match)]
@@ -15702,6 +15753,114 @@ mod string_call_tests {
         assert!(text.contains("== 1") || text.contains("== 0x1"), "{text}");
         assert!(text.contains("var_sp_m0x4 = 0xa"), "{text}");
         assert!(text.contains("var_sp_m0xc = x0"), "{text}");
+    }
+
+    #[test]
+    fn arm64_golden_loop_with_if_else_has_no_goto() {
+        let blocks = vec![
+            BasicBlock {
+                address: 0x1000,
+                size: 0x10,
+                instructions: vec![
+                    golden_mk(0x1000, "sub sp, sp, #0x20"),
+                    golden_mk(0x1004, "str w0, [sp, #0x1c]"),
+                    golden_mk(0x1008, "str wzr, [sp, #0x18]"),
+                    golden_mk(0x100c, "b 0x1010"),
+                ],
+            },
+            BasicBlock {
+                address: 0x1010,
+                size: 0x10,
+                instructions: vec![
+                    golden_mk(0x1010, "ldr w8, [sp, #0x18]"),
+                    golden_mk(0x1014, "ldr w9, [sp, #0x1c]"),
+                    golden_mk(0x1018, "cmp w8, w9"),
+                    golden_mk(0x101c, "b.ge 0x1060"),
+                ],
+            },
+            BasicBlock {
+                address: 0x1020,
+                size: 0x8,
+                instructions: vec![
+                    golden_mk(0x1020, "tst w8, #0x1"),
+                    golden_mk(0x1024, "b.eq 0x1040"),
+                ],
+            },
+            BasicBlock {
+                address: 0x1030,
+                size: 0x10,
+                instructions: vec![
+                    golden_mk(0x1030, "ldr w8, [sp, #0x18]"),
+                    golden_mk(0x1034, "add w8, w8, #0x1"),
+                    golden_mk(0x1038, "str w8, [sp, #0x14]"),
+                    golden_mk(0x103c, "b 0x1050"),
+                ],
+            },
+            BasicBlock {
+                address: 0x1040,
+                size: 0x10,
+                instructions: vec![
+                    golden_mk(0x1040, "ldr w8, [sp, #0x18]"),
+                    golden_mk(0x1044, "add w8, w8, #0x2"),
+                    golden_mk(0x1048, "str w8, [sp, #0x14]"),
+                    golden_mk(0x104c, "b 0x1050"),
+                ],
+            },
+            BasicBlock {
+                address: 0x1050,
+                size: 0x10,
+                instructions: vec![
+                    golden_mk(0x1050, "ldr w8, [sp, #0x14]"),
+                    golden_mk(0x1054, "str w8, [sp, #0x18]"),
+                    golden_mk(0x1058, "b 0x1010"),
+                ],
+            },
+            BasicBlock {
+                address: 0x1060,
+                size: 0x10,
+                instructions: vec![
+                    golden_mk(0x1060, "ldr w0, [sp, #0x18]"),
+                    golden_mk(0x1064, "add sp, sp, #0x20"),
+                    golden_mk(0x1068, "ret"),
+                ],
+            },
+        ];
+        let refs = vec![
+            Reference {
+                from: 0x100c,
+                to: 0x1010,
+                kind: ReferenceKind::Jump,
+            },
+            Reference {
+                from: 0x101c,
+                to: 0x1060,
+                kind: ReferenceKind::BranchTrue,
+            },
+            Reference {
+                from: 0x1024,
+                to: 0x1040,
+                kind: ReferenceKind::BranchTrue,
+            },
+            Reference {
+                from: 0x103c,
+                to: 0x1050,
+                kind: ReferenceKind::Jump,
+            },
+            Reference {
+                from: 0x104c,
+                to: 0x1050,
+                kind: ReferenceKind::Jump,
+            },
+            Reference {
+                from: 0x1058,
+                to: 0x1010,
+                kind: ReferenceKind::Jump,
+            },
+        ];
+        let text = golden_render(&blocks, &refs);
+        assert!(text.contains("while ("), "{text}");
+        assert!(text.contains("if ("), "{text}");
+        assert!(!text.contains("goto"), "{text}");
     }
 
     #[test]
