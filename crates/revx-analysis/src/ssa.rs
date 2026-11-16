@@ -5734,19 +5734,33 @@ fn lookup_or_symbol(func: &SsaFunction, reg_name: &str, block: BlockId) -> Opera
 
 #[allow(clippy::question_mark)]
 fn reaching_def(func: &SsaFunction, reg: &str, block: BlockId) -> Option<SsaValueId> {
+    reaching_def_inner(func, reg, block, &mut HashSet::new(), 0)
+}
+
+fn reaching_def_inner(
+    func: &SsaFunction,
+    reg: &str,
+    block: BlockId,
+    visited: &mut HashSet<BlockId>,
+    depth: usize,
+) -> Option<SsaValueId> {
+    if depth > 32 || !visited.insert(block) {
+        return None;
+    }
     let preds = func.cfg.predecessors(block);
     if preds.is_empty() {
         return None;
     }
     let mut found: Option<SsaValueId> = None;
     for &pred in preds {
-        let Some(d) = func
+        let d = func
             .block_defs(pred)
             .and_then(|m| m.get(reg))
             .copied()
             .or_else(|| func.lookup(reg, pred))
-        else {
-            return None;
+            .or_else(|| reaching_def_inner(func, reg, pred, visited, depth + 1));
+        let Some(d) = d else {
+            continue;
         };
         match found {
             None => found = Some(d),
