@@ -7751,6 +7751,17 @@ impl<'a> RegionWalk<'a> {
             }
             return;
         }
+        if let Some((lines, jump, branch)) = self.terminator(target)
+            && jump.is_none()
+            && branch.is_none()
+            && lines.iter().any(|l| l.trim_start().starts_with("return"))
+        {
+            for line in lines {
+                self.lines.push(format!("    {line}"));
+            }
+            self.emitted.insert(target);
+            return;
+        }
         self.goto_targets.insert(target);
         self.lines.push(format!("    goto bb{};", target.0));
     }
@@ -8544,6 +8555,9 @@ impl<'a> RegionWalk<'a> {
         self.lines.push("    }".to_string());
         if !body_ok {
             return false;
+        }
+        if self.emitted.contains(&exit) {
+            return true;
         }
         self.finish_join(exit)
     }
