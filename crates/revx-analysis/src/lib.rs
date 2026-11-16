@@ -21,7 +21,7 @@ pub use lattice::{
     synthesize_observation_corpus,
 };
 
-use object::{Object, ObjectSection};
+use object::{Object, ObjectSection, ObjectSegment};
 use revx_core::{
     AnalysisBundle, AnalysisProfile, AnalysisSummary, Architecture, BasicBlock, BinaryFormat,
     BinaryImage, BinarySummary, DebugCoverageSummary, DebugFunctionHint, DecompileStrategy,
@@ -1007,6 +1007,17 @@ where
             Vec::new()
         } else {
             collect_arm64_heuristic_seeds(&code_regions)
+        } {
+            heuristic_seed_addrs.insert(address);
+            seeds
+                .entry(address)
+                .or_insert_with(|| format_sub_addr(address));
+        }
+    } else if image.architecture == Architecture::X86_64 {
+        for address in if resource::micro_mode() || lean_effective(profile) {
+            Vec::new()
+        } else {
+            collect_x64_heuristic_seeds(&code_regions)
         } {
             heuristic_seed_addrs.insert(address);
             seeds
@@ -2592,6 +2603,108 @@ fn function_recovery_budget(image: &BinaryImage, profile: AnalysisProfile) -> us
         .min(cap)
 }
 
+fn collect_x64_heuristic_seeds(code_regions: &[CodeRegion]) -> Vec<u64> {
+    let mut out = Vec::new();
+    let mut seen = BTreeSet::new();
+
+    for region in code_regions {
+        let mut window_start = region.start;
+        while window_start < region.end {
+            let window_end = window_start.saturating_add(HEURISTIC_SCAN_WINDOW as u64);
+            let data = region
+                .read_range(window_start, window_end)
+                .unwrap_or_default();
+            if data.is_empty() {
+                break;
+            }
+            collect_x64_seeds_in_data(region, &data, window_start, &mut seen, &mut out);
+            if window_end >= region.end {
+                break;
+            }
+            window_start = window_end.saturating_sub(16);
+        }
+    }
+
+    out
+}
+
+fn collect_x64_seeds_in_data(
+    region: &CodeRegion,
+    data: &[u8],
+    window_start: u64,
+    seen: &mut BTreeSet<u64>,
+    out: &mut Vec<u64>,
+) {
+    let mut offset = 0usize;
+    while offset < data.len() {
+        if is_x64_prologue_at(data, offset)
+            && is_likely_x64_function_boundary(region, window_start, offset)
+        {
+            let address = window_start + offset as u64;
+            if seen.insert(address) {
+                out.push(address);
+            }
+        }
+        offset += 1;
+    }
+}
+
+fn is_x64_prologue_at(data: &[u8], offset: usize) -> bool {
+    let rest = &data[offset..];
+    if rest.starts_with(&[0x55, 0x48, 0x89, 0xe5]) {
+        return true;
+    }
+    if rest.starts_with(&[0x55, 0x48, 0x8b, 0xec]) {
+        return true;
+    }
+    if rest.starts_with(&[0xf3, 0x0f, 0x1e, 0xfa]) {
+        return true;
+    }
+    if rest.starts_with(&[0x48, 0x83, 0xec]) || rest.starts_with(&[0x48, 0x81, 0xec]) {
+        return true;
+    }
+    if rest.starts_with(&[0x40, 0x55]) || rest.starts_with(&[0x40, 0x53]) {
+        return true;
+    }
+    if rest.len() >= 2 && rest[0] == 0x41 && (0x54..=0x57).contains(&rest[1]) {
+        return true;
+    }
+    false
+}
+
+fn is_likely_x64_function_boundary(region: &CodeRegion, window_start: u64, offset: usize) -> bool {
+    let address = window_start + offset as u64;
+    if address == region.start {
+        return true;
+    }
+    if address.is_multiple_of(16) {
+        return true;
+    }
+    let prefix_start = address.saturating_sub(16).max(region.start);
+    let Some(prefix) = region.read_range(prefix_start, address) else {
+        return false;
+    };
+    if prefix.is_empty() {
+        return true;
+    }
+    let last = prefix[prefix.len() - 1];
+    if last == 0xc3 || last == 0xcc || last == 0x90 {
+        return true;
+    }
+    if prefix.len() >= 2 && prefix[prefix.len() - 2] == 0xc2 {
+        return true;
+    }
+    let decoded = revx_arch_x64::decode_block(&prefix, prefix_start);
+    if let Some(last_inst) = decoded.last() {
+        let t = last_inst.text.as_ref();
+        if t == "ret" || t.starts_with("ret ") || t.starts_with("jmp ") || t == "int3" || t == "nop"
+        {
+            return true;
+        }
+    }
+    false
+}
+
 fn collect_arm64_heuristic_seeds(code_regions: &[CodeRegion]) -> Vec<u64> {
     let mut out = Vec::new();
     let mut seen = BTreeSet::new();
@@ -2972,6 +3085,47 @@ fn build_code_regions(image: &BinaryImage) -> Vec<CodeRegion> {
                 size: file_size,
             },
         });
+    }
+
+    if out.is_empty() {
+        for segment in parsed.segments() {
+            let size = segment.size();
+            if size == 0 {
+                continue;
+            }
+            let name = segment
+                .name()
+                .ok()
+                .flatten()
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            if name.contains("pagezero") {
+                continue;
+            }
+            let executable = match segment.flags() {
+                object::SegmentFlags::Elf { p_flags } => p_flags & 1 != 0,
+                object::SegmentFlags::MachO { initprot, .. } => initprot & 4 != 0,
+                _ => name.contains("__text") || name.contains(".text"),
+            };
+            if !executable {
+                continue;
+            }
+            let (file_offset, file_size) = segment.file_range();
+            if file_size == 0 {
+                continue;
+            }
+            let start = segment.address();
+            let end = start.saturating_add(size);
+            out.push(CodeRegion {
+                start,
+                end,
+                bytes: ByteSource::File {
+                    file: Arc::clone(&file),
+                    file_offset,
+                    size: file_size as usize,
+                },
+            });
+        }
     }
 
     advise_bytes_dontneed(&mmap);
@@ -10391,12 +10545,13 @@ mod tests {
         CodeRegion, MIN_FUNCTION_BUDGET, StringRange, arm64_block_has_implicit_fallthrough,
         arm64_track_semantic_state, attach_relocation_references, build_arm64_semantic_local_refs,
         build_arm64_semantic_state, build_regions, collect_arm64_heuristic_seeds,
-        decode_arm64_cfg_with_references, decode_x64_cfg_with_references,
-        extract_x64_data_references, find_executable_range, function_recovery_budget,
-        infer_arm64_argument_type, infer_arm64_return_statement, infer_arm64_stack_arg_bytes,
-        infer_arm64_stack_slot_type, infer_return_type, is_string_address, memory_function_cap,
-        next_hard_boundary, polish_jni_argument_names, promote_data_reference_kinds,
-        reclassify_string_references, recover_arm64_locals, split_basic_blocks,
+        collect_x64_heuristic_seeds, decode_arm64_cfg_with_references,
+        decode_x64_cfg_with_references, extract_x64_data_references, find_executable_range,
+        function_recovery_budget, infer_arm64_argument_type, infer_arm64_return_statement,
+        infer_arm64_stack_arg_bytes, infer_arm64_stack_slot_type, infer_return_type,
+        is_string_address, memory_function_cap, next_hard_boundary, polish_jni_argument_names,
+        promote_data_reference_kinds, reclassify_string_references, recover_arm64_locals,
+        split_basic_blocks,
     };
     use revx_core::{
         AnalysisProfile, Architecture, BasicBlock, BinaryFormat, BinaryImage, DebugImportSummary,
@@ -10752,6 +10907,39 @@ mod tests {
         let seeds = collect_arm64_heuristic_seeds(&code_regions);
         assert!(seeds.contains(&0x5081f8));
         assert!(!seeds.contains(&0x5081fc));
+    }
+
+    #[test]
+    fn x64_prologue_after_ret_seeds_function_start() {
+        let code_regions = vec![CodeRegion::from_vec(
+            0x1000,
+            vec![
+                0xb8, 0x01, 0x00, 0x00, 0x00, // mov eax, 1
+                0xc3, // ret
+                0x55, // push rbp
+                0x48, 0x89, 0xe5, // mov rbp, rsp
+                0x48, 0x83, 0xec, 0x10, // sub rsp, 0x10
+                0xc3, // ret
+            ],
+        )];
+        let seeds = collect_x64_heuristic_seeds(&code_regions);
+        assert!(seeds.contains(&0x1006), "seeds={seeds:?}");
+    }
+
+    #[test]
+    fn x64_endbr64_prologue_seeds_function_start() {
+        let code_regions = vec![CodeRegion::from_vec(
+            0x2000,
+            vec![
+                0xc3, // ret
+                0xf3, 0x0f, 0x1e, 0xfa, // endbr64
+                0x55, // push rbp
+                0x48, 0x89, 0xe5, // mov rbp, rsp
+                0xc3, // ret
+            ],
+        )];
+        let seeds = collect_x64_heuristic_seeds(&code_regions);
+        assert!(seeds.contains(&0x2001), "seeds={seeds:?}");
     }
 
     #[test]
