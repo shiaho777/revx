@@ -65,25 +65,30 @@ const MAX_OVERSIZE_WINDOW_BLOCKS: usize = 64;
 const MAX_OVERSIZE_WINDOW_INSTS: usize = 384;
 const MAX_RECOVERY_SAMPLE_INSTS: usize = LIGHT_VAR_RECOVERY_INSTS;
 
+fn lean_effective(profile: AnalysisProfile) -> bool {
+    resource::lean_mode() && profile != AnalysisProfile::Full && !resource::micro_mode()
+}
+
 fn analysis_limit_boost(profile: AnalysisProfile) -> usize {
-    if resource::lean_mode() || resource::micro_mode() {
+    if resource::micro_mode() {
         return 1;
     }
-    match profile {
-        AnalysisProfile::Fast => 1,
-        AnalysisProfile::Full => {
-            if std::env::var_os("REVX_FULL_MEM").is_some() {
-                4
-            } else {
-                2
-            }
-        }
+    if profile == AnalysisProfile::Full {
+        return if std::env::var_os("REVX_FULL_MEM").is_some() {
+            4
+        } else {
+            2
+        };
     }
+    if resource::lean_mode() {
+        return 1;
+    }
+    1
 }
 
 fn ssa_inst_limit(profile: AnalysisProfile) -> usize {
     let base = MAX_SSA_INSTS.saturating_mul(analysis_limit_boost(profile));
-    if profile == AnalysisProfile::Full && !resource::lean_mode() && !resource::micro_mode() {
+    if profile == AnalysisProfile::Full && !resource::micro_mode() {
         base.max(384)
     } else {
         base
@@ -92,7 +97,7 @@ fn ssa_inst_limit(profile: AnalysisProfile) -> usize {
 
 fn ssa_block_limit(profile: AnalysisProfile) -> usize {
     let base = MAX_SSA_BLOCKS.saturating_mul(analysis_limit_boost(profile));
-    if profile == AnalysisProfile::Full && !resource::lean_mode() && !resource::micro_mode() {
+    if profile == AnalysisProfile::Full && !resource::micro_mode() {
         base.max(80)
     } else {
         base
@@ -140,13 +145,13 @@ fn shared_string_map_limit() -> usize {
         .unwrap_or(MAX_SHARED_STRING_MAP)
 }
 
-fn global_reference_limit() -> usize {
+fn global_reference_limit(profile: AnalysisProfile) -> usize {
     revx_core::analysis_caps()
         .global_references
         .unwrap_or_else(|| {
             if resource::micro_mode() {
                 MAX_GLOBAL_REFERENCES.min(128)
-            } else if resource::lean_mode() {
+            } else if lean_effective(profile) {
                 let rss_mb = (resource::process_resource_limits().rss_kb / 1024).max(1) as usize;
                 MAX_GLOBAL_REFERENCES.min(64).max(rss_mb.saturating_mul(16))
             } else {
@@ -998,7 +1003,7 @@ where
     let mut hard_seed_addrs = seeds.keys().copied().collect::<BTreeSet<_>>();
     let mut heuristic_seed_addrs = BTreeSet::new();
     if image.architecture == Architecture::Arm64 {
-        for address in if resource::micro_mode() || resource::lean_mode() {
+        for address in if resource::micro_mode() || lean_effective(profile) {
             Vec::new()
         } else {
             collect_arm64_heuristic_seeds(&code_regions)
@@ -1062,7 +1067,7 @@ where
     string_ranges.sort_unstable_by_key(|range| range.start);
     let relocation_refs = collect_relocation_references(image, &string_ranges, &executable);
 
-    let ref_cap = global_reference_limit();
+    let ref_cap = global_reference_limit(profile);
     let mut all_references = HashSet::<Reference>::with_capacity(ref_cap);
     for reference in &relocation_refs {
         all_references.insert(*reference);
@@ -1113,12 +1118,12 @@ where
     // ── Phase 1: Batched parallel discovery ────────────────────────────────
     // Decode is expensive and independent per candidate. Claim/seed expansion
     // stays serial so coverage remains deterministic.
-    let phase1_batch_size = if resource::micro_mode() || resource::lean_mode() {
+    let phase1_batch_size = if resource::micro_mode() || lean_effective(profile) {
         1
     } else {
         (parallel_worker_count() * 4).clamp(4, 16)
     };
-    let max_function_bytes = if resource::lean_mode() {
+    let max_function_bytes = if lean_effective(profile) {
         (default_max_function_bytes(image.architecture, profile) as u64).min(0x200)
     } else {
         default_max_function_bytes(image.architecture, profile) as u64
@@ -1222,6 +1227,7 @@ where
                     address,
                     max_end,
                     &executable,
+                    profile,
                 );
                 if instructions.is_empty() {
                     return (
@@ -1352,7 +1358,7 @@ where
             }
 
             let expand_calls = profile == AnalysisProfile::Full
-                || (if resource::lean_mode() {
+                || (if lean_effective(profile) {
                     function_count < (function_budget / 4).max(16)
                 } else {
                     phase1_batches < (function_budget / 4).max(32)
@@ -1378,9 +1384,10 @@ where
             let debug_hint = hint_by_addr
                 .get(&address)
                 .or_else(|| hint_by_name.get(name.as_str()))
+                .or_else(|| hint_by_name.get(name.trim_start_matches('_')))
                 .cloned();
 
-            if resource::lean_mode() {
+            if lean_effective(profile) {
                 let deep = deep_addresses.contains(&address);
                 let keep_pseudo = deep || lean_keep_pseudocode(&name, function_count);
                 let function = if deep {
@@ -1602,6 +1609,7 @@ where
             pf.address,
             pf.decode_end,
             &executable,
+            profile,
         );
         if instructions.is_empty() {
             return (
@@ -2375,20 +2383,20 @@ fn lean_cfg_inst_limit() -> usize {
     scaled.min(MAX_CFG_INSTRUCTIONS)
 }
 
-fn cfg_block_limit() -> usize {
+fn cfg_block_limit(profile: AnalysisProfile) -> usize {
     revx_core::analysis_caps()
         .cfg_blocks
-        .unwrap_or(if resource::lean_mode() {
+        .unwrap_or(if lean_effective(profile) {
             lean_cfg_block_limit()
         } else {
             MAX_CFG_BLOCKS
         })
 }
 
-fn cfg_inst_limit() -> usize {
+fn cfg_inst_limit(profile: AnalysisProfile) -> usize {
     revx_core::analysis_caps()
         .cfg_instructions
-        .unwrap_or(if resource::lean_mode() {
+        .unwrap_or(if lean_effective(profile) {
             lean_cfg_inst_limit()
         } else {
             MAX_CFG_INSTRUCTIONS
@@ -2467,21 +2475,39 @@ fn memory_function_cap(profile: AnalysisProfile) -> usize {
     by_rss.min(profile_cap)
 }
 
+fn segment_is_executable(segment: &revx_core::Segment) -> bool {
+    let name = segment.name.to_ascii_lowercase();
+    if name.contains("pagezero") {
+        return false;
+    }
+    let perms = segment.permissions.to_ascii_lowercase();
+    perms == "x"
+        || perms == "rx"
+        || perms == "rwx"
+        || perms == "wx"
+        || perms.contains("execute")
+        || (perms.contains('x') && !perms.contains("maxprot") && !perms.contains("initprot"))
+        || name.contains("__text")
+        || name.contains(".text")
+}
+
 fn total_executable_size(image: &BinaryImage) -> u64 {
-    image
+    let text_size = image
         .sections
         .iter()
         .filter(|section| section.kind.contains("Text"))
         .map(|section| section.size)
-        .sum::<u64>()
-        .max(
-            image
-                .segments
-                .iter()
-                .map(|segment| segment.size)
-                .max()
-                .unwrap_or(0),
-        )
+        .sum::<u64>();
+    if text_size > 0 {
+        return text_size;
+    }
+    image
+        .segments
+        .iter()
+        .filter(|segment| segment_is_executable(segment))
+        .map(|segment| segment.size)
+        .max()
+        .unwrap_or(0)
 }
 
 const SWEEP_RANGE_BYTES: u64 = 0x1000;
@@ -2553,20 +2579,7 @@ fn function_recovery_budget(image: &BinaryImage, profile: AnalysisProfile) -> us
     {
         return explicit;
     }
-    let executable_bytes = image
-        .sections
-        .iter()
-        .filter(|section| section.kind.contains("Text"))
-        .map(|section| section.size as usize)
-        .sum::<usize>()
-        .max(
-            image
-                .segments
-                .iter()
-                .map(|segment| segment.size as usize)
-                .max()
-                .unwrap_or(0),
-        );
+    let executable_bytes = total_executable_size(image) as usize;
     let seed_budget = image
         .symbols
         .len()
@@ -2877,15 +2890,16 @@ fn decode_function_with_references(
     start: u64,
     max_end: u64,
     executable: &[(u64, u64)],
+    profile: AnalysisProfile,
 ) -> (Vec<Instruction>, Vec<Reference>) {
     match architecture {
         #[cfg(feature = "arch-x64")]
         Architecture::X86_64 => {
-            decode_x64_cfg_with_references(code_regions, start, max_end, executable)
+            decode_x64_cfg_with_references(code_regions, start, max_end, executable, profile)
         }
         #[cfg(feature = "arch-arm64")]
         Architecture::Arm64 => {
-            decode_arm64_cfg_with_references(code_regions, start, max_end, executable)
+            decode_arm64_cfg_with_references(code_regions, start, max_end, executable, profile)
         }
         _ => (Vec::new(), Vec::new()),
     }
@@ -3396,21 +3410,24 @@ fn decode_arm64_cfg_with_references(
     start: u64,
     max_end: u64,
     executable: &[(u64, u64)],
+    profile: AnalysisProfile,
 ) -> (Vec<Instruction>, Vec<Reference>) {
     let mut queue = Arm64CfgQueue::new(start);
     let estimated_blocks = ((max_end.saturating_sub(start) / 16) as usize)
         .max(4)
-        .min(cfg_block_limit());
+        .min(cfg_block_limit(profile));
     let mut visited_blocks = HashSet::with_capacity(estimated_blocks);
     let estimated_insts = ((max_end.saturating_sub(start) / 4) as usize)
         .max(16)
-        .min(cfg_inst_limit());
+        .min(cfg_inst_limit(profile));
     let mut instruction_map: HashMap<u64, Instruction> = HashMap::with_capacity(estimated_insts);
     let mut all_refs = Vec::with_capacity(estimated_blocks);
     let mut saw_br = false;
 
-    while let Some(block_start) = queue.pop(instruction_map.len(), cfg_inst_limit()) {
-        if visited_blocks.len() >= cfg_block_limit() || instruction_map.len() >= cfg_inst_limit() {
+    while let Some(block_start) = queue.pop(instruction_map.len(), cfg_inst_limit(profile)) {
+        if visited_blocks.len() >= cfg_block_limit(profile)
+            || instruction_map.len() >= cfg_inst_limit(profile)
+        {
             break;
         }
         if block_start < start || block_start >= max_end {
@@ -3494,7 +3511,7 @@ fn decode_arm64_cfg_with_references(
         }
 
         for inst in block {
-            if instruction_map.len() >= cfg_inst_limit() {
+            if instruction_map.len() >= cfg_inst_limit(profile) {
                 break;
             }
             instruction_map.entry(inst.address).or_insert(inst);
@@ -3542,8 +3559,10 @@ fn decode_arm64_cfg_with_references(
             }
         }
     }
-    while let Some(block_start) = queue.pop(instruction_map.len(), cfg_inst_limit()) {
-        if visited_blocks.len() >= cfg_block_limit() || instruction_map.len() >= cfg_inst_limit() {
+    while let Some(block_start) = queue.pop(instruction_map.len(), cfg_inst_limit(profile)) {
+        if visited_blocks.len() >= cfg_block_limit(profile)
+            || instruction_map.len() >= cfg_inst_limit(profile)
+        {
             break;
         }
         if block_start < start || block_start >= max_end {
@@ -3621,7 +3640,7 @@ fn decode_arm64_cfg_with_references(
             }
         }
         for inst in block {
-            if instruction_map.len() >= cfg_inst_limit() {
+            if instruction_map.len() >= cfg_inst_limit(profile) {
                 break;
             }
             instruction_map.entry(inst.address).or_insert(inst);
@@ -4034,17 +4053,20 @@ fn decode_x64_cfg_with_references(
     start: u64,
     max_end: u64,
     executable: &[(u64, u64)],
+    profile: AnalysisProfile,
 ) -> (Vec<Instruction>, Vec<Reference>) {
     let mut queue = VecDeque::from([start]);
     let estimated_blocks = ((max_end.saturating_sub(start) / 12) as usize)
         .max(4)
-        .min(cfg_block_limit());
+        .min(cfg_block_limit(profile));
     let mut visited_blocks = HashSet::with_capacity(estimated_blocks);
     let mut instruction_map: BTreeMap<u64, Instruction> = BTreeMap::new();
     let mut all_refs = Vec::with_capacity(estimated_blocks);
 
     while let Some(block_start) = queue.pop_front() {
-        if visited_blocks.len() >= cfg_block_limit() || instruction_map.len() >= cfg_inst_limit() {
+        if visited_blocks.len() >= cfg_block_limit(profile)
+            || instruction_map.len() >= cfg_inst_limit(profile)
+        {
             break;
         }
         if block_start < start || block_start >= max_end {
@@ -4091,7 +4113,7 @@ fn decode_x64_cfg_with_references(
         }
 
         for inst in block {
-            if instruction_map.len() >= cfg_inst_limit() {
+            if instruction_map.len() >= cfg_inst_limit(profile) {
                 break;
             }
             instruction_map.entry(inst.address).or_insert(inst);
@@ -4383,9 +4405,7 @@ fn recover_variables(
     debug_hint: Option<&DebugFunctionHint>,
     profile: AnalysisProfile,
 ) -> (Vec<Variable>, Vec<Variable>) {
-    let mut arguments = debug_hint
-        .map(|hint| hint.arguments.clone())
-        .unwrap_or_default();
+    let mut arguments: Vec<Variable> = Vec::new();
     let mut locals = debug_hint
         .map(|hint| hint.locals.clone())
         .unwrap_or_default();
@@ -4421,14 +4441,19 @@ fn recover_variables(
             } else {
                 infer_arm64_argument_type(instructions, reg, wreg)
             };
-            let name = format!("arg_{index}");
+            let hint_arg = debug_hint.and_then(|hint| hint.arguments.get(index));
+            let name = hint_arg
+                .map(|arg| arg.name.clone())
+                .unwrap_or_else(|| format!("arg_{index}"));
             if seen_arg_names.insert(name.clone()) {
                 arguments.push(Variable {
                     name,
                     role: VariableRole::Argument,
                     storage: VariableStorage::Register,
-                    type_name,
-                    confidence: if profile == AnalysisProfile::Full {
+                    type_name: hint_arg.and_then(|arg| arg.type_name.clone()).or(type_name),
+                    confidence: if hint_arg.is_some() {
+                        0.9
+                    } else if profile == AnalysisProfile::Full {
                         0.6
                     } else {
                         0.45
@@ -4528,14 +4553,22 @@ fn recover_variables(
             if input_mask & (1u8 << index) == 0 {
                 continue;
             }
-            let name = format!("arg_{index}");
+            let name = debug_hint
+                .and_then(|hint| hint.arguments.get(index))
+                .map(|arg| arg.name.clone())
+                .unwrap_or_else(|| format!("arg_{index}"));
             if seen_arg_names.insert(name.clone()) {
+                let hint_arg = debug_hint.and_then(|hint| hint.arguments.get(index));
                 arguments.push(Variable {
                     name,
                     role: VariableRole::Argument,
                     storage: VariableStorage::Register,
-                    type_name: infer_type_from_usage(image, instructions, reg, true),
-                    confidence: if profile == AnalysisProfile::Full {
+                    type_name: hint_arg
+                        .and_then(|arg| arg.type_name.clone())
+                        .or_else(|| infer_type_from_usage(image, instructions, reg, true)),
+                    confidence: if hint_arg.is_some() {
+                        0.9
+                    } else if profile == AnalysisProfile::Full {
                         0.8
                     } else {
                         0.65
@@ -9912,6 +9945,10 @@ fn build_hint_maps(
             by_name
                 .entry(hint.name.clone())
                 .or_insert_with(|| hint.clone());
+            let bare = hint.name.trim_start_matches('_').to_string();
+            if bare != hint.name {
+                by_name.entry(bare).or_insert_with(|| hint.clone());
+            }
         }
     }
     (by_addr, by_name)
@@ -10429,8 +10466,14 @@ mod tests {
             ],
         )];
 
-        let instructions =
-            decode_arm64_cfg_with_references(&code_regions, 0x1000, 0x1008, &[(0x1000, 0x1008)]).0;
+        let instructions = decode_arm64_cfg_with_references(
+            &code_regions,
+            0x1000,
+            0x1008,
+            &[(0x1000, 0x1008)],
+            AnalysisProfile::Fast,
+        )
+        .0;
 
         assert_eq!(instructions.len(), 1);
         assert_eq!(instructions[0].text.as_ref(), "ret");
@@ -10497,8 +10540,13 @@ mod tests {
         let region = CodeRegion::from_vec(0, so);
         let code_regions = [region];
         let executable = vec![(0xd68u64, 0x2594u64)];
-        let (insts, refs) =
-            decode_arm64_cfg_with_references(&code_regions, 0xd68, 0x2594, &executable);
+        let (insts, refs) = decode_arm64_cfg_with_references(
+            &code_regions,
+            0xd68,
+            0x2594,
+            &executable,
+            AnalysisProfile::Fast,
+        );
         let blocks = split_basic_blocks(0xd68, insts, &refs);
         let args = vec![];
         let t0 = std::time::Instant::now();
@@ -11279,8 +11327,13 @@ mod tests {
         bytes[16..20].copy_from_slice(&0xD65F03C0u32.to_le_bytes()); // ret
         let regions = vec![CodeRegion::from_vec(0xe00, bytes)];
         let executable = vec![(0xe00u64, 0xe14u64)];
-        let (instructions, references) =
-            decode_arm64_cfg_with_references(&regions, 0xe00, 0xe14, &executable);
+        let (instructions, references) = decode_arm64_cfg_with_references(
+            &regions,
+            0xe00,
+            0xe14,
+            &executable,
+            AnalysisProfile::Fast,
+        );
         assert!(
             references
                 .iter()
@@ -11311,8 +11364,13 @@ mod tests {
             0xc3, // 1010: ret
         ];
         let regions = vec![CodeRegion::from_vec(0x1000, bytes)];
-        let (instructions, references) =
-            decode_x64_cfg_with_references(&regions, 0x1000, 0x1020, &[(0x1000, 0x1020)]);
+        let (instructions, references) = decode_x64_cfg_with_references(
+            &regions,
+            0x1000,
+            0x1020,
+            &[(0x1000, 0x1020)],
+            AnalysisProfile::Fast,
+        );
         assert!(
             instructions.len() >= 5,
             "expected full CFG coverage, got {} insts: {:?}",

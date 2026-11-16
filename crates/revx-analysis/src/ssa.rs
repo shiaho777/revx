@@ -647,6 +647,10 @@ fn looks_like_got_slot_page(addr: u64) -> bool {
 
 fn format_mem_access(base_text: &str, offset: i64) -> String {
     let base_text = simplify_addr_expr(base_text);
+    let bare = base_text.strip_prefix('&').unwrap_or(base_text.as_str());
+    if let Some((kind, rel)) = parse_frame_slot_name(bare) {
+        return frame_slot_name(kind, rel.wrapping_add(offset));
+    }
     if let Some(name) = frame_slot_name_from_parts(&base_text, offset) {
         return name.to_string();
     }
@@ -701,7 +705,7 @@ fn format_mem_access(base_text: &str, offset: i64) -> String {
     }
 }
 
-fn frame_slot_name_from_parts(base_text: &str, offset: i64) -> Option<&'static str> {
+fn frame_slot_name_from_parts(base_text: &str, offset: i64) -> Option<String> {
     let raw = base_text.trim();
     let raw = if raw.starts_with('(') && raw.ends_with(')') && balanced_outer_parens(raw) {
         raw[1..raw.len() - 1].trim()
@@ -723,7 +727,42 @@ fn frame_slot_name_from_parts(base_text: &str, offset: i64) -> Option<&'static s
         "sp" | "x31" => "sp",
         _ => return None,
     };
-    let _ = (kind, base_off.wrapping_add(offset));
+    Some(frame_slot_name(kind, base_off.wrapping_add(offset)))
+}
+
+fn frame_slot_name(kind: &str, rel: i64) -> String {
+    if rel == 0 {
+        return format!("var_{kind}");
+    }
+    if rel < 0 {
+        format!("var_{kind}_m{:#x}", -rel)
+    } else {
+        format!("var_{kind}_p{rel:#x}")
+    }
+}
+
+fn parse_frame_slot_name(text: &str) -> Option<(&str, i64)> {
+    let t = text.trim();
+    if t == "var_sp" {
+        return Some(("sp", 0));
+    }
+    if t == "var_fp" {
+        return Some(("fp", 0));
+    }
+    let (kind, rest) = if let Some(r) = t.strip_prefix("var_sp_") {
+        ("sp", r)
+    } else {
+        let r = t.strip_prefix("var_fp_")?;
+        ("fp", r)
+    };
+    if let Some(hex) = rest.strip_prefix('m') {
+        let v = parse_hex_or_dec(hex)?;
+        return Some((kind, -v));
+    }
+    if let Some(hex) = rest.strip_prefix('p') {
+        let v = parse_hex_or_dec(hex)?;
+        return Some((kind, v));
+    }
     None
 }
 
@@ -733,6 +772,8 @@ fn is_stack_protector_guard(cond: &str) -> bool {
     let compact = cond.replace(' ', "");
     (compact.contains("[0x28]") && compact.contains("(x29-0x10)"))
         || (compact.contains("[0x28]") && compact.contains("(x29+0x10)"))
+        || (compact.contains("[0x28]") && compact.contains("var_fp_m0x10"))
+        || (compact.contains("[0x28]") && compact.contains("var_fp_p0x10"))
 }
 
 /// Self-assignment noise like `r_stack_chk_fail = r_stack_chk_fail;`
@@ -747,6 +788,9 @@ fn is_self_assignment(rendered: &str) -> bool {
 /// Callee-saved / argument spill into stack frame: `*(sp ± ...)(+ off) = x2x;`
 /// or `*(...)= arg_N;` — register-save prologue noise, never a real operation.
 fn is_callee_saved_spill(rendered: &str) -> bool {
+    if is_frame_prologue_noise(rendered) {
+        return true;
+    }
     let t = rendered.trim().trim_end_matches(';');
     let Some((lhs, rhs)) = t.split_once('=') else {
         return false;
@@ -777,6 +821,25 @@ fn is_callee_saved_reg(name: &str) -> bool {
         return false;
     };
     rest.parse::<u32>().is_ok_and(|n| (19..=29).contains(&n))
+}
+
+fn is_frame_prologue_noise(rendered: &str) -> bool {
+    let t = rendered.trim().trim_end_matches(';');
+    let Some((lhs, rhs)) = t.split_once('=') else {
+        return false;
+    };
+    let lhs = lhs.trim();
+    let rhs = rhs.trim();
+    if parse_frame_slot_name(lhs).is_none() {
+        return false;
+    }
+    if rhs == "x30" || rhs == "lr" || rhs == "fp" || is_callee_saved_reg(rhs) {
+        return true;
+    }
+    if rhs.contains("var_sp") || rhs.contains("var_fp") {
+        return true;
+    }
+    false
 }
 
 fn is_trivial_stack_prologue_store(rendered: &str) -> bool {
@@ -858,7 +921,11 @@ fn paren_expr(text: &str) -> String {
 }
 
 fn parse_addr_chain(text: &str) -> Option<(String, i64)> {
-    let mut s = text.trim().to_string();
+    let t = text.trim();
+    if let Some((kind, rel)) = parse_frame_slot_name(t) {
+        return Some((kind.to_string(), rel));
+    }
+    let mut s = t.to_string();
     let mut total: i64 = 0;
     let mut base = String::new();
     for _ in 0..16 {
@@ -1815,6 +1882,11 @@ fn lookup_reg_value_preferring_invariant(
     if let Some(id) = prefer_forward_pred_def(func, reg, block) {
         return Some(id);
     }
+    if matches!(normalize_reg(reg).as_str(), "sp" | "x29" | "fp")
+        && let Some(id) = reaching_def(func, reg, block)
+    {
+        return Some(id);
+    }
     // Global invariant only when every def is the same high constant.
     let mut found: Option<(SsaValueId, u64)> = None;
     let mut saw_def = false;
@@ -2698,6 +2770,7 @@ pub struct SsaFunction {
     pub defs: Vec<BlockDefMap>,
     pub case_labels: HashMap<BlockId, Vec<String>>,
     pub large: bool,
+    pub frame_offsets: HashMap<u64, i64>,
 }
 
 impl SsaFunction {
@@ -2711,6 +2784,7 @@ impl SsaFunction {
             defs: Vec::new(),
             case_labels: HashMap::new(),
             large: false,
+            frame_offsets: HashMap::new(),
         }
     }
 
@@ -2723,6 +2797,7 @@ impl SsaFunction {
             defs: Vec::new(),
             case_labels: HashMap::new(),
             large: false,
+            frame_offsets: HashMap::new(),
         }
     }
 
@@ -3170,13 +3245,29 @@ pub fn constant_propagation(func: &mut SsaFunction) {
         .map(|(i, c)| (SsaValueId(i as u32), *c))
         .collect();
 
-    for inst in &mut func.values {
-        replace_operands_with_constants(&mut inst.op, &const_map);
-        if let SsaOp::BinOp { kind, lhs, rhs } = &inst.op
+    let dom = if func.dom_tree.idom.is_empty() {
+        DominatorTree::compute(&func.cfg)
+    } else {
+        func.dom_tree.clone()
+    };
+    let mut ops: Vec<SsaOp> = func.values.iter().map(|inst| inst.op.clone()).collect();
+    for (idx, op) in ops.iter_mut().enumerate() {
+        let block = func.values[idx].block;
+        let local_map: HashMap<SsaValueId, Option<i64>> = const_map
+            .iter()
+            .filter(|(id, _)| {
+                func.values
+                    .get(id.0 as usize)
+                    .is_some_and(|def| dom.dominates(def.block, block))
+            })
+            .map(|(id, c)| (*id, *c))
+            .collect();
+        replace_operands_with_constants(op, &local_map);
+        if let SsaOp::BinOp { kind, lhs, rhs } = op
             && let (Operand::Constant(l), Operand::Constant(r)) = (lhs, rhs)
             && let Some(folded) = eval_binop(*kind, *l, *r)
         {
-            inst.op = SsaOp::Copy {
+            *op = SsaOp::Copy {
                 src: Operand::Constant(folded),
             };
             continue;
@@ -3184,7 +3275,7 @@ pub fn constant_propagation(func: &mut SsaFunction) {
         if let SsaOp::UnaryOp {
             kind,
             src: Operand::Constant(c),
-        } = &inst.op
+        } = op
         {
             let folded = match kind {
                 UnaryOpKind::Neg => c.checked_neg(),
@@ -3192,11 +3283,14 @@ pub fn constant_propagation(func: &mut SsaFunction) {
                 UnaryOpKind::Bswap => Some(c.swap_bytes()),
             };
             if let Some(value) = folded {
-                inst.op = SsaOp::Copy {
+                *op = SsaOp::Copy {
                     src: Operand::Constant(value),
                 };
             }
         }
+    }
+    for (inst, op) in func.values.iter_mut().zip(ops) {
+        inst.op = op;
     }
     copy_propagation(func);
 }
@@ -3603,6 +3697,8 @@ pub fn lift_arm64_to_ssa(
     } else {
         None
     };
+    forward_block_local_stores(&mut func);
+    forward_cross_block_stores(&mut func);
     if !large {
         rewrite_low_constant_mem_bases(&mut func);
         constant_propagation(&mut func);
@@ -3610,6 +3706,7 @@ pub fn lift_arm64_to_ssa(
     } else if blocks.len() <= 96 {
         light_constant_fold(&mut func);
     }
+    anchor_frame_mem_accesses(&mut func);
     if let (Some(t0), Some(t1), Some(t2), Some(t3), Some(t4), Some(t5)) = (t0, t1, t2, t3, t4, t5) {
         let t6 = std::time::Instant::now();
         eprintln!(
@@ -3629,6 +3726,243 @@ pub fn lift_arm64_to_ssa(
     }
 
     func
+}
+
+fn frame_relative_offset(
+    func: &SsaFunction,
+    op: &Operand,
+    block: BlockId,
+    depth: usize,
+) -> Option<i64> {
+    if depth > 16 {
+        return None;
+    }
+    match op {
+        Operand::Symbol(name) => {
+            let n = normalize_reg(name);
+            if !matches!(n.as_str(), "sp" | "x29" | "fp" | "x31") {
+                return None;
+            }
+            if let Some(id) = reaching_def(func, &n, block)
+                && let Some(rel) =
+                    frame_relative_offset(func, &Operand::Value(id), block, depth + 1)
+            {
+                return Some(rel);
+            }
+            Some(0)
+        }
+        Operand::Value(id) => frame_value_offset(func, *id, depth + 1),
+        _ => None,
+    }
+}
+
+fn frame_value_offset(func: &SsaFunction, id: SsaValueId, depth: usize) -> Option<i64> {
+    if depth > 16 {
+        return None;
+    }
+    let inst = func.values.get(id.0 as usize)?;
+    match &inst.op {
+        SsaOp::Copy { src } => frame_operand_offset(func, src, depth + 1),
+        SsaOp::BinOp {
+            kind: BinOpKind::Add,
+            lhs,
+            rhs,
+        } => {
+            if let Some(base) = frame_operand_offset(func, lhs, depth + 1)
+                && let Some(c) = resolve_const_operand_static(func, rhs)
+            {
+                return Some(base.wrapping_add(c));
+            }
+            if let Some(base) = frame_operand_offset(func, rhs, depth + 1)
+                && let Some(c) = resolve_const_operand_static(func, lhs)
+            {
+                return Some(base.wrapping_add(c));
+            }
+            None
+        }
+        SsaOp::BinOp {
+            kind: BinOpKind::Sub,
+            lhs,
+            rhs,
+        } => {
+            let base = frame_operand_offset(func, lhs, depth + 1)?;
+            let c = resolve_const_operand_static(func, rhs)?;
+            Some(base.wrapping_sub(c))
+        }
+        _ => None,
+    }
+}
+
+fn frame_operand_offset(func: &SsaFunction, op: &Operand, depth: usize) -> Option<i64> {
+    match op {
+        Operand::Symbol(name) => {
+            if matches!(normalize_reg(name).as_str(), "sp" | "x29" | "fp" | "x31") {
+                Some(0)
+            } else {
+                None
+            }
+        }
+        Operand::Value(id) => frame_value_offset(func, *id, depth + 1),
+        _ => None,
+    }
+}
+
+fn value_is_sp_derived(func: &SsaFunction, id: SsaValueId, depth: usize) -> bool {
+    if depth > 16 {
+        return false;
+    }
+    let Some(inst) = func.values.get(id.0 as usize) else {
+        return false;
+    };
+    match &inst.op {
+        SsaOp::Copy { src } => match src {
+            Operand::Symbol(name) => matches!(normalize_reg(name).as_str(), "sp" | "x31"),
+            Operand::Value(v) => value_is_sp_derived(func, *v, depth + 1),
+            _ => false,
+        },
+        SsaOp::BinOp { lhs, rhs, .. } => operand_is_sp_symbol(lhs) || operand_is_sp_symbol(rhs),
+        _ => false,
+    }
+}
+
+fn operand_is_sp_symbol(op: &Operand) -> bool {
+    matches!(op, Operand::Symbol(name) if matches!(normalize_reg(name).as_str(), "sp" | "x31"))
+}
+
+fn anchor_frame_mem_accesses(func: &mut SsaFunction) {
+    let mut updates: Vec<(SsaValueId, i64)> = Vec::new();
+    for inst in &func.values {
+        let addr = match &inst.op {
+            SsaOp::Store { addr, .. } | SsaOp::Load { addr } => addr,
+            _ => continue,
+        };
+        let Operand::Deref { base, offset } = addr else {
+            continue;
+        };
+        let rel = if let Some(&base_rel) = func.frame_offsets.get(&inst.source_addr) {
+            Some(base_rel.wrapping_add(*offset))
+        } else {
+            match base.as_ref() {
+                Operand::Symbol(_) => frame_relative_offset(func, base, inst.block, 0),
+                Operand::Value(id) => {
+                    if value_is_sp_derived(func, *id, 0) {
+                        None
+                    } else {
+                        frame_relative_offset(func, base, inst.block, 0)
+                    }
+                }
+                _ => None,
+            }
+            .map(|r| r.wrapping_add(*offset))
+        };
+        if let Some(rel) = rel {
+            updates.push((inst.id, rel));
+        }
+    }
+    for (id, rel) in updates {
+        if let Some(inst) = func.values.get_mut(id.0 as usize) {
+            match &mut inst.op {
+                SsaOp::Store { addr, .. } | SsaOp::Load { addr } => {
+                    *addr = Operand::Deref {
+                        base: Box::new(Operand::Symbol("sp".to_string())),
+                        offset: rel,
+                    };
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+fn forward_cross_block_stores(func: &mut SsaFunction) {
+    let mut updates: Vec<(SsaValueId, Operand)> = Vec::new();
+    for block in &func.cfg.blocks {
+        let preds = func.cfg.predecessors(block.id);
+        if preds.len() != 1 {
+            continue;
+        }
+        let pred = preds[0];
+        let mut slots: HashMap<i64, Operand> = HashMap::new();
+        if let Some(pb) = func.cfg.blocks.get(pred.0 as usize) {
+            for &iid in &pb.insts {
+                let Some(inst) = func.values.get(iid.0 as usize) else {
+                    continue;
+                };
+                match &inst.op {
+                    SsaOp::Store { addr, value } => {
+                        if let Some(off) = stack_slot_offset(func, addr) {
+                            slots.insert(off, value.clone());
+                        }
+                    }
+                    SsaOp::Call { .. } => slots.clear(),
+                    _ => {}
+                }
+            }
+        }
+        if slots.is_empty() {
+            continue;
+        }
+        let mut invalidated: HashSet<i64> = HashSet::new();
+        for &iid in &block.insts {
+            let Some(inst) = func.values.get(iid.0 as usize) else {
+                continue;
+            };
+            match &inst.op {
+                SsaOp::Store { addr, .. } => {
+                    if let Some(off) = stack_slot_offset(func, addr) {
+                        invalidated.insert(off);
+                    }
+                }
+                SsaOp::Call { .. } => break,
+                SsaOp::Load { addr } => {
+                    if let Some(off) = stack_slot_offset(func, addr)
+                        && !invalidated.contains(&off)
+                        && let Some(val) = slots.get(&off)
+                    {
+                        updates.push((iid, val.clone()));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    for (id, val) in updates {
+        if let Some(inst) = func.values.get_mut(id.0 as usize)
+            && matches!(inst.op, SsaOp::Load { .. })
+        {
+            inst.op = SsaOp::Copy { src: val };
+        }
+    }
+}
+
+fn forward_block_local_stores(func: &mut SsaFunction) {
+    let block_ids: Vec<BlockId> = func.cfg.blocks.iter().map(|b| b.id).collect();
+    for block in block_ids {
+        let inst_ids: Vec<SsaValueId> = func.cfg.block(block).insts.clone();
+        let mut slots: HashMap<i64, Operand> = HashMap::new();
+        for id in inst_ids {
+            let Some(inst) = func.values.get(id.0 as usize) else {
+                continue;
+            };
+            match &inst.op {
+                SsaOp::Store { addr, value } => {
+                    if let Some(off) = stack_slot_offset(func, addr) {
+                        slots.insert(off, value.clone());
+                    }
+                }
+                SsaOp::Load { addr } => {
+                    if let Some(off) = stack_slot_offset(func, addr)
+                        && let Some(val) = slots.get(&off).cloned()
+                        && let Some(inst) = func.values.get_mut(id.0 as usize)
+                    {
+                        inst.op = SsaOp::Copy { src: val };
+                    }
+                }
+                SsaOp::Call { .. } => slots.clear(),
+                _ => {}
+            }
+        }
+    }
 }
 
 fn light_constant_fold(func: &mut SsaFunction) {
@@ -4553,17 +4887,44 @@ fn lift_arm64_instruction(
         }
 
         // add reg, reg, reg  /  add reg, reg, #imm
-        "add" | "adds" => {
+        "add" => {
             lift_arm64_binop(text, BinOpKind::Add, block, func, addr);
         }
-        "sub" | "subs" => {
+        "adds" => {
+            lift_arm64_binop(text, BinOpKind::Add, block, func, addr);
+            if extract_dest_reg_ref(text).is_some() {
+                lift_arm64_flags_binop(text, BinOpKind::Add, block, func, addr);
+            } else {
+                lift_arm64_flags_op(text, BinOpKind::Add, block, func, addr);
+            }
+        }
+        "sub" => {
             lift_arm64_binop(text, BinOpKind::Sub, block, func, addr);
+        }
+        "subs" => {
+            lift_arm64_binop(text, BinOpKind::Sub, block, func, addr);
+            if extract_dest_reg_ref(text).is_some() {
+                lift_arm64_flags_binop(text, BinOpKind::Sub, block, func, addr);
+            } else {
+                lift_arm64_flags_op(text, BinOpKind::Sub, block, func, addr);
+            }
         }
         "mul" => {
             lift_arm64_binop(text, BinOpKind::Mul, block, func, addr);
         }
-        "and" | "ands" => {
+        "and" => {
             lift_arm64_binop(text, BinOpKind::And, block, func, addr);
+        }
+        "ands" => {
+            lift_arm64_binop(text, BinOpKind::And, block, func, addr);
+            if extract_dest_reg_ref(text).is_some() {
+                lift_arm64_flags_binop(text, BinOpKind::And, block, func, addr);
+            } else {
+                lift_arm64_flags_op(text, BinOpKind::And, block, func, addr);
+            }
+        }
+        "tst" => {
+            lift_arm64_flags_op(text, BinOpKind::And, block, func, addr);
         }
         "orr" => {
             lift_arm64_binop(text, BinOpKind::Or, block, func, addr);
@@ -5197,12 +5558,6 @@ fn parse_arm64_pair_mem(mem: &str) -> (Option<String>, i64, bool, bool) {
     {
         offset = imm;
     }
-    if post
-        && let Some(imm_part) = t.split("],").nth(1)
-        && let Some(imm) = parse_arm64_imm(imm_part.trim())
-    {
-        offset = imm;
-    }
     (base, offset, writeback, pre)
 }
 
@@ -5239,6 +5594,61 @@ fn lift_arm64_binop(
     };
 
     func.define(dst, block, SsaOp::BinOp { kind, lhs, rhs }, addr);
+}
+
+fn lift_arm64_flags_op(
+    text: &str,
+    kind: BinOpKind,
+    block: BlockId,
+    func: &mut SsaFunction,
+    addr: u64,
+) {
+    let Some(rest) = text.split_once(' ').map(|(_, r)| r) else {
+        return;
+    };
+    let mut parts = rest.split(',').map(str::trim);
+    let Some(src1) = parts.next() else {
+        return;
+    };
+    let Some(src2_raw) = parts.next() else {
+        return;
+    };
+    let lhs = lookup_or_symbol(func, src1, block);
+    let rhs = if let Some(imm) = parse_arm64_imm(src2_raw) {
+        Operand::Constant(imm)
+    } else {
+        let clean = src2_raw.split_whitespace().next().unwrap_or(src2_raw);
+        lookup_or_symbol(func, clean, block)
+    };
+    func.define("__cmp", block, SsaOp::BinOp { kind, lhs, rhs }, addr);
+}
+
+fn lift_arm64_flags_binop(
+    text: &str,
+    kind: BinOpKind,
+    block: BlockId,
+    func: &mut SsaFunction,
+    addr: u64,
+) {
+    let Some(rest) = text.split_once(' ').map(|(_, r)| r) else {
+        return;
+    };
+    let mut parts = rest.split(',').map(str::trim);
+    let _dst = parts.next();
+    let Some(src1) = parts.next() else {
+        return;
+    };
+    let Some(src2_raw) = parts.next() else {
+        return;
+    };
+    let lhs = lookup_or_symbol(func, src1, block);
+    let rhs = if let Some(imm) = parse_arm64_imm(src2_raw) {
+        Operand::Constant(imm)
+    } else {
+        let clean = src2_raw.split_whitespace().next().unwrap_or(src2_raw);
+        lookup_or_symbol(func, clean, block)
+    };
+    func.define("__cmp", block, SsaOp::BinOp { kind, lhs, rhs }, addr);
 }
 
 fn parse_tbz_bit(text: &str) -> Option<u32> {
@@ -5764,9 +6174,35 @@ fn resolve_operand_reg_symbol(operand: &mut Operand, func: &SsaFunction, block: 
             }
             false
         }
-        Operand::Deref { base, .. } => resolve_operand_reg_symbol(base, func, block),
+        Operand::Deref { base, offset } => {
+            let before = base.as_ref().clone();
+            if resolve_operand_reg_symbol(base, func, block) {
+                if let Operand::Value(vid) = base.as_ref()
+                    && let Some(delta) = frame_base_shift(func, &before, Operand::Value(*vid))
+                {
+                    *offset = offset.wrapping_sub(delta);
+                }
+                return true;
+            }
+            false
+        }
         _ => false,
     }
+}
+
+fn frame_base_shift(func: &SsaFunction, old: &Operand, new: Operand) -> Option<i64> {
+    let old_reg = match old {
+        Operand::Symbol(name) if looks_like_reg_name(name) => normalize_reg(name),
+        _ => return None,
+    };
+    if !matches!(old_reg.as_str(), "sp" | "x29" | "fp") {
+        return None;
+    }
+    let Operand::Value(id) = new else {
+        return None;
+    };
+    let block = func.values.get(id.0 as usize)?.block;
+    frame_relative_offset(func, &Operand::Value(id), block, 0)
 }
 
 fn looks_like_reg_name(name: &str) -> bool {
@@ -5806,8 +6242,15 @@ fn rewrite_operand_tree_depth(
                 *changed = true;
             }
         }
-        Operand::Deref { base, .. } => {
-            rewrite_operand_tree_depth(base, func, block, changed, depth + 1)
+        Operand::Deref { base, offset } => {
+            let before = base.as_ref().clone();
+            rewrite_operand_tree_depth(base, func, block, changed, depth + 1);
+            if *changed
+                && let Operand::Value(vid) = base.as_ref()
+                && let Some(delta) = frame_base_shift(func, &before, Operand::Value(*vid))
+            {
+                *offset = offset.wrapping_sub(delta);
+            }
         }
         _ => {}
     }
@@ -5824,9 +6267,13 @@ fn rewrite_low_constant_mem_bases(func: &mut SsaFunction) {
             continue;
         };
         let mut replacement: Option<Operand> = None;
+        let mut new_offset = *offset;
         match base.as_ref() {
             Operand::Symbol(reg) if looks_like_reg_name(reg) => {
                 if let Some(id) = lookup_reg_value_preferring_invariant(func, reg, inst.block) {
+                    if let Some(delta) = frame_base_shift(func, base, Operand::Value(id)) {
+                        new_offset = new_offset.wrapping_sub(delta);
+                    }
                     replacement = Some(Operand::Value(id));
                 }
             }
@@ -5844,7 +6291,7 @@ fn rewrite_low_constant_mem_bases(func: &mut SsaFunction) {
                 inst.id,
                 Operand::Deref {
                     base: Box::new(base_op),
-                    offset: *offset,
+                    offset: new_offset,
                 },
             ));
         }
@@ -5973,6 +6420,9 @@ fn arm64_mem_addr(func: &mut SsaFunction, block: BlockId, text: &str, addr: u64)
         return Operand::Symbol("unknown_addr".into());
     };
     let base_op = lookup_or_symbol(func, base_reg, block);
+    if let Some(rel) = frame_operand_offset(func, &base_op, 0) {
+        func.frame_offsets.insert(addr, rel);
+    }
     let Some((index_reg, shift)) = extract_mem_index_reg(text) else {
         return deref_operand(base_op, extract_mem_offset(text));
     };
@@ -6129,21 +6579,33 @@ fn materialize_flag_condition(
     let Some(kind) = arm64_cond_kind(opcode) else {
         return Operand::Symbol("cond".to_string());
     };
-    if let Some(cmp_id) = func.lookup("__cmp", block) {
+    let cmp_id = func
+        .lookup("__cmp", block)
+        .or_else(|| reaching_def(func, "__cmp", block));
+    if let Some(cmp_id) = cmp_id {
         if let Some(inst) = func.values.get(cmp_id.0 as usize)
             && let SsaOp::BinOp {
-                kind: BinOpKind::Sub,
+                kind: cmp_kind,
                 lhs,
                 rhs,
             } = &inst.op
         {
+            let (cond_lhs, cond_rhs) = if *cmp_kind == BinOpKind::And {
+                let eq_zero = matches!(kind, BinOpKind::Eq | BinOpKind::Le);
+                (
+                    Operand::Value(cmp_id),
+                    Operand::Constant(if eq_zero { 0 } else { 1 }),
+                )
+            } else {
+                (lhs.clone(), rhs.clone())
+            };
             let cond_id = func.define(
                 "__cond",
                 block,
                 SsaOp::BinOp {
                     kind,
-                    lhs: lhs.clone(),
-                    rhs: rhs.clone(),
+                    lhs: cond_lhs,
+                    rhs: cond_rhs,
                 },
                 addr,
             );
@@ -6408,6 +6870,23 @@ fn resolve_const_operand_depth(func: &SsaFunction, op: &Operand, depth: usize) -
             }
         }
         _ => None,
+    }
+}
+
+fn operand_is_stack_slot_value(func: &SsaFunction, op: &Operand) -> bool {
+    let Operand::Value(id) = op else {
+        return false;
+    };
+    let Some(inst) = func.values.get(id.0 as usize) else {
+        return false;
+    };
+    match &inst.op {
+        SsaOp::Load { addr } => stack_slot_offset(func, addr).is_some(),
+        SsaOp::Copy { src } => operand_is_stack_slot_value(func, src),
+        SsaOp::BinOp { lhs, rhs, .. } => {
+            operand_is_stack_slot_value(func, lhs) || operand_is_stack_slot_value(func, rhs)
+        }
+        _ => false,
     }
 }
 
@@ -7162,6 +7641,7 @@ struct RegionWalk<'a> {
     stop: Option<BlockId>,
     block_line: HashMap<BlockId, usize>,
     goto_targets: HashSet<BlockId>,
+    loop_head: Option<BlockId>,
 }
 
 const REGION_WALK_MAX_DEPTH: usize = 24;
@@ -7209,6 +7689,7 @@ impl<'a> RegionWalk<'a> {
             stop: None,
             block_line: HashMap::new(),
             goto_targets: HashSet::new(),
+            loop_head: None,
         }
     }
 
@@ -7218,6 +7699,9 @@ impl<'a> RegionWalk<'a> {
 
     fn emit_goto(&mut self, target: BlockId) {
         if self.stop == Some(target) || target == self.exit_id {
+            return;
+        }
+        if self.loop_head == Some(target) {
             return;
         }
         if let Some(lines) = self.android_log_return(target) {
@@ -7438,7 +7922,8 @@ impl<'a> RegionWalk<'a> {
         let body_start = if back == head { exit } else { head };
         let _ = body_start;
         self.lines.push(format!("    while ({cond}) {{"));
-        // body = blocks strictly between head and back along successor chain
+        let prev_head = self.loop_head;
+        self.loop_head = Some(head);
         let mut body_ok = true;
         if back != head {
             let chain = self.straight_chain(head, back);
@@ -7447,6 +7932,7 @@ impl<'a> RegionWalk<'a> {
                 body_ok = self.walk(back);
             }
         }
+        self.loop_head = prev_head;
         self.lines.push("    }".to_string());
         if !body_ok {
             return false;
@@ -8004,10 +8490,13 @@ impl<'a> RegionWalk<'a> {
             return self.finish_join(exit);
         }
         self.lines.push(format!("    while ({cond}) {{"));
+        let prev_head = self.loop_head;
+        self.loop_head = Some(head);
         let mut body_ok = true;
         if body != exit && !self.emitted.contains(&body) {
             body_ok = self.walk_loop_body(body, head);
         }
+        self.loop_head = prev_head;
         self.lines.push("    }".to_string());
         if !body_ok {
             return false;
@@ -8027,7 +8516,21 @@ impl<'a> RegionWalk<'a> {
         let Some((_, jump, branch)) = self.terminator(last) else {
             return false;
         };
-        if branch.is_some() {
+        if let Some((cond, t, f)) = branch {
+            let join = self.join_of(t, f);
+            if join != self.exit_id
+                && (join == head || self.dom_tree.dominates(head, join))
+                && self.dom_tree.dominates(head, t)
+                && self.dom_tree.dominates(head, f)
+            {
+                if !self.emit_if_else(last, &cond, t, f) {
+                    return false;
+                }
+                if join == head || self.emitted.contains(&join) {
+                    return true;
+                }
+                return self.walk_loop_body(join, head);
+            }
             return false;
         }
         match jump {
@@ -8626,6 +9129,9 @@ fn apply_call_result_cse(lines: &[String]) -> Vec<String> {
         }
         let mut rewritten = body.to_string();
         for (call_expr, name) in &bindings {
+            if !call_expr.contains('(') {
+                continue;
+            }
             if rewritten.contains(call_expr.as_str()) {
                 rewritten = rewritten.replace(call_expr.as_str(), name);
             }
@@ -13285,7 +13791,15 @@ fn polish_call_arg_operand(
         }
     }
     let text = render_operand_named_depth(func, operand, symbols, local_symbols, depth);
+    if let Some(addr_text) = text.strip_prefix('&')
+        && let Some((kind, rel)) = parse_frame_slot_name(addr_text)
+    {
+        return format!("&{}", frame_slot_name(kind, rel));
+    }
     if text.starts_with('&') {
+        return text;
+    }
+    if parse_frame_slot_name(&text).is_some() {
         return text;
     }
     if let Some((base, off)) = parse_addr_chain(&text)
@@ -14016,6 +14530,9 @@ fn render_named_value_depth_inner(
             }
             let l = render_operand_named_depth(func, lhs, symbols, local_symbols, depth + 1);
             let r = render_operand_named_depth(func, rhs, symbols, local_symbols, depth + 1);
+            if operand_is_stack_slot_value(func, lhs) || operand_is_stack_slot_value(func, rhs) {
+                return format!("({l} + {r})");
+            }
             simplify_addr_expr(&format!("({l} + {r})"))
         }
         SsaOp::BinOp { kind, lhs, rhs } => {
@@ -14047,6 +14564,12 @@ fn render_named_value_depth_inner(
                 | BinOpKind::Le
                 | BinOpKind::Gt
                 | BinOpKind::Ge => format!("{l} {op} {r}"),
+                BinOpKind::Add | BinOpKind::Sub
+                    if operand_is_stack_slot_value(func, lhs)
+                        || operand_is_stack_slot_value(func, rhs) =>
+                {
+                    format!("({l} {op} {r})")
+                }
                 BinOpKind::Add | BinOpKind::Sub => simplify_addr_expr(&format!("({l} {op} {r})")),
                 _ => format!("({l} {op} {r})"),
             }
@@ -15058,6 +15581,318 @@ mod string_call_tests {
     use super::*;
     use revx_core::{BasicBlock, Instruction, Reference, ReferenceKind};
     use std::sync::Arc;
+
+    fn golden_mk(addr: u64, text: &str) -> Instruction {
+        Instruction {
+            address: addr,
+            bytes: Arc::from("00"),
+            text: Arc::from(text),
+        }
+    }
+
+    fn golden_render(blocks: &[BasicBlock], refs: &[Reference]) -> String {
+        let ssa = lift_arm64_to_ssa(blocks, refs, &[]);
+        render_ssa_pseudocode_named_layered(&ssa, "probe", &[], &HashMap::new(), &HashMap::new())
+    }
+
+    #[test]
+    fn arm64_golden_classify_switch_conditions() {
+        let blocks = vec![
+            BasicBlock {
+                address: 0x5d0,
+                size: 0x14,
+                instructions: vec![
+                    golden_mk(0x5d0, "sub sp, sp, #0x10"),
+                    golden_mk(0x5d4, "str w0, [sp, #0x8]"),
+                    golden_mk(0x5d8, "ldr w8, [sp, #0x8]"),
+                    golden_mk(0x5dc, "str w8, [sp, #0x4]"),
+                    golden_mk(0x5e0, "cbz w8, 0x618"),
+                ],
+            },
+            BasicBlock {
+                address: 0x5e8,
+                size: 0xc,
+                instructions: vec![
+                    golden_mk(0x5e8, "ldr w8, [sp, #0x4]"),
+                    golden_mk(0x5ec, "subs w8, w8, #0x1"),
+                    golden_mk(0x5f0, "b.eq 0x624"),
+                ],
+            },
+            BasicBlock {
+                address: 0x5f8,
+                size: 0xc,
+                instructions: vec![
+                    golden_mk(0x5f8, "ldr w8, [sp, #0x4]"),
+                    golden_mk(0x5fc, "subs w8, w8, #0x2"),
+                    golden_mk(0x600, "b.eq 0x630"),
+                ],
+            },
+            BasicBlock {
+                address: 0x618,
+                size: 0xc,
+                instructions: vec![
+                    golden_mk(0x618, "mov w8, #0xa"),
+                    golden_mk(0x61c, "str w8, [sp, #0xc]"),
+                    golden_mk(0x620, "b 0x654"),
+                ],
+            },
+            BasicBlock {
+                address: 0x624,
+                size: 0xc,
+                instructions: vec![
+                    golden_mk(0x624, "mov w8, #0x14"),
+                    golden_mk(0x628, "str w8, [sp, #0xc]"),
+                    golden_mk(0x62c, "b 0x654"),
+                ],
+            },
+            BasicBlock {
+                address: 0x630,
+                size: 0xc,
+                instructions: vec![
+                    golden_mk(0x630, "mov w8, #0x1e"),
+                    golden_mk(0x634, "str w8, [sp, #0xc]"),
+                    golden_mk(0x638, "b 0x654"),
+                ],
+            },
+            BasicBlock {
+                address: 0x654,
+                size: 0xc,
+                instructions: vec![
+                    golden_mk(0x654, "ldr w0, [sp, #0xc]"),
+                    golden_mk(0x658, "add sp, sp, #0x10"),
+                    golden_mk(0x65c, "ret"),
+                ],
+            },
+        ];
+        let refs = vec![
+            Reference {
+                from: 0x5e0,
+                to: 0x618,
+                kind: ReferenceKind::BranchTrue,
+            },
+            Reference {
+                from: 0x5f0,
+                to: 0x624,
+                kind: ReferenceKind::BranchTrue,
+            },
+            Reference {
+                from: 0x600,
+                to: 0x630,
+                kind: ReferenceKind::BranchTrue,
+            },
+            Reference {
+                from: 0x620,
+                to: 0x654,
+                kind: ReferenceKind::Jump,
+            },
+            Reference {
+                from: 0x62c,
+                to: 0x654,
+                kind: ReferenceKind::Jump,
+            },
+            Reference {
+                from: 0x638,
+                to: 0x654,
+                kind: ReferenceKind::Jump,
+            },
+        ];
+        let text = golden_render(&blocks, &refs);
+        assert!(!text.contains("& var"), "{text}");
+        assert!(!text.contains("&var"), "{text}");
+        assert!(text.contains("== 1") || text.contains("== 0x1"), "{text}");
+        assert!(text.contains("var_sp_m0x4 = 0xa"), "{text}");
+        assert!(text.contains("var_sp_m0xc = x0"), "{text}");
+    }
+
+    #[test]
+    fn arm64_golden_subs_condition_operands() {
+        let blocks = vec![
+            BasicBlock {
+                address: 0x1000,
+                size: 0x8,
+                instructions: vec![
+                    golden_mk(0x1000, "subs w8, w9, #0x1"),
+                    golden_mk(0x1004, "b.eq 0x1010"),
+                ],
+            },
+            BasicBlock {
+                address: 0x1008,
+                size: 0x8,
+                instructions: vec![golden_mk(0x1008, "mov w0, #0x1"), golden_mk(0x100c, "ret")],
+            },
+            BasicBlock {
+                address: 0x1010,
+                size: 0x8,
+                instructions: vec![golden_mk(0x1010, "mov w0, #0x2"), golden_mk(0x1014, "ret")],
+            },
+        ];
+        let refs = vec![Reference {
+            from: 0x1004,
+            to: 0x1010,
+            kind: ReferenceKind::BranchTrue,
+        }];
+        let text = golden_render(&blocks, &refs);
+        assert!(!text.contains("cond"), "{text}");
+        assert!(
+            text.contains("x9 == 1") || text.contains("x9 == 0x1"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn arm64_golden_tst_condition() {
+        let blocks = vec![
+            BasicBlock {
+                address: 0x1000,
+                size: 0x8,
+                instructions: vec![
+                    golden_mk(0x1000, "tst w8, #0x1"),
+                    golden_mk(0x1004, "b.eq 0x1010"),
+                ],
+            },
+            BasicBlock {
+                address: 0x1008,
+                size: 0x8,
+                instructions: vec![golden_mk(0x1008, "mov w0, #0x1"), golden_mk(0x100c, "ret")],
+            },
+            BasicBlock {
+                address: 0x1010,
+                size: 0x8,
+                instructions: vec![golden_mk(0x1010, "mov w0, #0x2"), golden_mk(0x1014, "ret")],
+            },
+        ];
+        let refs = vec![Reference {
+            from: 0x1004,
+            to: 0x1010,
+            kind: ReferenceKind::BranchTrue,
+        }];
+        let text = golden_render(&blocks, &refs);
+        assert!(!text.contains("cond"), "{text}");
+        assert!(
+            text.contains("(x8 & 1) == 0") || text.contains("(x8 & 0x1) == 0"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn arm64_golden_cross_block_cmp_condition() {
+        let blocks = vec![
+            BasicBlock {
+                address: 0x1000,
+                size: 0x8,
+                instructions: vec![
+                    golden_mk(0x1000, "cmp w8, #0x0"),
+                    golden_mk(0x1004, "b 0x1008"),
+                ],
+            },
+            BasicBlock {
+                address: 0x1008,
+                size: 0x4,
+                instructions: vec![golden_mk(0x1008, "b.eq 0x1014")],
+            },
+            BasicBlock {
+                address: 0x100c,
+                size: 0x8,
+                instructions: vec![golden_mk(0x100c, "mov w0, #0x1"), golden_mk(0x1010, "ret")],
+            },
+            BasicBlock {
+                address: 0x1014,
+                size: 0x8,
+                instructions: vec![golden_mk(0x1014, "mov w0, #0x2"), golden_mk(0x1018, "ret")],
+            },
+        ];
+        let refs = vec![
+            Reference {
+                from: 0x1004,
+                to: 0x1008,
+                kind: ReferenceKind::Jump,
+            },
+            Reference {
+                from: 0x1008,
+                to: 0x1014,
+                kind: ReferenceKind::BranchTrue,
+            },
+        ];
+        let text = golden_render(&blocks, &refs);
+        assert!(!text.contains("cond"), "{text}");
+        assert!(text.contains("!x8") || text.contains("x8 == 0"), "{text}");
+    }
+
+    #[test]
+    fn arm64_pair_mem_post_index_offset_zero() {
+        let (base, offset, writeback, pre) = parse_arm64_pair_mem("[sp], #0x20");
+        assert_eq!(base.as_deref(), Some("sp"));
+        assert_eq!(offset, 0);
+        assert!(writeback);
+        assert!(!pre);
+        let (base, offset, writeback, pre) = parse_arm64_pair_mem("[sp, #-0x20]!");
+        assert_eq!(base.as_deref(), Some("sp"));
+        assert_eq!(offset, -0x20);
+        assert!(writeback);
+        assert!(pre);
+    }
+
+    #[test]
+    fn arm64_golden_ldp_post_index_return_slot() {
+        let blocks = vec![BasicBlock {
+            address: 0x1000,
+            size: 0x10,
+            instructions: vec![
+                golden_mk(0x1000, "str w9, [sp, #0x8]"),
+                golden_mk(0x1004, "ldr w0, [sp, #0x8]"),
+                golden_mk(0x1008, "ldp x29, x30, [sp], #0x20"),
+                golden_mk(0x100c, "ret"),
+            ],
+        }];
+        let text = golden_render(&blocks, &[]);
+        assert!(!text.contains("0x28"), "{text}");
+        assert!(text.contains("return x9;"), "{text}");
+    }
+
+    #[test]
+    fn arm64_golden_frame_slot_naming_unified() {
+        let blocks = vec![BasicBlock {
+            address: 0x1000,
+            size: 0x18,
+            instructions: vec![
+                golden_mk(0x1000, "stp x29, x30, [sp, #-0x20]!"),
+                golden_mk(0x1004, "mov x29, sp"),
+                golden_mk(0x1008, "str w8, [sp, #0x8]"),
+                golden_mk(0x100c, "ldr w9, [x29, #0x8]"),
+                golden_mk(0x1010, "mov w0, w9"),
+                golden_mk(0x1014, "ret"),
+            ],
+        }];
+        let text = golden_render(&blocks, &[]);
+        assert!(text.contains("var_sp_m0x18 = x8;"), "{text}");
+        assert!(!text.contains("= x30"), "{text}");
+        assert!(!text.contains("sp["), "{text}");
+        assert!(!text.contains("*(x29"), "{text}");
+        assert!(text.contains("return x8;"), "{text}");
+    }
+
+    #[test]
+    fn arm64_golden_frame_slot_alias_merged_with_fp_offset() {
+        let blocks = vec![BasicBlock {
+            address: 0x1000,
+            size: 0x18,
+            instructions: vec![
+                golden_mk(0x1000, "sub sp, sp, #0x20"),
+                golden_mk(0x1004, "add x29, sp, #0x10"),
+                golden_mk(0x1008, "str w8, [x29, #-0x4]"),
+                golden_mk(0x100c, "ldr w9, [sp, #0xc]"),
+                golden_mk(0x1010, "mov w0, w9"),
+                golden_mk(0x1014, "ret"),
+            ],
+        }];
+        let text = golden_render(&blocks, &[]);
+        assert!(text.contains("var_sp_m0x14 = x8;"), "{text}");
+        assert!(!text.contains("var_sp_p0xc"), "{text}");
+        assert!(
+            text.contains("return var_sp_m0x14;") || text.contains("return x8;"),
+            "{text}"
+        );
+    }
 
     #[test]
     fn arm64_ssa_char_range_condition_naturalizes() {

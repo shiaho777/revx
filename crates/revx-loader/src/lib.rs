@@ -4237,7 +4237,14 @@ fn import_debug_info(
 #[cfg(feature = "debug-info")]
 fn dwarf_import(path: &Path, bytes: &[u8], file: &object::File<'_>) -> DebugImportSummary {
     match dwarf_import_inner(path, bytes, file) {
-        Ok(summary) => summary,
+        Ok(summary) => {
+            if summary.status == DebugImportStatus::NotFound
+                && let Some(dsym_summary) = dwarf_import_from_dsym(path)
+            {
+                return dsym_summary;
+            }
+            summary
+        }
         Err(err) => DebugImportSummary {
             status: DebugImportStatus::Failed,
             source_kind: Some("dwarf".to_string()),
@@ -4256,6 +4263,36 @@ fn dwarf_import(path: &Path, bytes: &[u8], file: &object::File<'_>) -> DebugImpo
 }
 
 #[cfg(feature = "debug-info")]
+fn dwarf_import_from_dsym(path: &Path) -> Option<DebugImportSummary> {
+    let dsym = find_external_dsym(path)?;
+    let dwarf_dir = dsym.join("Contents").join("Resources").join("DWARF");
+    let entries = fs::read_dir(&dwarf_dir).ok()?;
+    for entry in entries.flatten() {
+        let candidate = entry.path();
+        if !candidate.is_file() {
+            continue;
+        }
+        let Ok(dsym_bytes) = fs::read(&candidate) else {
+            continue;
+        };
+        let Ok(dsym_file) = object::File::parse(&*dsym_bytes) else {
+            continue;
+        };
+        if let Ok(mut summary) = dwarf_import_inner(&candidate, &dsym_bytes, &dsym_file)
+            && summary.status == DebugImportStatus::Parsed
+        {
+            summary.source_kind = Some("dsym".to_string());
+            summary.artifact_path = Some(dsym.display().to_string());
+            summary
+                .notes
+                .push(format!("Loaded DWARF from dSYM {}", dsym.display()));
+            return Some(summary);
+        }
+    }
+    None
+}
+
+#[cfg(feature = "debug-info")]
 fn dwarf_import_inner(
     path: &Path,
     bytes: &[u8],
@@ -4268,7 +4305,12 @@ fn dwarf_import_inner(
     };
 
     let load_section = |id: SectionId| -> Result<Cow<'_, [u8]>> {
-        if let Some(section) = file.section_by_name(id.name()) {
+        let elf_name = id.name();
+        let macho_name = format!("__{}", elf_name.trim_start_matches('.'));
+        let section = file
+            .section_by_name(elf_name)
+            .or_else(|| file.section_by_name(&macho_name));
+        if let Some(section) = section {
             Ok(section.uncompressed_data().unwrap_or(Cow::Borrowed(&[])))
         } else {
             Ok(Cow::Borrowed(&[]))
@@ -4315,12 +4357,18 @@ fn dwarf_import_inner(
                 }
                 gimli::DW_TAG_subprogram => {
                     if let Some(name) = name.clone() {
-                        let address = attr_u64(entry.attr(gimli::DW_AT_low_pc)?);
+                        let address = attr_address(&dwarf, &unit, entry.attr(gimli::DW_AT_low_pc)?);
+                        let return_type = dwarf_type_name(&dwarf, &unit, entry)?;
+                        let calling_convention = match file.architecture() {
+                            object::Architecture::Aarch64 => "aapcs64",
+                            object::Architecture::X86_64 => "sysv_amd64",
+                            _ => "unknown",
+                        };
                         functions.push(DebugFunctionHint {
                             address,
                             name,
-                            return_type: None,
-                            calling_convention: Some("system_default_x64".to_string()),
+                            return_type,
+                            calling_convention: Some(calling_convention.to_string()),
                             arguments: Vec::new(),
                             locals: Vec::new(),
                             source_anchor,
@@ -4337,11 +4385,12 @@ fn dwarf_import_inner(
                         } else {
                             VariableRole::Local
                         };
+                        let type_name = dwarf_type_name(&dwarf, &unit, entry)?;
                         let variable = Variable {
                             name,
                             role,
                             storage: VariableStorage::Stack,
-                            type_name: None,
+                            type_name,
                             confidence: 0.9,
                             location: "debug".to_string(),
                             evidence_ids: Vec::new(),
@@ -5376,6 +5425,51 @@ fn dedupe_strings(mut strings: Vec<StringLiteral>) -> Vec<StringLiteral> {
 }
 
 #[cfg(feature = "debug-info")]
+fn dwarf_type_name<R: gimli::Reader>(
+    dwarf: &gimli::Dwarf<R>,
+    unit: &gimli::Unit<R>,
+    entry: &gimli::DebuggingInformationEntry<R>,
+) -> Result<Option<String>> {
+    let Some(attr) = entry.attr(gimli::DW_AT_type)? else {
+        return Ok(None);
+    };
+    let mut current = match attr.value() {
+        gimli::AttributeValue::UnitRef(off) => off,
+        _ => return Ok(None),
+    };
+    let mut suffix = String::new();
+    for _ in 0..16 {
+        let Ok(type_entry) = unit.entry(current) else {
+            return Ok(None);
+        };
+        match type_entry.tag() {
+            gimli::DW_TAG_pointer_type => suffix.push('*'),
+            gimli::DW_TAG_const_type => suffix.insert_str(0, "const "),
+            gimli::DW_TAG_volatile_type => suffix.insert_str(0, "volatile "),
+            gimli::DW_TAG_restrict_type => suffix.insert_str(0, "restrict "),
+            gimli::DW_TAG_base_type
+            | gimli::DW_TAG_typedef
+            | gimli::DW_TAG_structure_type
+            | gimli::DW_TAG_union_type
+            | gimli::DW_TAG_enumeration_type => {
+                let name = attr_string(dwarf, unit, type_entry.attr(gimli::DW_AT_name)?)?;
+                return Ok(name.map(|n| format!("{n}{suffix}")));
+            }
+            gimli::DW_TAG_subroutine_type => return Ok(Some(format!("fn{suffix}"))),
+            _ => {}
+        }
+        let Some(next) = type_entry.attr(gimli::DW_AT_type)? else {
+            return Ok(None);
+        };
+        match next.value() {
+            gimli::AttributeValue::UnitRef(off) => current = off,
+            _ => return Ok(None),
+        }
+    }
+    Ok(None)
+}
+
+#[cfg(feature = "debug-info")]
 fn attr_string<R: gimli::Reader>(
     dwarf: &gimli::Dwarf<R>,
     unit: &gimli::Unit<R>,
@@ -5401,6 +5495,23 @@ fn attr_u64<R: gimli::Reader>(attr: Option<gimli::Attribute<R>>) -> Option<u64> 
         gimli::AttributeValue::Data4(value) => Some(value as u64),
         gimli::AttributeValue::Data8(value) => Some(value),
         _ => None,
+    }
+}
+
+#[cfg(feature = "debug-info")]
+fn attr_address<R: gimli::Reader>(
+    dwarf: &gimli::Dwarf<R>,
+    unit: &gimli::Unit<R>,
+    attr: Option<gimli::Attribute<R>>,
+) -> Option<u64> {
+    let attr = attr?;
+    match attr.value() {
+        gimli::AttributeValue::Addr(value) => Some(value),
+        gimli::AttributeValue::DebugAddrIndex(index) => dwarf
+            .debug_addr
+            .get_address(unit.encoding().address_size, unit.addr_base, index)
+            .ok(),
+        _ => attr_u64(Some(attr)),
     }
 }
 
