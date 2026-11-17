@@ -8047,8 +8047,94 @@ fn sink_post_inc_while(lines: &[String]) -> Vec<String> {
     out
 }
 
+fn balanced_paren_spans(text: &str) -> Vec<(usize, usize)> {
+    let mut stack: Vec<usize> = Vec::new();
+    let mut spans = Vec::new();
+    for (i, ch) in text.char_indices() {
+        match ch {
+            '(' => stack.push(i),
+            ')' => {
+                if let Some(start) = stack.pop() {
+                    spans.push((start, i + 1));
+                }
+            }
+            _ => {}
+        }
+    }
+    spans
+}
+
+fn extract_common_subexpressions(lines: &[String]) -> Vec<String> {
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for line in lines {
+        if line.trim_start().starts_with("//") {
+            continue;
+        }
+        for (s, e) in balanced_paren_spans(line) {
+            let span = &line[s..e];
+            if span.len() < 24 {
+                continue;
+            }
+            let inner = &span[1..span.len() - 1];
+            if !inner.contains('?') && !inner.contains(" & ") && !inner.contains(" < ") {
+                continue;
+            }
+            *counts.entry(span.to_string()).or_insert(0) += 1;
+        }
+    }
+    let mut dups: Vec<String> = counts
+        .into_iter()
+        .filter(|(_, n)| *n >= 2)
+        .map(|(s, _)| s)
+        .collect();
+    dups.sort_by_key(|s| std::cmp::Reverse(s.len()));
+    let mut kept: Vec<String> = Vec::new();
+    for cand in dups {
+        if kept.iter().any(|k| k.contains(&cand)) {
+            continue;
+        }
+        kept.push(cand);
+        if kept.len() >= 4 {
+            break;
+        }
+    }
+    if kept.is_empty() {
+        return lines.to_vec();
+    }
+    let mut out: Vec<String> = Vec::new();
+    let mut declared: HashSet<String> = HashSet::new();
+    let mut next_id = 0usize;
+    let mut names: HashMap<String, String> = HashMap::new();
+    for line in lines {
+        if line.trim_start().starts_with("//") {
+            out.push(line.clone());
+            continue;
+        }
+        let indent: String = line.chars().take_while(|c| c.is_whitespace()).collect();
+        let mut current = line.clone();
+        for cand in &kept {
+            if !current.contains(cand.as_str()) {
+                continue;
+            }
+            let name = names.entry(cand.clone()).or_insert_with(|| {
+                let n = format!("cse_{next_id}");
+                next_id += 1;
+                n
+            });
+            if !declared.contains(cand) {
+                declared.insert(cand.clone());
+                out.push(format!("{indent}int {name} = {cand};"));
+            }
+            current = current.replace(cand.as_str(), name);
+        }
+        out.push(current);
+    }
+    out
+}
+
 fn polish_rendered_lines(lines: &[String]) -> Vec<String> {
     let lines = reindent_braces(&fold_same_target_gotos(&sink_post_inc_while(lines)));
+    let lines = extract_common_subexpressions(&lines);
     lines
         .iter()
         .filter(|line| {
@@ -16185,6 +16271,35 @@ mod string_call_tests {
         assert_eq!(out[0], "    r_sub_7440 = sub_7440(arg_0);");
         assert_eq!(out[1], "    if ((r_sub_7440 & 1) != 0) goto bb4;");
         assert_eq!(out[2], "    r_sub_62e0 = sub_62e0(r_sub_7440);");
+    }
+
+    #[test]
+    fn expr_cse_extracts_repeated_long_ternary() {
+        let expr = "((0 < r_atoi ? (r_atoi & 3) : -(-r_atoi & 3)) < 4 ? 0xa : -1)";
+        let lines = vec![
+            format!("    var_sp_m0x38 = {expr};"),
+            format!("    _printf(\"v=%d\", {expr});"),
+        ];
+        let out = extract_common_subexpressions(&lines);
+        assert!(out.iter().any(|l| l.contains("int cse_0 = ")), "{out:?}");
+        assert!(
+            out.iter().any(|l| l.trim() == "var_sp_m0x38 = cse_0;"),
+            "{out:?}"
+        );
+        assert!(
+            out.iter().any(|l| l.contains("_printf(\"v=%d\", cse_0);")),
+            "{out:?}"
+        );
+    }
+
+    #[test]
+    fn expr_cse_keeps_unique_expressions() {
+        let lines = vec![
+            "    a = (x < 4 ? (y & 3) : -1);".to_string(),
+            "    b = (z < 4 ? (w & 3) : -1);".to_string(),
+        ];
+        let out = extract_common_subexpressions(&lines);
+        assert_eq!(out, lines);
     }
 
     #[test]
