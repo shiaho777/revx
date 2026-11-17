@@ -5008,6 +5008,45 @@ fn lift_arm64_instruction(
                 lift_arm64_flags_op(text, BinOpKind::Sub, block, func, addr);
             }
         }
+        "neg" | "negs" => {
+            if let Some(dst) = extract_dest_reg_ref(text) {
+                let parts: Vec<&str> = text.split(',').map(str::trim).collect();
+                if parts.len() >= 2 {
+                    let src_reg = parts[1].split_whitespace().next().unwrap_or(parts[1]);
+                    let src = lookup_or_symbol(func, src_reg, block);
+                    let id = func.new_value_id();
+                    func.values.push(SsaInstruction {
+                        id,
+                        op: SsaOp::UnaryOp {
+                            kind: UnaryOpKind::Neg,
+                            src: src.clone(),
+                        },
+                        source_addr: addr,
+                        block,
+                    });
+                    func.define(
+                        dst,
+                        block,
+                        SsaOp::Copy {
+                            src: Operand::Value(id),
+                        },
+                        addr,
+                    );
+                    if text.starts_with("negs") {
+                        func.define(
+                            "__cmp",
+                            block,
+                            SsaOp::BinOp {
+                                kind: BinOpKind::Sub,
+                                lhs: Operand::Constant(0),
+                                rhs: src,
+                            },
+                            addr,
+                        );
+                    }
+                }
+            }
+        }
         "mul" => {
             lift_arm64_binop(text, BinOpKind::Mul, block, func, addr);
         }
@@ -16600,6 +16639,41 @@ mod string_call_tests {
         assert!(text.contains("-1"), "{text}");
         assert!(!text.contains("xzr"), "{text}");
         assert!(!text.contains("~"), "{text}");
+    }
+
+    #[test]
+    fn arm64_golden_negs_csneg_condition() {
+        let blocks = vec![BasicBlock {
+            address: 0x1000,
+            size: 0x14,
+            instructions: vec![
+                golden_mk(0x1000, "negs w8, w0"),
+                golden_mk(0x1004, "and w8, w8, #0x3"),
+                golden_mk(0x1008, "and w9, w0, #0x3"),
+                golden_mk(0x100c, "csneg w0, w9, w8, mi"),
+                golden_mk(0x1010, "ret"),
+            ],
+        }];
+        let args = vec![revx_core::Variable {
+            name: "n".to_string(),
+            role: revx_core::VariableRole::Argument,
+            storage: revx_core::VariableStorage::Register,
+            type_name: Some("int".to_string()),
+            confidence: 0.9,
+            location: "x0".to_string(),
+            evidence_ids: vec![],
+        }];
+        let ssa = lift_arm64_to_ssa(&blocks, &[], &args);
+        let text = render_ssa_pseudocode_named_layered(
+            &ssa,
+            "probe",
+            &args,
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        eprintln!("NEGS_TEXT:\n{text}");
+        assert!(text.contains('?'), "{text}");
+        assert!(!text.contains("cond"), "{text}");
     }
 
     #[test]
