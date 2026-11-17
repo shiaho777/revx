@@ -15001,6 +15001,87 @@ fn render_phi_as_store_expr(
     }
 }
 
+fn loop_backedge_name_map(func: &SsaFunction) -> HashMap<u32, String> {
+    let mut map = HashMap::new();
+    for (phi_id, name) in &func.loop_var_names {
+        let Some(inst) = func.values.get(*phi_id as usize) else {
+            continue;
+        };
+        let SsaOp::Phi { incoming } = &inst.op else {
+            continue;
+        };
+        for (pred, val) in incoming {
+            if *pred == inst.block {
+                map.insert(val.0, name.clone());
+            }
+        }
+    }
+    map
+}
+
+fn value_tree_loop_var(
+    func: &SsaFunction,
+    id: SsaValueId,
+    map: &HashMap<u32, String>,
+    depth: usize,
+) -> Option<String> {
+    if depth > 6 {
+        return None;
+    }
+    if let Some(n) = map.get(&id.0) {
+        return Some(n.clone());
+    }
+    let inst = func.values.get(id.0 as usize)?;
+    if matches!(inst.op, SsaOp::Phi { .. } | SsaOp::Call { .. }) {
+        return None;
+    }
+    let mut used = Vec::new();
+    collect_used_operands_vec(&inst.op, &mut used);
+    let mut found: Option<String> = None;
+    for v in used {
+        if let Some(n) = value_tree_loop_var(func, v, map, depth + 1) {
+            match &found {
+                None => found = Some(n),
+                Some(prev) if *prev == n => {}
+                Some(_) => return None,
+            }
+        }
+    }
+    found
+}
+
+fn phi_inherited_loop_var(
+    func: &SsaFunction,
+    incoming: &[(BlockId, SsaValueId)],
+) -> Option<String> {
+    let map = loop_backedge_name_map(func);
+    if map.is_empty() {
+        return None;
+    }
+    let mut name: Option<String> = None;
+    let mut saw_named = false;
+    for (_, vid) in incoming {
+        if let Some(inst) = func.values.get(vid.0 as usize)
+            && matches!(
+                inst.op,
+                SsaOp::Copy {
+                    src: Operand::Constant(_)
+                }
+            )
+        {
+            continue;
+        }
+        let resolved = value_tree_loop_var(func, *vid, &map, 0)?;
+        saw_named = true;
+        match &name {
+            None => name = Some(resolved),
+            Some(prev) if *prev == resolved => {}
+            Some(_) => return None,
+        }
+    }
+    if saw_named { name } else { None }
+}
+
 fn phi_common_render(
     func: &SsaFunction,
     incoming: &[(BlockId, SsaValueId)],
@@ -15139,6 +15220,9 @@ fn render_named_value_depth_inner(
         SsaOp::Phi { incoming } => {
             if let Some(name) = func.loop_var_names.get(&id.0) {
                 return name.clone();
+            }
+            if let Some(name) = phi_inherited_loop_var(func, incoming) {
+                return name;
             }
             if let Some(common) = phi_common_render(func, incoming, symbols, local_symbols) {
                 return common;
@@ -16889,6 +16973,96 @@ mod string_call_tests {
         assert!(text.contains("var_x8 = "), "{text}");
         assert!(text.contains("var_x9 = "), "{text}");
         assert!(text.contains("return var_x8;"), "{text}");
+        assert!(!text.contains("phi_"), "{text}");
+    }
+
+    #[test]
+    fn arm64_golden_join_phi_inherits_loop_var() {
+        let blocks = vec![
+            BasicBlock {
+                address: 0x1000,
+                size: 0x8,
+                instructions: vec![
+                    golden_mk(0x1000, "cmp w0, #0x1"),
+                    golden_mk(0x1004, "b.ge 0x1010"),
+                ],
+            },
+            BasicBlock {
+                address: 0x1008,
+                size: 0x8,
+                instructions: vec![
+                    golden_mk(0x1008, "mov w19, #0x0"),
+                    golden_mk(0x100c, "b 0x102c"),
+                ],
+            },
+            BasicBlock {
+                address: 0x1010,
+                size: 0x8,
+                instructions: vec![
+                    golden_mk(0x1010, "mov w19, #0x0"),
+                    golden_mk(0x1014, "mov w8, #0x0"),
+                ],
+            },
+            BasicBlock {
+                address: 0x1018,
+                size: 0x14,
+                instructions: vec![
+                    golden_mk(0x1018, "add w9, w19, w8"),
+                    golden_mk(0x101c, "lsl w10, w19, #1"),
+                    golden_mk(0x1020, "tst w8, #0x1"),
+                    golden_mk(0x1024, "csel w19, w9, w10, eq"),
+                    golden_mk(0x1028, "add w8, w8, #0x1"),
+                    golden_mk(0x102c, "cmp w0, w8"),
+                    golden_mk(0x1030, "b.ne 0x1018"),
+                ],
+            },
+            BasicBlock {
+                address: 0x1034,
+                size: 0x8,
+                instructions: vec![golden_mk(0x1034, "mov w0, w19"), golden_mk(0x1038, "ret")],
+            },
+        ];
+        let refs = vec![
+            Reference {
+                from: 0x1004,
+                to: 0x1010,
+                kind: ReferenceKind::BranchTrue,
+            },
+            Reference {
+                from: 0x100c,
+                to: 0x1034,
+                kind: ReferenceKind::Jump,
+            },
+            Reference {
+                from: 0x1030,
+                to: 0x1018,
+                kind: ReferenceKind::BranchTrue,
+            },
+        ];
+        let args = vec![revx_core::Variable {
+            name: "n".to_string(),
+            role: revx_core::VariableRole::Argument,
+            storage: revx_core::VariableStorage::Register,
+            type_name: Some("int".to_string()),
+            confidence: 0.9,
+            location: "x0".to_string(),
+            evidence_ids: vec![],
+        }];
+        let ssa = lift_arm64_to_ssa(&blocks, &refs, &args);
+        let text = render_ssa_pseudocode_named_layered(
+            &ssa,
+            "probe",
+            &args,
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        eprintln!("JOIN_PHI_TEXT:\n{text}");
+        assert!(text.contains("while ("), "{text}");
+        assert!(text.contains("var_x19 = "), "{text}");
+        assert!(
+            text.contains("return var_x19;") || text.contains("return x19;"),
+            "{text}"
+        );
         assert!(!text.contains("phi_"), "{text}");
     }
 
