@@ -3708,6 +3708,7 @@ pub fn lift_arm64_to_ssa(
     if !large {
         rewrite_low_constant_mem_bases(&mut func);
         constant_propagation(&mut func);
+        fold_modulo_patterns(&mut func);
         dead_code_elimination(&mut func);
     } else if blocks.len() <= 96 {
         light_constant_fold(&mut func);
@@ -3857,6 +3858,71 @@ fn frame_operand_offset_inner(
             frame_value_offset_inner(func, *id, depth + 1, root)
         }
         _ => None,
+    }
+}
+
+fn fold_modulo_patterns(func: &mut SsaFunction) {
+    let mut updates: Vec<(SsaValueId, Operand, Operand)> = Vec::new();
+    for inst in &func.values {
+        let SsaOp::BinOp {
+            kind: BinOpKind::Sub,
+            lhs,
+            rhs,
+        } = &inst.op
+        else {
+            continue;
+        };
+        let Operand::Value(prod_id) = rhs else {
+            continue;
+        };
+        let Some(prod) = func.values.get(prod_id.0 as usize) else {
+            continue;
+        };
+        let SsaOp::BinOp {
+            kind: BinOpKind::Mul,
+            lhs: mul_lhs,
+            rhs: mul_rhs,
+        } = &prod.op
+        else {
+            continue;
+        };
+        let (div_op, divisor) = match (mul_lhs, mul_rhs) {
+            (Operand::Value(d), other) => (d, other),
+            (other, Operand::Value(d)) => (d, other),
+            _ => continue,
+        };
+        let Some(div) = func.values.get(div_op.0 as usize) else {
+            continue;
+        };
+        let SsaOp::BinOp {
+            kind: BinOpKind::Div,
+            lhs: div_lhs,
+            rhs: div_rhs,
+        } = &div.op
+        else {
+            continue;
+        };
+        if operands_equal(div_lhs, lhs) && operands_equal(div_rhs, divisor) {
+            updates.push((inst.id, lhs.clone(), divisor.clone()));
+        }
+    }
+    for (id, a, b) in updates {
+        if let Some(inst) = func.values.get_mut(id.0 as usize) {
+            inst.op = SsaOp::BinOp {
+                kind: BinOpKind::Mod,
+                lhs: a,
+                rhs: b,
+            };
+        }
+    }
+}
+
+fn operands_equal(a: &Operand, b: &Operand) -> bool {
+    match (a, b) {
+        (Operand::Constant(x), Operand::Constant(y)) => x == y,
+        (Operand::Value(x), Operand::Value(y)) => x == y,
+        (Operand::Symbol(x), Operand::Symbol(y)) => normalize_reg(x) == normalize_reg(y),
+        _ => false,
     }
 }
 
@@ -4937,6 +5003,15 @@ fn lift_arm64_instruction(
         "mul" => {
             lift_arm64_binop(text, BinOpKind::Mul, block, func, addr);
         }
+        "sdiv" | "udiv" => {
+            lift_arm64_binop(text, BinOpKind::Div, block, func, addr);
+        }
+        "msub" => {
+            lift_arm64_msub(text, block, func, addr);
+        }
+        "madd" => {
+            lift_arm64_madd(text, block, func, addr);
+        }
         "and" => {
             lift_arm64_binop(text, BinOpKind::And, block, func, addr);
         }
@@ -5619,6 +5694,92 @@ fn lift_arm64_binop(
     };
 
     func.define(dst, block, SsaOp::BinOp { kind, lhs, rhs }, addr);
+}
+
+fn lift_arm64_msub(text: &str, block: BlockId, func: &mut SsaFunction, addr: u64) {
+    let Some(dst) = extract_dest_reg_ref(text) else {
+        return;
+    };
+    let Some((_, rest)) = text.split_once(' ') else {
+        return;
+    };
+    let mut parts = rest.split(',').map(str::trim);
+    let _dst_tok = parts.next();
+    let Some(wn) = parts.next() else {
+        return;
+    };
+    let Some(wm) = parts.next() else {
+        return;
+    };
+    let Some(wa) = parts.next() else {
+        return;
+    };
+    let n = lookup_or_symbol(func, wn, block);
+    let m = lookup_or_symbol(func, wm, block);
+    let a = lookup_or_symbol(func, wa, block);
+    let prod = func.define(
+        "__msub_prod",
+        block,
+        SsaOp::BinOp {
+            kind: BinOpKind::Mul,
+            lhs: n,
+            rhs: m,
+        },
+        addr,
+    );
+    func.define(
+        dst,
+        block,
+        SsaOp::BinOp {
+            kind: BinOpKind::Sub,
+            lhs: a,
+            rhs: Operand::Value(prod),
+        },
+        addr,
+    );
+}
+
+fn lift_arm64_madd(text: &str, block: BlockId, func: &mut SsaFunction, addr: u64) {
+    let Some(dst) = extract_dest_reg_ref(text) else {
+        return;
+    };
+    let Some((_, rest)) = text.split_once(' ') else {
+        return;
+    };
+    let mut parts = rest.split(',').map(str::trim);
+    let _dst_tok = parts.next();
+    let Some(wn) = parts.next() else {
+        return;
+    };
+    let Some(wm) = parts.next() else {
+        return;
+    };
+    let Some(wa) = parts.next() else {
+        return;
+    };
+    let n = lookup_or_symbol(func, wn, block);
+    let m = lookup_or_symbol(func, wm, block);
+    let a = lookup_or_symbol(func, wa, block);
+    let prod = func.define(
+        "__madd_prod",
+        block,
+        SsaOp::BinOp {
+            kind: BinOpKind::Mul,
+            lhs: n,
+            rhs: m,
+        },
+        addr,
+    );
+    func.define(
+        dst,
+        block,
+        SsaOp::BinOp {
+            kind: BinOpKind::Add,
+            lhs: a,
+            rhs: Operand::Value(prod),
+        },
+        addr,
+    );
 }
 
 fn lift_arm64_flags_op(
@@ -15889,6 +16050,39 @@ mod string_call_tests {
         assert!(text.contains("while ("), "{text}");
         assert!(text.contains("if ("), "{text}");
         assert!(!text.contains("goto"), "{text}");
+    }
+
+    #[test]
+    fn arm64_golden_modulo_pattern_folds() {
+        let blocks = vec![BasicBlock {
+            address: 0x1000,
+            size: 0x18,
+            instructions: vec![
+                golden_mk(0x1000, "mov w10, #0x4"),
+                golden_mk(0x1004, "sdiv w9, w0, w10"),
+                golden_mk(0x1008, "mul w9, w9, w10"),
+                golden_mk(0x100c, "subs w0, w0, w9"),
+                golden_mk(0x1010, "ret"),
+            ],
+        }];
+        let args = vec![revx_core::Variable {
+            name: "x".to_string(),
+            role: revx_core::VariableRole::Argument,
+            storage: revx_core::VariableStorage::Register,
+            type_name: Some("int".to_string()),
+            confidence: 0.9,
+            location: "x0".to_string(),
+            evidence_ids: vec![],
+        }];
+        let ssa = lift_arm64_to_ssa(&blocks, &[], &args);
+        let text = render_ssa_pseudocode_named_layered(
+            &ssa,
+            "probe",
+            &args,
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        assert!(text.contains('%'), "{text}");
     }
 
     #[test]
