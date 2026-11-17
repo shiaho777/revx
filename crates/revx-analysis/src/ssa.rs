@@ -8204,6 +8204,12 @@ impl<'a> RegionWalk<'a> {
             }
             return self.walk_chain(target);
         }
+        if let Some(&next) = self.func.cfg.successors(block).first()
+            && self.func.cfg.successors(block).len() == 1
+            && next != block
+        {
+            return self.walk_chain(next);
+        }
         true
     }
 
@@ -8469,6 +8475,15 @@ impl<'a> RegionWalk<'a> {
         self.push_arm(chain);
         for &block in chain {
             self.emitted.insert(block);
+        }
+        if let Some(&last) = chain.last()
+            && let Some(&next) = self.func.cfg.successors(last).first()
+            && next != join
+            && !self.emitted.contains(&next)
+            && self.self_loop(next).is_some()
+        {
+            self.emit_self_loop_at(next);
+            return self.finish_join(join);
         }
         if head != join
             && let Some(lines) = self.android_log_return(head)
@@ -16261,6 +16276,7 @@ mod string_call_tests {
         assert!(text.contains("<< 1") || text.contains("<< 0x1"), "{text}");
         assert!(text.contains("& 0x1") || text.contains("& 1"), "{text}");
         assert!(text.contains('?'), "{text}");
+        assert!(text.contains("while ("), "{text}");
     }
 
     #[test]
