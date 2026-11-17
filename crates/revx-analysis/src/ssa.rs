@@ -5521,23 +5521,71 @@ fn lift_arm64_instruction(
             }
         }
 
-        "csel" => {
+        "csel" | "csinv" | "csneg" | "csinc" | "cinc" | "cneg" => {
             if let Some(dst) = extract_dest_reg_ref(text) {
                 let parts: Vec<&str> = text.split(',').map(str::trim).collect();
                 if parts.len() >= 3 {
+                    let mnemonic = text.split_whitespace().next().unwrap_or("csel");
                     let t_reg = parts[1].split_whitespace().next().unwrap_or(parts[1]);
                     let f_reg = parts[2].split_whitespace().next().unwrap_or(parts[2]);
-                    let t_op = lookup_or_symbol(func, t_reg, block);
-                    let f_op = lookup_or_symbol(func, f_reg, block);
-                    let cond_str = parts.get(3).map(|s| s.trim()).unwrap_or("");
+                    let read_op = |func: &SsaFunction, reg: &str| {
+                        let nl = reg.to_ascii_lowercase();
+                        if nl == "xzr" || nl == "wzr" {
+                            Operand::Constant(0)
+                        } else {
+                            lookup_or_symbol(func, reg, block)
+                        }
+                    };
+                    let t_op = read_op(func, t_reg);
+                    let f_op = read_op(func, f_reg);
+                    let raw_cond = parts.get(3).map(|s| s.trim()).unwrap_or("");
+                    let inverted;
+                    let cond_str = if mnemonic == "cinc" || mnemonic == "cneg" {
+                        inverted = invert_arm64_cond(raw_cond);
+                        inverted.as_str()
+                    } else {
+                        raw_cond
+                    };
+                    let emit_unary = |func: &mut SsaFunction, kind, src| {
+                        let id = func.new_value_id();
+                        func.values.push(SsaInstruction {
+                            id,
+                            op: SsaOp::UnaryOp { kind, src },
+                            source_addr: addr,
+                            block,
+                        });
+                        Operand::Value(id)
+                    };
+                    let emit_inc = |func: &mut SsaFunction, src| {
+                        let id = func.new_value_id();
+                        func.values.push(SsaInstruction {
+                            id,
+                            op: SsaOp::BinOp {
+                                kind: BinOpKind::Add,
+                                lhs: src,
+                                rhs: Operand::Constant(1),
+                            },
+                            source_addr: addr,
+                            block,
+                        });
+                        Operand::Value(id)
+                    };
+                    let (true_val, false_val) = match mnemonic {
+                        "csinv" => (t_op, emit_unary(func, UnaryOpKind::Not, f_op)),
+                        "csneg" => (t_op, emit_unary(func, UnaryOpKind::Neg, f_op)),
+                        "csinc" => (t_op, emit_inc(func, f_op)),
+                        "cinc" => (emit_inc(func, t_op.clone()), t_op),
+                        "cneg" => (emit_unary(func, UnaryOpKind::Neg, t_op.clone()), t_op),
+                        _ => (t_op, f_op),
+                    };
                     let cond_op = materialize_flag_condition(func, block, cond_str, addr);
                     func.define(
                         dst,
                         block,
                         SsaOp::Select {
                             cond: cond_op,
-                            true_val: t_op,
-                            false_val: f_op,
+                            true_val,
+                            false_val,
                         },
                         addr,
                     );
@@ -6931,6 +6979,28 @@ fn arm64_cond_kind(opcode: &str) -> Option<BinOpKind> {
         "ge" | "hs" | "pl" => Some(BinOpKind::Ge),
         _ => None,
     }
+}
+
+fn invert_arm64_cond(cond: &str) -> String {
+    let code = cond.strip_prefix("b.").unwrap_or(cond);
+    let inv = match code {
+        "eq" => "ne",
+        "ne" => "eq",
+        "cs" | "hs" => "cc",
+        "cc" | "lo" => "cs",
+        "mi" => "pl",
+        "pl" => "mi",
+        "vs" => "vc",
+        "vc" => "vs",
+        "hi" => "ls",
+        "ls" => "hi",
+        "ge" => "lt",
+        "lt" => "ge",
+        "gt" => "le",
+        "le" => "gt",
+        _ => return cond.to_string(),
+    };
+    inv.to_string()
 }
 
 fn materialize_flag_condition(
@@ -16493,6 +16563,43 @@ mod string_call_tests {
         );
         eprintln!("CSEL_TEXT:\n{text}");
         assert!(text.contains('1') && text.contains('2'), "{text}");
+    }
+
+    #[test]
+    fn arm64_golden_csinv_zero_register() {
+        let blocks = vec![BasicBlock {
+            address: 0x1000,
+            size: 0x14,
+            instructions: vec![
+                golden_mk(0x1000, "mov w8, #0xa"),
+                golden_mk(0x1004, "madd w8, w0, w8, w8"),
+                golden_mk(0x1008, "cmp w0, #0x4"),
+                golden_mk(0x100c, "csinv w0, w8, wzr, lo"),
+                golden_mk(0x1010, "ret"),
+            ],
+        }];
+        let args = vec![revx_core::Variable {
+            name: "v".to_string(),
+            role: revx_core::VariableRole::Argument,
+            storage: revx_core::VariableStorage::Register,
+            type_name: Some("int".to_string()),
+            confidence: 0.9,
+            location: "x0".to_string(),
+            evidence_ids: vec![],
+        }];
+        let ssa = lift_arm64_to_ssa(&blocks, &[], &args);
+        let text = render_ssa_pseudocode_named_layered(
+            &ssa,
+            "probe",
+            &args,
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        eprintln!("CSINV_TEXT:\n{text}");
+        assert!(text.contains('?'), "{text}");
+        assert!(text.contains("-1"), "{text}");
+        assert!(!text.contains("xzr"), "{text}");
+        assert!(!text.contains("~"), "{text}");
     }
 
     #[test]
