@@ -387,6 +387,21 @@ impl<'a> RenderCtx<'a> {
                 let name = self.name_of(id);
                 format!("{name} = phi();")
             }
+            SsaOp::Select {
+                cond,
+                true_val,
+                false_val,
+            } => {
+                if self.emitted_defs.contains(&id) {
+                    return None;
+                }
+                self.emitted_defs.insert(id);
+                let name = self.name_of(id);
+                let c = self.operand_text(cond);
+                let t = self.operand_text(true_val);
+                let f = self.operand_text(false_val);
+                format!("{name} = ({c} ? {t} : {f});")
+            }
             SsaOp::Unknown => "// unknown".to_string(),
         };
         Some(line)
