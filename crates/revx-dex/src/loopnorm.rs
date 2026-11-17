@@ -473,6 +473,15 @@ pub(crate) fn remap_op_operands(op: &mut SsaOp, value_map: &HashMap<SsaValueId, 
             }
         }
         SsaOp::Branch { cond, .. } => *cond = remap_operand(cond, value_map),
+        SsaOp::Select {
+            cond,
+            true_val,
+            false_val,
+        } => {
+            *cond = remap_operand(cond, value_map);
+            *true_val = remap_operand(true_val, value_map);
+            *false_val = remap_operand(false_val, value_map);
+        }
         SsaOp::Jump { .. } | SsaOp::Phi { .. } | SsaOp::Unknown => {}
     }
 }

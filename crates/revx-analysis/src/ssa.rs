@@ -2130,6 +2130,12 @@ pub enum SsaOp {
     Phi {
         incoming: Vec<(BlockId, SsaValueId)>,
     },
+    /// Conditional select: `cond ? true_val : false_val` (csel)
+    Select {
+        cond: Operand,
+        true_val: Operand,
+        false_val: Operand,
+    },
     /// No-op / unknown instruction
     Unknown,
 }
@@ -2969,6 +2975,16 @@ impl SsaFunction {
         let inst = &self.values[id.0 as usize];
         let out = match &inst.op {
             SsaOp::Copy { src } => self.render_operand_depth(src, depth + 1, visiting, cache),
+            SsaOp::Select {
+                cond,
+                true_val,
+                false_val,
+            } => {
+                let c = self.render_operand_depth(cond, depth + 1, visiting, cache);
+                let t = self.render_operand_depth(true_val, depth + 1, visiting, cache);
+                let f = self.render_operand_depth(false_val, depth + 1, visiting, cache);
+                format!("({c} ? {t} : {f})")
+            }
             SsaOp::BinOp { kind, lhs, rhs } => {
                 let l = self.render_operand_depth(lhs, depth + 1, visiting, cache);
                 let r = self.render_operand_depth(rhs, depth + 1, visiting, cache);
@@ -5521,9 +5537,18 @@ fn lift_arm64_instruction(
                     let f_reg = parts[2].split_whitespace().next().unwrap_or(parts[2]);
                     let t_op = lookup_or_symbol(func, t_reg, block);
                     let f_op = lookup_or_symbol(func, f_reg, block);
-                    let cond = parts.get(3).map(|s| s.trim()).unwrap_or("");
-                    let preferred = prefer_csel_arm(func, &t_op, &f_op, cond);
-                    func.define(dst, block, SsaOp::Copy { src: preferred }, addr);
+                    let cond_str = parts.get(3).map(|s| s.trim()).unwrap_or("");
+                    let cond_op = materialize_flag_condition(func, block, cond_str, addr);
+                    func.define(
+                        dst,
+                        block,
+                        SsaOp::Select {
+                            cond: cond_op,
+                            true_val: t_op,
+                            false_val: f_op,
+                        },
+                        addr,
+                    );
                 }
             }
         }
@@ -5970,6 +5995,15 @@ fn collect_symbol_regs_hash(op: &SsaOp, regs: &mut HashSet<String>) {
             }
         }
         SsaOp::Branch { cond, .. } => add(cond),
+        SsaOp::Select {
+            cond,
+            true_val,
+            false_val,
+        } => {
+            add(cond);
+            add(true_val);
+            add(false_val);
+        }
         SsaOp::Phi { incoming } => {
             let _ = incoming;
         }
@@ -6972,41 +7006,6 @@ fn stack_slot_offset(func: &SsaFunction, addr: &Operand) -> Option<i64> {
         },
         _ => None,
     }
-}
-
-fn prefer_csel_arm(
-    func: &SsaFunction,
-    true_op: &Operand,
-    false_op: &Operand,
-    cond: &str,
-) -> Operand {
-    let cond = cond.trim().trim_start_matches('.').to_ascii_lowercase();
-    let t_is_add_of_false = match true_op {
-        Operand::Value(id) => match func.values.get(id.0 as usize).map(|i| &i.op) {
-            Some(SsaOp::BinOp {
-                kind: BinOpKind::Add,
-                lhs,
-                rhs,
-            }) => {
-                (operand_same_value(func, lhs, false_op)
-                    && resolve_const_operand_static(func, rhs).is_some())
-                    || (operand_same_value(func, rhs, false_op)
-                        && resolve_const_operand_static(func, lhs).is_some())
-            }
-            _ => false,
-        },
-        _ => false,
-    };
-    if t_is_add_of_false {
-        if matches!(cond.as_str(), "lt" | "le" | "mi" | "lo" | "ls") {
-            return true_op.clone();
-        }
-        if matches!(cond.as_str(), "ge" | "gt" | "pl" | "hs" | "hi") {
-            return false_op.clone();
-        }
-        return true_op.clone();
-    }
-    true_op.clone()
 }
 
 fn operand_same_value(func: &SsaFunction, a: &Operand, b: &Operand) -> bool {
@@ -13690,6 +13689,15 @@ fn collect_used_operands_vec(op: &SsaOp, used: &mut Vec<SsaValueId>) {
             }
         }
         SsaOp::Branch { cond, .. } => push(cond),
+        SsaOp::Select {
+            cond,
+            true_val,
+            false_val,
+        } => {
+            push(cond);
+            push(true_val);
+            push(false_val);
+        }
         SsaOp::Phi { incoming } => {
             for (_, v) in incoming {
                 used.push(*v);
@@ -16083,6 +16091,40 @@ mod string_call_tests {
             &HashMap::new(),
         );
         assert!(text.contains('%'), "{text}");
+    }
+
+    #[test]
+    fn arm64_golden_csel_renders_selection() {
+        let blocks = vec![BasicBlock {
+            address: 0x1000,
+            size: 0x14,
+            instructions: vec![
+                golden_mk(0x1000, "cmp w0, #0x0"),
+                golden_mk(0x1004, "mov w9, #0x1"),
+                golden_mk(0x1008, "mov w10, #0x2"),
+                golden_mk(0x100c, "csel w0, w9, w10, gt"),
+                golden_mk(0x1010, "ret"),
+            ],
+        }];
+        let args = vec![revx_core::Variable {
+            name: "x".to_string(),
+            role: revx_core::VariableRole::Argument,
+            storage: revx_core::VariableStorage::Register,
+            type_name: Some("int".to_string()),
+            confidence: 0.9,
+            location: "x0".to_string(),
+            evidence_ids: vec![],
+        }];
+        let ssa = lift_arm64_to_ssa(&blocks, &[], &args);
+        let text = render_ssa_pseudocode_named_layered(
+            &ssa,
+            "probe",
+            &args,
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        eprintln!("CSEL_TEXT:\n{text}");
+        assert!(text.contains('1') && text.contains('2'), "{text}");
     }
 
     #[test]
