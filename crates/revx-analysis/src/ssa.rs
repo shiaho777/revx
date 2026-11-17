@@ -8296,9 +8296,61 @@ fn extract_common_subexpressions(lines: &[String]) -> Vec<String> {
     out
 }
 
+fn collapse_empty_else(lines: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        let t = lines[i].trim();
+        if t == "} else {" && i + 1 < lines.len() && lines[i + 1].trim() == "}" {
+            out.push(lines[i].replace("} else {", "}"));
+            i += 2;
+            continue;
+        }
+        out.push(lines[i].clone());
+        i += 1;
+    }
+    out
+}
+
+fn drop_unreferenced_bb_comments(lines: &[String]) -> Vec<String> {
+    let has_structure = lines.iter().any(|l| {
+        let t = l.trim();
+        t.starts_with("while (") || t.starts_with("if (") || t.starts_with("} else")
+    });
+    if !has_structure {
+        return lines.to_vec();
+    }
+    let mut referenced: HashSet<String> = HashSet::new();
+    for line in lines {
+        let t = line.trim();
+        if let Some(rest) = t.strip_prefix("goto bb") {
+            let label: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if !label.is_empty() {
+                referenced.insert(format!("bb{label}"));
+            }
+        }
+    }
+    lines
+        .iter()
+        .filter(|line| {
+            let t = line.trim();
+            if let Some(rest) = t.strip_prefix("// bb") {
+                let label: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+                if !label.is_empty() && t.contains(" @ ") {
+                    return referenced.contains(&format!("bb{label}"));
+                }
+            }
+            true
+        })
+        .cloned()
+        .collect()
+}
+
 fn polish_rendered_lines(lines: &[String]) -> Vec<String> {
     let lines = reindent_braces(&fold_same_target_gotos(&sink_post_inc_while(lines)));
     let lines = extract_common_subexpressions(&lines);
+    let lines = collapse_empty_else(&lines);
+    let lines = drop_unreferenced_bb_comments(&lines);
     lines
         .iter()
         .filter(|line| {
@@ -14754,8 +14806,22 @@ fn store_is_stack_arg_for_call(func: &SsaFunction, store_id: SsaValueId) -> bool
     if !(0..0x20).contains(&off) {
         return false;
     }
+    let mut scan_blocks = vec![store_inst.block];
+    let mut cur = store_inst.block;
+    for _ in 0..4 {
+        let succs = func.cfg.successors(cur);
+        if succs.len() != 1 {
+            break;
+        }
+        let next = succs[0];
+        if next == cur || scan_blocks.contains(&next) {
+            break;
+        }
+        scan_blocks.push(next);
+        cur = next;
+    }
     for other in &func.values {
-        if other.id == store_id || other.block != store_inst.block {
+        if other.id == store_id || !scan_blocks.contains(&other.block) {
             continue;
         }
         if other.source_addr < store_inst.source_addr {
@@ -16548,6 +16614,49 @@ mod string_call_tests {
         ];
         let out = extract_common_subexpressions(&lines);
         assert_eq!(out, lines);
+    }
+
+    #[test]
+    fn polish_collapses_empty_else() {
+        let lines = vec![
+            "    if (x < 1) {".to_string(),
+            "        return 0;".to_string(),
+            "    } else {".to_string(),
+            "    }".to_string(),
+        ];
+        let out = collapse_empty_else(&lines);
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[2].trim(), "}");
+        assert!(!out.iter().any(|l| l.contains("else")));
+    }
+
+    #[test]
+    fn polish_drops_unreferenced_bb_comments_in_structured_output() {
+        let lines = vec![
+            "    while (x < 4) {".to_string(),
+            "        x = x + 1;".to_string(),
+            "    }".to_string(),
+            "    // bb3 @ 0x1024".to_string(),
+            "    return x;".to_string(),
+        ];
+        let out = drop_unreferenced_bb_comments(&lines);
+        assert!(!out.iter().any(|l| l.contains("// bb3")));
+        let with_goto = vec![
+            "    if (x) {".to_string(),
+            "        goto bb3;".to_string(),
+            "    }".to_string(),
+            "    // bb3 @ 0x1024".to_string(),
+            "    return x;".to_string(),
+        ];
+        let out2 = drop_unreferenced_bb_comments(&with_goto);
+        assert!(out2.iter().any(|l| l.contains("// bb3")));
+        let linear = vec![
+            "    return;".to_string(),
+            "    // bb1 @ 0x1000".to_string(),
+            "    return;".to_string(),
+        ];
+        let out3 = drop_unreferenced_bb_comments(&linear);
+        assert!(out3.iter().any(|l| l.contains("// bb1")));
     }
 
     #[test]
