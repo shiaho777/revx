@@ -3945,16 +3945,19 @@ fn anchor_frame_mem_accesses(func: &mut SsaFunction) {
         let Operand::Deref { base, offset } = addr else {
             continue;
         };
-        let recomputed = match base.as_ref() {
-            Operand::Symbol(_) => frame_relative_offset(func, base, inst.block, 0),
-            Operand::Value(_) => frame_relative_offset(func, base, inst.block, 0),
-            _ => None,
-        };
-        let rel = recomputed.map(|r| r.wrapping_add(*offset)).or_else(|| {
-            func.frame_offsets
-                .get(&inst.source_addr)
-                .map(|base_rel| base_rel.wrapping_add(*offset))
-        });
+        let rel = func
+            .frame_offsets
+            .get(&inst.source_addr)
+            .map(|base_rel| base_rel.wrapping_add(*offset))
+            .or_else(|| {
+                let recomputed = match base.as_ref() {
+                    Operand::Symbol(_) | Operand::Value(_) => {
+                        frame_relative_offset(func, base, inst.block, 0)
+                    }
+                    _ => None,
+                };
+                recomputed.map(|r| r.wrapping_add(*offset))
+            });
         if let Some(rel) = rel {
             updates.push((inst.id, rel));
         }
@@ -4271,6 +4274,12 @@ fn polish_switch_markers_with_map(
 }
 
 pub fn refine_call_arguments_with_symbols(func: &mut SsaFunction, symbols: &HashMap<u64, String>) {
+    RENDER_CODE_NAMES.with(|slot| {
+        let mut guard = slot.borrow_mut();
+        for (addr, name) in symbols {
+            guard.entry(*addr).or_insert_with(|| name.clone());
+        }
+    });
     let call_ids: Vec<SsaValueId> = func
         .values
         .iter()
@@ -4305,33 +4314,40 @@ pub fn refine_call_arguments_with_symbols(func: &mut SsaFunction, symbols: &Hash
             let mut cur_args = args.clone();
             if cur_args.len() <= min_args {
                 let mut stack_args: Vec<(i64, Operand)> = Vec::new();
-                let block_insts = func
-                    .cfg
-                    .blocks
-                    .get(call_block.0 as usize)
-                    .map(|b| b.insts.clone())
-                    .unwrap_or_default();
-                for &iid in &block_insts {
-                    let Some(prev) = func.values.get(iid.0 as usize) else {
-                        continue;
-                    };
-                    if prev.source_addr >= call_addr {
-                        continue;
-                    }
-                    if call_addr.saturating_sub(prev.source_addr) > 0x30 {
-                        continue;
-                    }
-                    let SsaOp::Store {
-                        addr: st_addr,
-                        value,
-                    } = &prev.op
-                    else {
-                        continue;
-                    };
-                    if let Some(off) = stack_slot_offset(func, st_addr)
-                        && (0..0x20).contains(&off)
+                let mut scan_blocks = vec![call_block];
+                for &pred in func.cfg.predecessors(call_block) {
+                    if pred != call_block
+                        && func.cfg.successors(pred).len() == 1
+                        && !scan_blocks.contains(&pred)
                     {
-                        stack_args.push((off, value.clone()));
+                        scan_blocks.push(pred);
+                    }
+                }
+                for scan_block in scan_blocks {
+                    let block_insts = func
+                        .cfg
+                        .blocks
+                        .get(scan_block.0 as usize)
+                        .map(|b| b.insts.clone())
+                        .unwrap_or_default();
+                    for &iid in &block_insts {
+                        let Some(prev) = func.values.get(iid.0 as usize) else {
+                            continue;
+                        };
+                        if prev.source_addr >= call_addr {
+                            continue;
+                        }
+                        if call_addr.saturating_sub(prev.source_addr) > 0x30 {
+                            continue;
+                        }
+                        let SsaOp::Store { value, .. } = &prev.op else {
+                            continue;
+                        };
+                        if let Some(off) = call_stack_slot_offset(func, prev)
+                            && (0..0x20).contains(&off)
+                        {
+                            stack_args.push((off, value.clone()));
+                        }
                     }
                 }
                 stack_args.sort_by_key(|(off, _)| *off);
@@ -4345,6 +4361,9 @@ pub fn refine_call_arguments_with_symbols(func: &mut SsaFunction, symbols: &Hash
             {
                 *args = cur_args;
             }
+            continue;
+        }
+        if is_variadic_call(&name) {
             continue;
         }
         let Some(max_args) = known_call_arg_count(&name) else {
@@ -5682,22 +5701,12 @@ fn lift_arm64_stp_ldp(
         return;
     };
     let base_op = lookup_or_symbol(func, &base_reg, block);
-    let addr0 = if pre {
-        match &base_op {
-            Operand::Symbol(s) if s == "sp" || s == "x31" => Operand::Deref {
-                base: Box::new(base_op.clone()),
-                offset,
-            },
-            _ => Operand::Deref {
-                base: Box::new(base_op.clone()),
-                offset,
-            },
-        }
-    } else {
-        Operand::Deref {
-            base: Box::new(base_op.clone()),
-            offset,
-        }
+    if let Some(rel) = frame_operand_offset(func, &base_op, 0) {
+        func.frame_offsets.insert(addr, rel);
+    }
+    let addr0 = Operand::Deref {
+        base: Box::new(base_op.clone()),
+        offset,
     };
     let addr1 = Operand::Deref {
         base: Box::new(if pre {
@@ -14486,10 +14495,10 @@ fn store_is_stack_arg_for_call(func: &SsaFunction, store_id: SsaValueId) -> bool
     let Some(store_inst) = func.values.get(store_id.0 as usize) else {
         return false;
     };
-    let SsaOp::Store { addr, value } = &store_inst.op else {
+    let SsaOp::Store { value, .. } = &store_inst.op else {
         return false;
     };
-    let Some(off) = stack_slot_offset(func, addr) else {
+    let Some(off) = call_stack_slot_offset(func, store_inst) else {
         return false;
     };
     if !(0..0x20).contains(&off) {
@@ -14505,7 +14514,7 @@ fn store_is_stack_arg_for_call(func: &SsaFunction, store_id: SsaValueId) -> bool
         if other.source_addr.saturating_sub(store_inst.source_addr) > 0x28 {
             continue;
         }
-        let SsaOp::Call { args, .. } = &other.op else {
+        let SsaOp::Call { target, args } = &other.op else {
             continue;
         };
         if args
@@ -14514,21 +14523,42 @@ fn store_is_stack_arg_for_call(func: &SsaFunction, store_id: SsaValueId) -> bool
         {
             return true;
         }
-        let name = match &other.op {
-            SsaOp::Call { target, .. } => match target {
-                Operand::Symbol(n) => n.as_str(),
-                _ => "",
-            },
-            _ => "",
-        };
-        if is_variadic_call(name)
-            && other.source_addr.saturating_sub(store_inst.source_addr) <= 0x18
-            && off == 0
+        if let Some(name) = call_target_bare_name(target)
+            && is_variadic_call(&name)
+            && other.source_addr.saturating_sub(store_inst.source_addr) <= 0x28
         {
             return true;
         }
     }
     false
+}
+
+fn call_stack_slot_offset(func: &SsaFunction, inst: &SsaInstruction) -> Option<i64> {
+    let addr = match &inst.op {
+        SsaOp::Store { addr, .. } | SsaOp::Load { addr } => addr,
+        _ => return None,
+    };
+    if let (Operand::Deref { base, offset }, Some(cap)) =
+        (addr, func.frame_offsets.get(&inst.source_addr))
+        && matches!(base.as_ref(), Operand::Symbol(n) if normalize_reg(n) == "sp")
+    {
+        return Some(offset.wrapping_sub(*cap));
+    }
+    stack_slot_offset(func, addr)
+}
+
+fn call_target_bare_name(target: &Operand) -> Option<String> {
+    match target {
+        Operand::Symbol(n) => {
+            if let Some(addr) = parse_sub_symbol_addr(n) {
+                lookup_code_name(addr).or_else(|| Some(n.clone()))
+            } else {
+                Some(n.clone())
+            }
+        }
+        Operand::Constant(c) if *c >= 0 => lookup_code_name(*c as u64),
+        _ => None,
+    }
 }
 
 fn render_call_target(
@@ -15188,6 +15218,14 @@ fn render_named_value_depth_inner(
             };
             let rhs = render_store_rhs(func, value, symbols, local_symbols, depth + 1);
             format!("{dst} = {rhs}")
+        }
+        SsaOp::UnaryOp { kind, src } => {
+            let inner = render_operand_named_depth(func, src, symbols, local_symbols, depth + 1);
+            match kind {
+                UnaryOpKind::Neg => format!("-{inner}"),
+                UnaryOpKind::Not => format!("~{inner}"),
+                UnaryOpKind::Bswap => format!("bswap({inner})"),
+            }
         }
         SsaOp::BinOp {
             kind: BinOpKind::Add,
@@ -16737,6 +16775,57 @@ mod string_call_tests {
         assert!(text.contains("var_x9 = "), "{text}");
         assert!(text.contains("return var_x8;"), "{text}");
         assert!(!text.contains("phi_"), "{text}");
+    }
+
+    #[test]
+    fn arm64_golden_variadic_cross_block_stack_args() {
+        let blocks = vec![
+            BasicBlock {
+                address: 0x1000,
+                size: 0x14,
+                instructions: vec![
+                    golden_mk(0x1000, "sub sp, sp, #0x20"),
+                    golden_mk(0x1004, "mov w19, #0x7"),
+                    golden_mk(0x1008, "mov w20, #0x9"),
+                    golden_mk(0x100c, "stp x19, x20, [sp]"),
+                    golden_mk(0x1010, "b 0x1014"),
+                ],
+            },
+            BasicBlock {
+                address: 0x1014,
+                size: 0x10,
+                instructions: vec![
+                    golden_mk(0x1014, "adrp x0, 0x2000"),
+                    golden_mk(0x1018, "add x0, x0, #0x10"),
+                    golden_mk(0x101c, "bl 0x3000"),
+                    golden_mk(0x1020, "ret"),
+                ],
+            },
+        ];
+        let refs = vec![
+            Reference {
+                from: 0x1010,
+                to: 0x1014,
+                kind: ReferenceKind::Jump,
+            },
+            Reference {
+                from: 0x101c,
+                to: 0x3000,
+                kind: ReferenceKind::Call,
+            },
+        ];
+        let mut ssa = lift_arm64_to_ssa(&blocks, &refs, &[]);
+        let mut symbols = HashMap::new();
+        symbols.insert(0x3000u64, "printf".to_string());
+        refine_call_arguments_with_symbols(&mut ssa, &symbols);
+        let text =
+            render_ssa_pseudocode_named_layered(&ssa, "probe", &[], &symbols, &HashMap::new());
+        eprintln!("VARIADIC_TEXT:\n{text}");
+        let call_line = text
+            .lines()
+            .find(|l| l.contains("printf("))
+            .unwrap_or_default();
+        assert!(call_line.matches(',').count() >= 2, "{text}");
     }
 
     #[test]
