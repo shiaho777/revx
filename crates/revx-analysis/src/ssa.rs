@@ -40,6 +40,7 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
     static SSA_FLAG_COND: std::cell::RefCell<Option<SsaFlagCond>> =
         const { std::cell::RefCell::new(None) };
+    static LOOP_BODY_EXPAND: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 type SsaUseGraph = (usize, Vec<u32>, Vec<Vec<u32>>);
@@ -2779,6 +2780,7 @@ pub struct SsaFunction {
     pub case_labels: HashMap<BlockId, Vec<String>>,
     pub large: bool,
     pub frame_offsets: HashMap<u64, i64>,
+    pub loop_var_names: HashMap<u32, String>,
 }
 
 impl SsaFunction {
@@ -2793,6 +2795,7 @@ impl SsaFunction {
             case_labels: HashMap::new(),
             large: false,
             frame_offsets: HashMap::new(),
+            loop_var_names: HashMap::new(),
         }
     }
 
@@ -2806,6 +2809,7 @@ impl SsaFunction {
             case_labels: HashMap::new(),
             large: false,
             frame_offsets: HashMap::new(),
+            loop_var_names: HashMap::new(),
         }
     }
 
@@ -6218,6 +6222,7 @@ fn insert_register_phis(func: &mut SsaFunction) {
             }
         }
     }
+    let mut loop_var_counter = 0u32;
     for (block, reg, incoming) in pending {
         let is_self_loop = func.cfg.predecessors(block).contains(&block);
         if func.block_defs(block).and_then(|m| m.get(&reg)).is_some() && !is_self_loop {
@@ -6234,7 +6239,55 @@ fn insert_register_phis(func: &mut SsaFunction) {
         };
         func.values.push(inst);
         func.cfg.block_mut(block).phis.push(id);
+        let loop_name = if is_self_loop && !reg.starts_with("__") {
+            let name = loop_var_name_for_reg(&reg, loop_var_counter);
+            loop_var_counter += 1;
+            Some(name)
+        } else {
+            None
+        };
         block_defs_mut(&mut func.defs, block).insert(reg, id);
+        if let Some(name) = loop_name {
+            func.loop_var_names.insert(id.0, name);
+        }
+    }
+}
+
+fn loop_var_for_backedge(func: &SsaFunction, id: SsaValueId) -> Option<&String> {
+    let target = func.values.get(id.0 as usize)?;
+    if !matches!(
+        target.op,
+        SsaOp::Select { .. } | SsaOp::Call { .. } | SsaOp::Copy { .. }
+    ) {
+        return None;
+    }
+    for (phi_id, name) in &func.loop_var_names {
+        let inst = func.values.get(*phi_id as usize)?;
+        let SsaOp::Phi { incoming } = &inst.op else {
+            continue;
+        };
+        for (pred, val) in incoming {
+            if *pred == inst.block && *val == id {
+                return Some(name);
+            }
+        }
+    }
+    None
+}
+
+fn loop_var_name_for_reg(reg: &str, counter: u32) -> String {
+    let lower = reg.to_ascii_lowercase();
+    let base = lower.trim_start_matches('w').trim_start_matches('x');
+    if let Ok(n) = base.parse::<u32>()
+        && n <= 28
+    {
+        return format!("var_{lower}");
+    }
+    match lower.as_str() {
+        "sp" => "var_sp".to_string(),
+        "fp" | "x29" => "var_fp".to_string(),
+        "lr" | "x30" => "var_lr".to_string(),
+        _ => format!("loop_{counter}"),
     }
 }
 
@@ -8227,6 +8280,9 @@ impl<'a> RegionWalk<'a> {
             if !self.emitted.contains(&back) {
                 body_ok = self.walk(back);
             }
+        } else {
+            self.emit_loop_var_updates(head);
+            self.emitted.insert(head);
         }
         self.loop_head = prev_head;
         self.lines.push("    }".to_string());
@@ -8445,9 +8501,37 @@ impl<'a> RegionWalk<'a> {
         }
         self.lines.push(format!("    while ({cond}) {{"));
         self.push_arm(&[block]);
+        self.emit_loop_var_updates(block);
         self.emitted.insert(block);
         self.lines.push("    }".to_string());
         true
+    }
+
+    fn emit_loop_var_updates(&mut self, block: BlockId) {
+        let phi_ids: Vec<SsaValueId> = self.func.cfg.block(block).phis.clone();
+        for pid in phi_ids {
+            let Some(name) = self.func.loop_var_names.get(&pid.0).cloned() else {
+                continue;
+            };
+            let Some(inst) = self.func.values.get(pid.0 as usize) else {
+                continue;
+            };
+            let SsaOp::Phi { incoming } = &inst.op else {
+                continue;
+            };
+            let Some((_, back_val)) = incoming.iter().find(|(pred, _)| *pred == block) else {
+                continue;
+            };
+            NAMED_RENDER_CACHE.with(|c| c.borrow_mut().clear());
+            LOOP_BODY_EXPAND.with(|c| c.set(true));
+            let rhs = render_named_value(self.func, *back_val, self.symbols, self.local_symbols);
+            LOOP_BODY_EXPAND.with(|c| c.set(false));
+            NAMED_RENDER_CACHE.with(|c| c.borrow_mut().clear());
+            if rhs == name {
+                continue;
+            }
+            self.lines.push(format!("        {name} = {rhs};"));
+        }
     }
 
     fn self_loop(&self, block: BlockId) -> Option<(String, BlockId)> {
@@ -8802,6 +8886,10 @@ impl<'a> RegionWalk<'a> {
         let mut body_ok = true;
         if body != exit && !self.emitted.contains(&body) {
             body_ok = self.walk_loop_body(body, head);
+        }
+        if body == head {
+            self.emit_loop_var_updates(head);
+            self.emitted.insert(head);
         }
         self.loop_head = prev_head;
         self.loop_latch = prev_latch;
@@ -14686,8 +14774,17 @@ fn render_named_value_depth_inner(
     depth: usize,
 ) -> String {
     let inst = &func.values[id.0 as usize];
+    if !matches!(inst.op, SsaOp::Phi { .. })
+        && !LOOP_BODY_EXPAND.with(|c| c.get())
+        && let Some(name) = loop_var_for_backedge(func, id)
+    {
+        return name.clone();
+    }
     match &inst.op {
         SsaOp::Phi { incoming } => {
+            if let Some(name) = func.loop_var_names.get(&id.0) {
+                return name.clone();
+            }
             if let Some(common) = phi_common_render(func, incoming, symbols, local_symbols) {
                 return common;
             }
@@ -14949,6 +15046,16 @@ fn render_named_value_depth_inner(
             ),
             None => "return".to_string(),
         },
+        SsaOp::Select {
+            cond,
+            true_val,
+            false_val,
+        } => {
+            let c = render_condition_text(func, cond, symbols, local_symbols);
+            let t = render_operand_named_depth(func, true_val, symbols, local_symbols, depth + 1);
+            let f = render_operand_named_depth(func, false_val, symbols, local_symbols, depth + 1);
+            format!("({c} ? {t} : {f})")
+        }
         _ => func.render_value(id),
     }
 }
@@ -16277,6 +16384,10 @@ mod string_call_tests {
         assert!(text.contains("& 0x1") || text.contains("& 1"), "{text}");
         assert!(text.contains('?'), "{text}");
         assert!(text.contains("while ("), "{text}");
+        assert!(text.contains("var_x8 = "), "{text}");
+        assert!(text.contains("var_x9 = "), "{text}");
+        assert!(text.contains("return var_x8;"), "{text}");
+        assert!(!text.contains("phi_"), "{text}");
     }
 
     #[test]
