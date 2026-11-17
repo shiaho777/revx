@@ -694,7 +694,9 @@ fn format_mem_access(base_text: &str, offset: i64) -> String {
     } else if offset > 0 {
         if base_text == "g_data" {
             format!("*(g_data + {offset:#x})")
-        } else if matches!(base_text.as_str(), "optarg" | "argv") && offset < 0x40 {
+        } else if base_text == "argv" && offset < 0x40 && offset % 8 == 0 {
+            format!("argv[{}]", offset / 8)
+        } else if base_text == "optarg" && offset < 0x40 {
             format!("{base_text}[{offset}]")
         } else if simple && offset < 0x100 {
             format!("{base_text}[{offset:#x}]")
@@ -3665,6 +3667,7 @@ pub fn lift_arm64_to_ssa(
 
     if !(large && blocks.len() > 48) {
         insert_register_phis(&mut func);
+        propagate_join_phis(&mut func);
         rename_loop_carried_operands(&mut func);
     }
     let t3 = if trace {
@@ -6011,6 +6014,32 @@ fn reaching_def(func: &SsaFunction, reg: &str, block: BlockId) -> Option<SsaValu
     reaching_def_inner(func, reg, block, &mut HashSet::new(), 0)
 }
 
+fn reaching_def_excluding(func: &SsaFunction, reg: &str, block: BlockId) -> Option<SsaValueId> {
+    let mut visited = HashSet::new();
+    visited.insert(block);
+    let mut found: Option<SsaValueId> = None;
+    for &pred in func.cfg.predecessors(block) {
+        if pred == block {
+            continue;
+        }
+        let d = func
+            .block_defs(pred)
+            .and_then(|m| m.get(reg))
+            .copied()
+            .or_else(|| func.lookup(reg, pred))
+            .or_else(|| reaching_def_inner(func, reg, pred, &mut visited, 1));
+        let Some(d) = d else {
+            continue;
+        };
+        match found {
+            None => found = Some(d),
+            Some(prev) if prev == d => {}
+            Some(_) => return None,
+        }
+    }
+    found
+}
+
 fn reaching_def_inner(
     func: &SsaFunction,
     reg: &str,
@@ -6290,12 +6319,19 @@ fn insert_register_phis(func: &mut SsaFunction) {
             let mut unique: Option<SsaValueId> = None;
             let mut ok = true;
             for &pred in preds {
-                let Some(d) = func
+                let d = func
                     .block_defs(pred)
                     .and_then(|m| m.get(&reg))
                     .copied()
                     .or_else(|| func.lookup(&reg, pred))
-                else {
+                    .or_else(|| {
+                        if is_self_loop && pred == block {
+                            reaching_def_excluding(func, &reg, block)
+                        } else {
+                            reaching_def(func, &reg, pred)
+                        }
+                    });
+                let Some(d) = d else {
                     ok = false;
                     break;
                 };
@@ -6345,6 +6381,134 @@ fn insert_register_phis(func: &mut SsaFunction) {
             func.loop_var_names.insert(id.0, name);
         }
     }
+}
+
+fn propagate_join_phis(func: &mut SsaFunction) {
+    let blocks: Vec<BlockId> = func.cfg.blocks.iter().map(|b| b.id).collect();
+    for block in blocks {
+        let preds = func.cfg.predecessors(block).to_vec();
+        if preds.len() < 2 {
+            continue;
+        }
+        let mut regs: Vec<String> = Vec::new();
+        for &pred in &preds {
+            if let Some(map) = func.block_defs(pred) {
+                for (reg, _) in map.iter_pairs() {
+                    let r = normalize_reg(reg);
+                    if !r.starts_with("__")
+                        && !matches!(r.as_str(), "sp" | "fp" | "x29" | "x30" | "lr")
+                        && !regs.contains(&r)
+                    {
+                        regs.push(r);
+                    }
+                }
+            }
+        }
+        regs.sort();
+        for reg in regs {
+            if func.block_defs(block).and_then(|m| m.get(&reg)).is_some() {
+                continue;
+            }
+            let mut visiting = HashSet::new();
+            let mut plan: Vec<(BlockId, Vec<(BlockId, PhiRef)>)> = Vec::new();
+            let Some(root) = collect_reg_phi(func, &reg, block, &mut visiting, &mut plan, 0) else {
+                continue;
+            };
+            if plan.is_empty() {
+                if let PhiRef::Existing(id) = root {
+                    block_defs_mut(&mut func.defs, block).insert(reg, id);
+                }
+                continue;
+            }
+            plan.sort_by_key(|(b, _)| b.0);
+            plan.dedup_by_key(|(b, _)| *b);
+            let mut assigned: HashMap<BlockId, SsaValueId> = HashMap::new();
+            for (b, _) in &plan {
+                let pid = func.new_value_id();
+                assigned.insert(*b, pid);
+            }
+            for (b, incoming) in &plan {
+                let pid = assigned[b];
+                let resolved: Vec<(BlockId, SsaValueId)> = incoming
+                    .iter()
+                    .map(|(pred, r)| {
+                        let id = match r {
+                            PhiRef::Existing(id) => *id,
+                            PhiRef::Phi(pb) => assigned[pb],
+                        };
+                        (*pred, id)
+                    })
+                    .collect();
+                func.values.push(SsaInstruction {
+                    id: pid,
+                    op: SsaOp::Phi { incoming: resolved },
+                    source_addr: 0,
+                    block: *b,
+                });
+                func.cfg.block_mut(*b).phis.push(pid);
+                block_defs_mut(&mut func.defs, *b).insert(reg.clone(), pid);
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum PhiRef {
+    Existing(SsaValueId),
+    Phi(BlockId),
+}
+
+fn collect_reg_phi(
+    func: &SsaFunction,
+    reg: &str,
+    block: BlockId,
+    visiting: &mut HashSet<BlockId>,
+    plan: &mut Vec<(BlockId, Vec<(BlockId, PhiRef)>)>,
+    depth: usize,
+) -> Option<PhiRef> {
+    if depth > 16 || !visiting.insert(block) {
+        return None;
+    }
+    if let Some(id) = func.block_defs(block).and_then(|m| m.get(reg)).copied() {
+        visiting.remove(&block);
+        return Some(PhiRef::Existing(id));
+    }
+    let preds = func.cfg.predecessors(block).to_vec();
+    if preds.is_empty() {
+        visiting.remove(&block);
+        return None;
+    }
+    let mut incoming: Vec<(BlockId, PhiRef)> = Vec::new();
+    for &pred in &preds {
+        let d = if pred == block {
+            reaching_def_excluding(func, reg, block).map(PhiRef::Existing)
+        } else {
+            func.block_defs(pred)
+                .and_then(|m| m.get(reg))
+                .copied()
+                .map(PhiRef::Existing)
+                .or_else(|| func.lookup(reg, pred).map(PhiRef::Existing))
+                .or_else(|| collect_reg_phi(func, reg, pred, visiting, plan, depth + 1))
+        };
+        let Some(d) = d else {
+            visiting.remove(&block);
+            return None;
+        };
+        incoming.push((pred, d));
+    }
+    if let Some(PhiRef::Existing(first)) = incoming.first().map(|(_, r)| *r)
+        && incoming
+            .iter()
+            .all(|(_, r)| matches!(r, PhiRef::Existing(id) if *id == first))
+    {
+        visiting.remove(&block);
+        return Some(PhiRef::Existing(first));
+    }
+    if !plan.iter().any(|(b, _)| *b == block) {
+        plan.push((block, incoming));
+    }
+    visiting.remove(&block);
+    Some(PhiRef::Phi(block))
 }
 
 fn loop_var_for_backedge(func: &SsaFunction, id: SsaValueId) -> Option<&String> {
@@ -17115,6 +17279,52 @@ mod string_call_tests {
             .find(|l| l.contains("printf("))
             .unwrap_or_default();
         assert!(call_line.matches(',').count() >= 2, "{text}");
+    }
+
+    #[test]
+    fn arm64_golden_argv_byte_offset_as_index() {
+        let blocks = vec![BasicBlock {
+            address: 0x1000,
+            size: 0xc,
+            instructions: vec![
+                golden_mk(0x1000, "ldr x0, [x1, #0x8]"),
+                golden_mk(0x1004, "bl 0x2000"),
+                golden_mk(0x1008, "ret"),
+            ],
+        }];
+        let refs = vec![Reference {
+            from: 0x1004,
+            to: 0x2000,
+            kind: ReferenceKind::Call,
+        }];
+        let args = vec![
+            revx_core::Variable {
+                name: "argc".to_string(),
+                role: revx_core::VariableRole::Argument,
+                storage: revx_core::VariableStorage::Register,
+                type_name: Some("int".to_string()),
+                confidence: 0.9,
+                location: "x0".to_string(),
+                evidence_ids: vec![],
+            },
+            revx_core::Variable {
+                name: "argv".to_string(),
+                role: revx_core::VariableRole::Argument,
+                storage: revx_core::VariableStorage::Register,
+                type_name: Some("char**".to_string()),
+                confidence: 0.9,
+                location: "x1".to_string(),
+                evidence_ids: vec![],
+            },
+        ];
+        let ssa = lift_arm64_to_ssa(&blocks, &refs, &args);
+        let mut symbols = HashMap::new();
+        symbols.insert(0x2000u64, "atoi".to_string());
+        let text =
+            render_ssa_pseudocode_named_layered(&ssa, "probe", &args, &symbols, &HashMap::new());
+        eprintln!("ARGV_TEXT:\n{text}");
+        assert!(text.contains("argv[1]"), "{text}");
+        assert!(!text.contains("argv[8]"), "{text}");
     }
 
     #[test]
