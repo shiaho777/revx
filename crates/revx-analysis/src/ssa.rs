@@ -8160,6 +8160,9 @@ impl<'a> RegionWalk<'a> {
             if self.emitted.contains(&next) && next != block {
                 break;
             }
+            if !chain.is_empty() && self.self_loop(next).is_some() {
+                break;
+            }
             cur = next;
             chain.push(cur);
         }
@@ -8225,6 +8228,7 @@ impl<'a> RegionWalk<'a> {
             for line in &prelude {
                 self.lines.push(format!("    {line}"));
             }
+            self.emit_loop_var_updates(block);
             self.emitted.insert(block);
             self.lines.push("    }".to_string());
             if exit == block {
@@ -8362,6 +8366,20 @@ impl<'a> RegionWalk<'a> {
                     self.lines.push("    }".to_string());
                     return self.finish_join(join);
                 }
+                if let Some(&last) = f_chain.last()
+                    && let Some(&next) = self.func.cfg.successors(last).first()
+                    && next != join
+                    && !self.emitted.contains(&next)
+                    && self.self_loop(next).is_some()
+                {
+                    self.push_arm(&f_chain);
+                    for &b in &f_chain {
+                        self.emitted.insert(b);
+                    }
+                    self.emit_self_loop_at(next);
+                    self.lines.push("    }".to_string());
+                    return self.finish_join(join);
+                }
                 let before = self.lines.len();
                 self.push_arm(&f_chain);
                 let added = self.lines.len() > before;
@@ -8385,6 +8403,20 @@ impl<'a> RegionWalk<'a> {
                     return self.finish_join(join);
                 }
                 if self.emit_self_loop_at(t) {
+                    self.lines.push("    }".to_string());
+                    return self.finish_join(join);
+                }
+                if let Some(&last) = t_chain.last()
+                    && let Some(&next) = self.func.cfg.successors(last).first()
+                    && next != join
+                    && !self.emitted.contains(&next)
+                    && self.self_loop(next).is_some()
+                {
+                    self.push_arm(&t_chain);
+                    for &b in &t_chain {
+                        self.emitted.insert(b);
+                    }
+                    self.emit_self_loop_at(next);
                     self.lines.push("    }".to_string());
                     return self.finish_join(join);
                 }
@@ -8506,8 +8538,8 @@ impl<'a> RegionWalk<'a> {
     }
 
     fn emit_loop_var_updates(&mut self, block: BlockId) {
-        let phi_ids: Vec<SsaValueId> = self.func.cfg.block(block).phis.clone();
-        for pid in phi_ids {
+        let mut updates: Vec<(SsaValueId, String, SsaValueId)> = Vec::new();
+        for &pid in &self.func.cfg.block(block).phis {
             let Some(name) = self.func.loop_var_names.get(&pid.0).cloned() else {
                 continue;
             };
@@ -8520,16 +8552,116 @@ impl<'a> RegionWalk<'a> {
             let Some((_, back_val)) = incoming.iter().find(|(pred, _)| *pred == block) else {
                 continue;
             };
-            NAMED_RENDER_CACHE.with(|c| c.borrow_mut().clear());
-            LOOP_BODY_EXPAND.with(|c| c.set(true));
-            let rhs = render_named_value(self.func, *back_val, self.symbols, self.local_symbols);
-            LOOP_BODY_EXPAND.with(|c| c.set(false));
-            NAMED_RENDER_CACHE.with(|c| c.borrow_mut().clear());
-            if rhs == name {
+            if self.loop_update_feeds_other_phi(*back_val, pid) {
                 continue;
             }
-            self.lines.push(format!("        {name} = {rhs};"));
+            updates.push((pid, name, *back_val));
         }
+        if updates.is_empty() {
+            return;
+        }
+        let inst_ids: Vec<SsaValueId> = self.func.cfg.block(block).insts.clone();
+        NAMED_RENDER_CACHE.with(|c| c.borrow_mut().clear());
+        LOOP_BODY_EXPAND.with(|c| c.set(true));
+        for iid in inst_ids {
+            let Some((_, name, back_val)) = updates.iter().find(|(_, _, bv)| *bv == iid) else {
+                continue;
+            };
+            let rhs = self.render_loop_update_rhs(*back_val, &updates);
+            if rhs != *name {
+                self.lines.push(format!("        {name} = {rhs};"));
+            }
+        }
+        for (pid, name, back_val) in &updates {
+            if self.func.cfg.block(block).insts.contains(back_val) {
+                continue;
+            }
+            let rhs = self.render_loop_update_rhs(*back_val, &updates);
+            if rhs != *name {
+                self.lines.push(format!("        {name} = {rhs};"));
+            }
+            let _ = pid;
+        }
+        LOOP_BODY_EXPAND.with(|c| c.set(false));
+        NAMED_RENDER_CACHE.with(|c| c.borrow_mut().clear());
+    }
+
+    fn loop_update_feeds_other_phi(&self, id: SsaValueId, own_phi: SsaValueId) -> bool {
+        let mut frontier = vec![id];
+        let mut seen: HashSet<u32> = HashSet::new();
+        let mut feeds_other = false;
+        for _ in 0..8 {
+            let mut next_frontier = Vec::new();
+            for cur in &frontier {
+                let reached = ssa_with_use_graph(self.func, |_, users| {
+                    users.get(cur.0 as usize).cloned().unwrap_or_default()
+                });
+                for user in reached {
+                    if !seen.insert(user) {
+                        continue;
+                    }
+                    let Some(other) = self.func.values.get(user as usize) else {
+                        return false;
+                    };
+                    match &other.op {
+                        SsaOp::Phi { .. } if user == own_phi.0 => {}
+                        SsaOp::Phi { .. } if self.func.loop_var_names.contains_key(&user) => {
+                            feeds_other = true;
+                        }
+                        SsaOp::Copy { src } if operand_uses_value(src, *cur) => {
+                            next_frontier.push(other.id);
+                        }
+                        _ => return false,
+                    }
+                }
+            }
+            if next_frontier.is_empty() {
+                break;
+            }
+            frontier = next_frontier;
+        }
+        feeds_other
+    }
+
+    fn render_loop_update_rhs(
+        &self,
+        id: SsaValueId,
+        updates: &[(SsaValueId, String, SsaValueId)],
+    ) -> String {
+        let Some(inst) = self.func.values.get(id.0 as usize) else {
+            return format!("v{}", id.0);
+        };
+        if let SsaOp::Call { .. } = &inst.op {
+            let mut candidates: Vec<(String, SsaValueId)> = Vec::new();
+            for (_, name, bv) in updates {
+                if *bv == id {
+                    continue;
+                }
+                let Some(user) = self.func.values.get(bv.0 as usize) else {
+                    continue;
+                };
+                let mut used = Vec::new();
+                collect_used_operands_vec(&user.op, &mut used);
+                if !used.contains(&id) {
+                    continue;
+                }
+                if matches!(user.op, SsaOp::Copy { .. })
+                    && ssa_with_use_graph(self.func, |counts, _| {
+                        counts.get(bv.0 as usize).copied().unwrap_or(0)
+                    }) <= 2
+                {
+                    candidates.push((name.clone(), *bv));
+                }
+            }
+            if candidates.len() == 1 {
+                let (name, bv) = candidates.pop().unwrap();
+                let rhs = self.render_loop_update_rhs(bv, updates);
+                if rhs != name {
+                    return rhs;
+                }
+            }
+        }
+        render_named_value(self.func, id, self.symbols, self.local_symbols)
     }
 
     fn self_loop(&self, block: BlockId) -> Option<(String, BlockId)> {
@@ -16424,6 +16556,103 @@ mod string_call_tests {
         assert!(text.contains("var_x9 = "), "{text}");
         assert!(text.contains("return var_x8;"), "{text}");
         assert!(!text.contains("phi_"), "{text}");
+    }
+
+    #[test]
+    fn arm64_golden_recursive_loop_structured() {
+        let blocks = vec![
+            BasicBlock {
+                address: 0x1000,
+                size: 0x8,
+                instructions: vec![
+                    golden_mk(0x1000, "cmp w0, #0x2"),
+                    golden_mk(0x1004, "b.ge 0x1010"),
+                ],
+            },
+            BasicBlock {
+                address: 0x1008,
+                size: 0x8,
+                instructions: vec![
+                    golden_mk(0x1008, "mov w19, #0x0"),
+                    golden_mk(0x100c, "b 0x1038"),
+                ],
+            },
+            BasicBlock {
+                address: 0x1010,
+                size: 0x8,
+                instructions: vec![
+                    golden_mk(0x1010, "mov w19, #0x0"),
+                    golden_mk(0x1014, "mov x20, x0"),
+                ],
+            },
+            BasicBlock {
+                address: 0x1018,
+                size: 0x20,
+                instructions: vec![
+                    golden_mk(0x1018, "sub w0, w20, #0x1"),
+                    golden_mk(0x101c, "bl 0x1000"),
+                    golden_mk(0x1020, "mov x8, x0"),
+                    golden_mk(0x1024, "sub w0, w20, #0x2"),
+                    golden_mk(0x1028, "add w19, w8, w19"),
+                    golden_mk(0x102c, "cmp w20, #0x3"),
+                    golden_mk(0x1030, "mov x20, x0"),
+                    golden_mk(0x1034, "b.hi 0x1018"),
+                ],
+            },
+            BasicBlock {
+                address: 0x1038,
+                size: 0x8,
+                instructions: vec![
+                    golden_mk(0x1038, "add w0, w0, w19"),
+                    golden_mk(0x103c, "ret"),
+                ],
+            },
+        ];
+        let refs = vec![
+            Reference {
+                from: 0x1004,
+                to: 0x1010,
+                kind: ReferenceKind::BranchTrue,
+            },
+            Reference {
+                from: 0x100c,
+                to: 0x1038,
+                kind: ReferenceKind::Jump,
+            },
+            Reference {
+                from: 0x101c,
+                to: 0x1000,
+                kind: ReferenceKind::Call,
+            },
+            Reference {
+                from: 0x1034,
+                to: 0x1018,
+                kind: ReferenceKind::BranchTrue,
+            },
+        ];
+        let args = vec![revx_core::Variable {
+            name: "n".to_string(),
+            role: revx_core::VariableRole::Argument,
+            storage: revx_core::VariableStorage::Register,
+            type_name: Some("int".to_string()),
+            confidence: 0.9,
+            location: "x0".to_string(),
+            evidence_ids: vec![],
+        }];
+        let ssa = lift_arm64_to_ssa(&blocks, &refs, &args);
+        let text = render_ssa_pseudocode_named_layered(
+            &ssa,
+            "probe",
+            &args,
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        eprintln!("RECURSIVE_LOOP_TEXT:\n{text}");
+        assert!(text.contains("while ("), "{text}");
+        assert!(text.contains("var_x20 = "), "{text}");
+        assert!(text.contains("var_x19 = "), "{text}");
+        assert!(!text.contains("var_x0 = "), "{text}");
+        assert!(!text.contains("goto"), "{text}");
     }
 
     #[test]
