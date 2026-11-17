@@ -2237,9 +2237,7 @@ impl Cfg {
         let mut preds = vec![Vec::new(); n];
         let mut succs = vec![Vec::new(); n];
         for (from_addr, to_addr) in edges {
-            if let (Some(&from), Some(&to)) = (addr_to_id.get(from_addr), addr_to_id.get(to_addr))
-                && from != to
-            {
+            if let (Some(&from), Some(&to)) = (addr_to_id.get(from_addr), addr_to_id.get(to_addr)) {
                 let fi = from.0 as usize;
                 let ti = to.0 as usize;
                 if !succs[fi].contains(&to) {
@@ -2311,9 +2309,7 @@ impl Cfg {
         let mut preds = vec![Vec::new(); n];
         let mut succs = vec![Vec::new(); n];
         for (from_addr, to_addr) in edges {
-            if let (Some(&from), Some(&to)) = (addr_to_id.get(from_addr), addr_to_id.get(to_addr))
-                && from != to
-            {
+            if let (Some(&from), Some(&to)) = (addr_to_id.get(from_addr), addr_to_id.get(to_addr)) {
                 let fi = from.0 as usize;
                 let ti = to.0 as usize;
                 if !succs[fi].contains(&to) {
@@ -3056,14 +3052,7 @@ impl SsaFunction {
                 ),
                 None => "return".to_string(),
             },
-            SsaOp::Phi { incoming } => {
-                let pairs = incoming
-                    .iter()
-                    .map(|(b, v)| format!("bb{}: v{}", b.0, v.0))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                format!("phi({})", pairs)
-            }
+            SsaOp::Phi { .. } => format!("phi_{}", id.0),
             SsaOp::Branch { cond, .. } => {
                 format!(
                     "if ({})",
@@ -3673,6 +3662,7 @@ pub fn lift_arm64_to_ssa(
 
     if !(large && blocks.len() > 48) {
         insert_register_phis(&mut func);
+        rename_loop_carried_operands(&mut func);
     }
     let t3 = if trace {
         Some(std::time::Instant::now())
@@ -6046,8 +6036,9 @@ fn insert_register_phis(func: &mut SsaFunction) {
                         }
                     }
                 }
+                let is_self_loop = preds.contains(&block);
                 for reg in regs {
-                    if func.block_defs(block).and_then(|m| m.get(&reg)).is_some() {
+                    if func.block_defs(block).and_then(|m| m.get(&reg)).is_some() && !is_self_loop {
                         continue;
                     }
                     let mut incoming: Vec<(BlockId, SsaValueId)> = Vec::new();
@@ -6192,8 +6183,9 @@ fn insert_register_phis(func: &mut SsaFunction) {
                 }
             }
         }
+        let is_self_loop = preds.contains(&block);
         for reg in regs {
-            if func.block_defs(block).and_then(|m| m.get(&reg)).is_some() {
+            if func.block_defs(block).and_then(|m| m.get(&reg)).is_some() && !is_self_loop {
                 continue;
             }
             let mut incoming: Vec<(BlockId, SsaValueId)> = Vec::new();
@@ -6227,7 +6219,8 @@ fn insert_register_phis(func: &mut SsaFunction) {
         }
     }
     for (block, reg, incoming) in pending {
-        if func.block_defs(block).and_then(|m| m.get(&reg)).is_some() {
+        let is_self_loop = func.cfg.predecessors(block).contains(&block);
+        if func.block_defs(block).and_then(|m| m.get(&reg)).is_some() && !is_self_loop {
             continue;
         }
         let id = func.new_value_id();
@@ -6242,6 +6235,91 @@ fn insert_register_phis(func: &mut SsaFunction) {
         func.values.push(inst);
         func.cfg.block_mut(block).phis.push(id);
         block_defs_mut(&mut func.defs, block).insert(reg, id);
+    }
+}
+
+fn remap_op_value_ids(op: &mut SsaOp, map: &HashMap<SsaValueId, SsaValueId>) {
+    let remap = |operand: &mut Operand| match operand {
+        Operand::Value(id) => {
+            if let Some(&new) = map.get(id) {
+                *id = new;
+            }
+        }
+        Operand::Deref { base, .. } => {
+            if let Operand::Value(id) = base.as_mut()
+                && let Some(&new) = map.get(id)
+            {
+                *id = new;
+            }
+        }
+        _ => {}
+    };
+    match op {
+        SsaOp::Copy { src } => remap(src),
+        SsaOp::BinOp { lhs, rhs, .. } => {
+            remap(lhs);
+            remap(rhs);
+        }
+        SsaOp::UnaryOp { src, .. } => remap(src),
+        SsaOp::Load { addr } => remap(addr),
+        SsaOp::Store { addr, value } => {
+            remap(addr);
+            remap(value);
+        }
+        SsaOp::Call { target, args } => {
+            remap(target);
+            for a in args.iter_mut() {
+                remap(a);
+            }
+        }
+        SsaOp::Return { value: Some(v) } => remap(v),
+        SsaOp::Branch { cond, .. } => remap(cond),
+        SsaOp::Select {
+            cond,
+            true_val,
+            false_val,
+        } => {
+            remap(cond);
+            remap(true_val);
+            remap(false_val);
+        }
+        _ => {}
+    }
+}
+
+fn rename_loop_carried_operands(func: &mut SsaFunction) {
+    let self_loops: Vec<BlockId> = func
+        .cfg
+        .blocks
+        .iter()
+        .filter(|b| func.cfg.predecessors(b.id).contains(&b.id))
+        .map(|b| b.id)
+        .collect();
+    for block in self_loops {
+        let mut map: HashMap<SsaValueId, SsaValueId> = HashMap::new();
+        let phi_ids: Vec<SsaValueId> = func.cfg.block(block).phis.clone();
+        for pid in phi_ids {
+            let Some(inst) = func.values.get(pid.0 as usize) else {
+                continue;
+            };
+            let SsaOp::Phi { incoming } = &inst.op else {
+                continue;
+            };
+            for (pred, val) in incoming {
+                if *pred != block {
+                    map.insert(*val, pid);
+                }
+            }
+        }
+        if map.is_empty() {
+            continue;
+        }
+        let inst_ids: Vec<SsaValueId> = func.cfg.block(block).insts.clone();
+        for iid in inst_ids {
+            if let Some(inst) = func.values.get_mut(iid.0 as usize) {
+                remap_op_value_ids(&mut inst.op, &map);
+            }
+        }
     }
 }
 
@@ -6792,14 +6870,14 @@ fn branch_targets(
 }
 
 fn arm64_cond_kind(opcode: &str) -> Option<BinOpKind> {
-    match opcode {
-        "b.eq" | "b.cs" => Some(BinOpKind::Eq),
-        "b.ne" | "b.cc" => Some(BinOpKind::Ne),
-        "b.lt" | "b.mi" => Some(BinOpKind::Lt),
-        "b.le" | "b.ls" => Some(BinOpKind::Le),
-        "b.gt" | "b.hi" => Some(BinOpKind::Gt),
-        "b.ge" | "b.hs" | "b.pl" => Some(BinOpKind::Ge),
-        "b.lo" => Some(BinOpKind::Lt),
+    let code = opcode.strip_prefix("b.").unwrap_or(opcode);
+    match code {
+        "eq" | "cs" => Some(BinOpKind::Eq),
+        "ne" | "cc" => Some(BinOpKind::Ne),
+        "lt" | "mi" | "lo" => Some(BinOpKind::Lt),
+        "le" | "ls" => Some(BinOpKind::Le),
+        "gt" | "hi" => Some(BinOpKind::Gt),
+        "ge" | "hs" | "pl" => Some(BinOpKind::Ge),
         _ => None,
     }
 }
@@ -16125,6 +16203,64 @@ mod string_call_tests {
         );
         eprintln!("CSEL_TEXT:\n{text}");
         assert!(text.contains('1') && text.contains('2'), "{text}");
+    }
+
+    #[test]
+    fn arm64_golden_self_loop_csel_keeps_body() {
+        let blocks = vec![
+            BasicBlock {
+                address: 0x1000,
+                size: 0x8,
+                instructions: vec![
+                    golden_mk(0x1000, "mov w8, #0x0"),
+                    golden_mk(0x1004, "mov w9, #0x0"),
+                ],
+            },
+            BasicBlock {
+                address: 0x1008,
+                size: 0x1c,
+                instructions: vec![
+                    golden_mk(0x1008, "add w10, w8, w9"),
+                    golden_mk(0x100c, "lsl w8, w8, #1"),
+                    golden_mk(0x1010, "tst w9, #0x1"),
+                    golden_mk(0x1014, "csel w8, w10, w8, eq"),
+                    golden_mk(0x1018, "add w9, w9, #0x1"),
+                    golden_mk(0x101c, "cmp w0, w9"),
+                    golden_mk(0x1020, "b.ne 0x1008"),
+                ],
+            },
+            BasicBlock {
+                address: 0x1024,
+                size: 0x8,
+                instructions: vec![golden_mk(0x1024, "mov x0, x8"), golden_mk(0x1028, "ret")],
+            },
+        ];
+        let refs = vec![Reference {
+            from: 0x1020,
+            to: 0x1008,
+            kind: ReferenceKind::BranchTrue,
+        }];
+        let args = vec![revx_core::Variable {
+            name: "n".to_string(),
+            role: revx_core::VariableRole::Argument,
+            storage: revx_core::VariableStorage::Register,
+            type_name: Some("int".to_string()),
+            confidence: 0.9,
+            location: "x0".to_string(),
+            evidence_ids: vec![],
+        }];
+        let ssa = lift_arm64_to_ssa(&blocks, &refs, &args);
+        let text = render_ssa_pseudocode_named_layered(
+            &ssa,
+            "probe",
+            &args,
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        eprintln!("SELF_LOOP_CSEL_TEXT:\n{text}");
+        assert!(text.contains("<< 1") || text.contains("<< 0x1"), "{text}");
+        assert!(text.contains("& 0x1") || text.contains("& 1"), "{text}");
+        assert!(text.contains('?'), "{text}");
     }
 
     #[test]
