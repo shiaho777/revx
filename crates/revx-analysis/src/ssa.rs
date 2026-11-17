@@ -2731,11 +2731,14 @@ impl BlockDefMap {
     }
 
     pub fn iter_pairs(&self) -> impl Iterator<Item = (&str, SsaValueId)> + '_ {
+        let mut extra: Vec<(&str, SsaValueId)> =
+            self.extra.iter().map(|(k, v)| (k.as_str(), *v)).collect();
+        extra.sort_by_key(|(k, _)| *k);
         self.slots
             .iter()
             .enumerate()
             .filter_map(|(i, s)| s.map(|id| (Self::slot_name(i), id)))
-            .chain(self.extra.iter().map(|(k, v)| (k.as_str(), *v)))
+            .chain(extra)
     }
 
     pub fn keys_owned(&self) -> Vec<String> {
@@ -3726,6 +3729,7 @@ pub fn lift_arm64_to_ssa(
         light_constant_fold(&mut func);
     }
     anchor_frame_mem_accesses(&mut func);
+    resolve_block_invariant_symbols(&mut func);
     if let (Some(t0), Some(t1), Some(t2), Some(t3), Some(t4), Some(t5)) = (t0, t1, t2, t3, t4, t5) {
         let t6 = std::time::Instant::now();
         eprintln!(
@@ -6164,6 +6168,8 @@ fn insert_register_phis(func: &mut SsaFunction) {
                     }
                 }
                 let is_self_loop = preds.contains(&block);
+                let mut regs: Vec<String> = regs.into_iter().collect();
+                regs.sort();
                 for reg in regs {
                     if func.block_defs(block).and_then(|m| m.get(&reg)).is_some() && !is_self_loop {
                         continue;
@@ -6311,6 +6317,8 @@ fn insert_register_phis(func: &mut SsaFunction) {
             }
         }
         let is_self_loop = preds.contains(&block);
+        let mut regs: Vec<String> = regs.into_iter().collect();
+        regs.sort();
         for reg in regs {
             if func.block_defs(block).and_then(|m| m.get(&reg)).is_some() && !is_self_loop {
                 continue;
@@ -6384,6 +6392,45 @@ fn insert_register_phis(func: &mut SsaFunction) {
 }
 
 fn propagate_join_phis(func: &mut SsaFunction) {
+    let mut defined_regs: Vec<String> = Vec::new();
+    for map in &func.defs {
+        for (reg, _) in map.iter_pairs() {
+            let r = normalize_reg(reg);
+            if !defined_regs.contains(&r) {
+                defined_regs.push(r);
+            }
+        }
+    }
+    let mut implicit_set: HashSet<String> = HashSet::new();
+    for inst in &func.values {
+        let mut used = HashSet::new();
+        collect_symbol_regs_hash(&inst.op, &mut used);
+        for n in used {
+            if !n.starts_with("__")
+                && !matches!(
+                    n.as_str(),
+                    "sp" | "fp" | "x29" | "x30" | "lr" | "xzr" | "wzr"
+                )
+                && !defined_regs.contains(&n)
+            {
+                implicit_set.insert(n);
+            }
+        }
+    }
+    let mut implicit: Vec<String> = implicit_set.into_iter().collect();
+    implicit.sort();
+    for reg in &implicit {
+        let id = func.new_value_id();
+        func.values.push(SsaInstruction {
+            id,
+            op: SsaOp::Copy {
+                src: Operand::Symbol(reg.clone()),
+            },
+            source_addr: 0,
+            block: func.cfg.entry,
+        });
+        block_defs_mut(&mut func.defs, func.cfg.entry).insert(reg.clone(), id);
+    }
     let blocks: Vec<BlockId> = func.cfg.blocks.iter().map(|b| b.id).collect();
     for block in blocks {
         let preds = func.cfg.predecessors(block).to_vec();
@@ -6452,7 +6499,153 @@ fn propagate_join_phis(func: &mut SsaFunction) {
     }
 }
 
-#[derive(Clone, Copy)]
+fn reg_def_before(func: &SsaFunction, reg: &str, block: BlockId, addr: u64) -> Option<SsaValueId> {
+    for &pid in &func.cfg.block(block).phis {
+        if let Some(p) = func.values.get(pid.0 as usize)
+            && let SsaOp::Phi { .. } = p.op
+            && func.block_defs(block).and_then(|m| m.get(reg)).copied() == Some(pid)
+        {
+            return Some(pid);
+        }
+    }
+    let mut best: Option<(u64, SsaValueId)> = None;
+    for &iid in &func.cfg.block(block).insts {
+        let Some(inst) = func.values.get(iid.0 as usize) else {
+            continue;
+        };
+        if inst.source_addr >= addr {
+            continue;
+        }
+        let defines = match &inst.op {
+            SsaOp::Copy { .. }
+            | SsaOp::BinOp { .. }
+            | SsaOp::UnaryOp { .. }
+            | SsaOp::Load { .. }
+            | SsaOp::Call { .. }
+            | SsaOp::Select { .. } => {
+                func.block_defs(block).and_then(|m| m.get(reg)).copied() == Some(iid)
+            }
+            _ => false,
+        };
+        if defines && (best.is_none() || inst.source_addr > best.unwrap().0) {
+            best = Some((inst.source_addr, iid));
+        }
+    }
+    best.map(|(_, id)| id)
+}
+
+fn reg_def_at_exit(
+    func: &SsaFunction,
+    reg: &str,
+    block: BlockId,
+    depth: usize,
+) -> Option<SsaValueId> {
+    if depth > 16 {
+        return None;
+    }
+    if let Some(id) = reg_def_before(func, reg, block, u64::MAX) {
+        return Some(id);
+    }
+    let preds = func.cfg.predecessors(block);
+    let mut found: Option<SsaValueId> = None;
+    for &pred in preds {
+        if pred == block {
+            continue;
+        }
+        let Some(d) = reg_def_at_exit(func, reg, pred, depth + 1) else {
+            continue;
+        };
+        match found {
+            None => found = Some(d),
+            Some(prev) if prev == d => {}
+            Some(_) => return None,
+        }
+    }
+    found
+}
+
+fn resolve_block_invariant_symbols(func: &mut SsaFunction) {
+    let blocks: Vec<BlockId> = func.cfg.blocks.iter().map(|b| b.id).collect();
+    for block in blocks {
+        let inst_ids: Vec<SsaValueId> = func.cfg.block(block).insts.clone();
+        for iid in inst_ids {
+            let Some(inst) = func.values.get(iid.0 as usize) else {
+                continue;
+            };
+            if matches!(inst.op, SsaOp::Store { .. } | SsaOp::Load { .. }) {
+                continue;
+            }
+            let addr = inst.source_addr;
+            let mut new_op = inst.op.clone();
+            let mut changed = false;
+            let mut resolve = |operand: &mut Operand| {
+                if let Operand::Symbol(name) = operand
+                    && looks_like_reg_name(name)
+                {
+                    let reg = normalize_reg(name);
+                    if matches!(
+                        reg.as_str(),
+                        "sp" | "fp" | "x29" | "x30" | "lr" | "xzr" | "wzr"
+                    ) {
+                        return;
+                    }
+                    let target = reg_def_before(func, &reg, block, addr).or_else(|| {
+                        let mut found: Option<SsaValueId> = None;
+                        for &pred in func.cfg.predecessors(block) {
+                            if pred == block {
+                                continue;
+                            }
+                            let d = reg_def_at_exit(func, &reg, pred, 0);
+                            match (found, d) {
+                                (None, Some(x)) => found = Some(x),
+                                (Some(a), Some(b)) if a == b => {}
+                                (Some(_), Some(_)) => return None,
+                                _ => {}
+                            }
+                        }
+                        found
+                    });
+                    if let Some(id) = target
+                        && id != iid
+                    {
+                        *operand = Operand::Value(id);
+                        changed = true;
+                    }
+                }
+            };
+            match &mut new_op {
+                SsaOp::Copy { src } => resolve(src),
+                SsaOp::BinOp { lhs, rhs, .. } => {
+                    resolve(lhs);
+                    resolve(rhs);
+                }
+                SsaOp::UnaryOp { src, .. } => resolve(src),
+                SsaOp::Call { args, .. } => {
+                    for a in args.iter_mut() {
+                        resolve(a);
+                    }
+                }
+                SsaOp::Return { value: Some(v) } => resolve(v),
+                SsaOp::Branch { cond, .. } => resolve(cond),
+                SsaOp::Select {
+                    cond,
+                    true_val,
+                    false_val,
+                } => {
+                    resolve(cond);
+                    resolve(true_val);
+                    resolve(false_val);
+                }
+                _ => {}
+            }
+            if changed && let Some(inst) = func.values.get_mut(iid.0 as usize) {
+                inst.op = new_op;
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
 enum PhiRef {
     Existing(SsaValueId),
     Phi(BlockId),
@@ -17434,6 +17627,81 @@ mod string_call_tests {
         eprintln!("ARGV_TEXT:\n{text}");
         assert!(text.contains("argv[1]"), "{text}");
         assert!(!text.contains("argv[8]"), "{text}");
+    }
+
+    #[test]
+    fn arm64_golden_join_bare_regs_resolved() {
+        let blocks = vec![
+            BasicBlock {
+                address: 0x1000,
+                size: 0x8,
+                instructions: vec![
+                    golden_mk(0x1000, "cmp w0, #0x1"),
+                    golden_mk(0x1004, "b.ge 0x1010"),
+                ],
+            },
+            BasicBlock {
+                address: 0x1008,
+                size: 0x8,
+                instructions: vec![
+                    golden_mk(0x1008, "mov w1, #0x2"),
+                    golden_mk(0x100c, "b 0x1018"),
+                ],
+            },
+            BasicBlock {
+                address: 0x1010,
+                size: 0x8,
+                instructions: vec![
+                    golden_mk(0x1010, "mov w1, #0x3"),
+                    golden_mk(0x1014, "b 0x1018"),
+                ],
+            },
+            BasicBlock {
+                address: 0x1018,
+                size: 0x8,
+                instructions: vec![
+                    golden_mk(0x1018, "add w0, w0, w1"),
+                    golden_mk(0x101c, "ret"),
+                ],
+            },
+        ];
+        let refs = vec![
+            Reference {
+                from: 0x1004,
+                to: 0x1010,
+                kind: ReferenceKind::BranchTrue,
+            },
+            Reference {
+                from: 0x100c,
+                to: 0x1018,
+                kind: ReferenceKind::Jump,
+            },
+            Reference {
+                from: 0x1014,
+                to: 0x1018,
+                kind: ReferenceKind::Jump,
+            },
+        ];
+        let args = vec![revx_core::Variable {
+            name: "n".to_string(),
+            role: revx_core::VariableRole::Argument,
+            storage: revx_core::VariableStorage::Register,
+            type_name: Some("int".to_string()),
+            confidence: 0.9,
+            location: "x0".to_string(),
+            evidence_ids: vec![],
+        }];
+        let ssa = lift_arm64_to_ssa(&blocks, &refs, &args);
+        let text = render_ssa_pseudocode_named_layered(
+            &ssa,
+            "probe",
+            &args,
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        eprintln!("JOIN_BARE_TEXT:\n{text}");
+        assert!(!text.contains("x1"), "{text}");
+        assert!(text.contains("return"), "{text}");
     }
 
     #[test]
