@@ -3589,7 +3589,6 @@ pub fn lift_arm64_to_ssa(
         match r.kind {
             revx_core::ReferenceKind::Call => {
                 call_targets.insert(r.from, r.to);
-                edges.push((r.from, r.to));
             }
             revx_core::ReferenceKind::Jump => {
                 jump_targets.insert(r.from, r.to);
@@ -4370,8 +4369,7 @@ pub fn lift_x64_to_ssa(
         .filter(|r| {
             matches!(
                 r.kind,
-                revx_core::ReferenceKind::Call
-                    | revx_core::ReferenceKind::Jump
+                revx_core::ReferenceKind::Jump
                     | revx_core::ReferenceKind::BranchTrue
                     | revx_core::ReferenceKind::BranchFalse
                     | revx_core::ReferenceKind::Fallthrough
@@ -16041,6 +16039,44 @@ mod string_call_tests {
     fn golden_render(blocks: &[BasicBlock], refs: &[Reference]) -> String {
         let ssa = lift_arm64_to_ssa(blocks, refs, &[]);
         render_ssa_pseudocode_named_layered(&ssa, "probe", &[], &HashMap::new(), &HashMap::new())
+    }
+
+    #[test]
+    fn arm64_golden_call_edge_not_in_cfg() {
+        let blocks = vec![
+            BasicBlock {
+                address: 0x1000,
+                size: 0x8,
+                instructions: vec![
+                    golden_mk(0x1000, "bl 0x2000"),
+                    golden_mk(0x1004, "b 0x1008"),
+                ],
+            },
+            BasicBlock {
+                address: 0x1008,
+                size: 0x8,
+                instructions: vec![golden_mk(0x1008, "mov w0, #0x1"), golden_mk(0x100c, "ret")],
+            },
+        ];
+        let refs = vec![
+            Reference {
+                from: 0x1000,
+                to: 0x2000,
+                kind: ReferenceKind::Call,
+            },
+            Reference {
+                from: 0x1004,
+                to: 0x1008,
+                kind: ReferenceKind::Jump,
+            },
+        ];
+        let ssa = lift_arm64_to_ssa(&blocks, &refs, &[]);
+        assert!(
+            !ssa.cfg.successors(BlockId(0)).contains(&BlockId(0)),
+            "call must not create a self/entry CFG edge"
+        );
+        assert_eq!(ssa.cfg.predecessors(BlockId(0)).len(), 0);
+        assert!(ssa.cfg.successors(BlockId(0)).contains(&BlockId(1)));
     }
 
     #[test]
