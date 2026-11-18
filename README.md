@@ -10,7 +10,7 @@ It is built around three invariants:
 
 This repository is aligned to the ReVX v1 correction plan. It does not treat ad hoc HTTP routes or direct CLI-to-analysis calls as the product contract.
 
-> **Quality vs. memory budget.** The default `REVX_RSS_MB=8` lean mode aggressively truncates analysis (small CFG/decode windows, dropped pseudocode) to fit a tiny memory budget. If decompile output looks empty or wrong, raise the budget before judging quality: `REVX_RSS_MB=512` (or `REVX_FULL_MEM=1`) with `--profile full`. See [Memory and analysis depth](#memory-and-analysis-depth).
+> **Quality vs. memory budget.** By default, small functions (≤1 KiB) are fully structured (loops/ifs/switch, typed arguments) even with `--profile fast`, and full snapshots are persisted. Explicit lean mode (`REVX_LEAN=1` or `REVX_RSS_MB` ≤ 32) trades quality for a tiny memory budget: small CFG/decode windows, stub pseudocode. For the deepest analysis of large functions use `REVX_RSS_MB=512` (or `REVX_FULL_MEM=1`) with `--profile full`. See [Memory and analysis depth](#memory-and-analysis-depth).
 
 ## Current shape
 
@@ -47,7 +47,7 @@ Place `revx`, `revx-engine`, and `revx-micro` side by side on `PATH` (or set `RE
 
 ## Memory and analysis depth
 
-Default analysis targets single-digit MB process growth (`REVX_RSS_MB=8`, 1 job, lean Fast snapshots). **Lean mode trades output quality for memory**: it clamps CFG/decode windows and may drop pseudocode. For faithful decompilation, raise the budget and use `--profile full`:
+Default analysis structures small functions (≤1 KiB) with the region-tree SSA path even under `--profile fast`, and persists full snapshots; process memory scales with the workload. **Explicit lean mode** (`REVX_LEAN=1`, or `REVX_RSS_MB`/`REVX_RSS_KB` ≤ 32 MB) targets single-digit MB growth (1 job, stub pseudocode, clamped CFG/decode windows) and trades output quality for memory. For the deepest analysis of large functions, raise the budget and use `--profile full`:
 
 ```bash
 REVX_RSS_MB=512 revx analyze /path/to/binary --profile full

@@ -5709,7 +5709,7 @@ impl AnalysisRunIngestSession {
             warnings,
         } = function;
 
-        let lean = self.profile == AnalysisProfile::Fast || revx_core::lean_mode();
+        let lean = revx_core::lean_mode();
         if lean {
             let warnings_json = if warnings.is_empty() {
                 "[]".to_string()
