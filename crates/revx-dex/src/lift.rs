@@ -256,8 +256,8 @@ const fn binop(op: u8) -> Option<BinOpKind> {
         0x96 | 0xb6 | 0xd6 | 0xde => BinOpKind::Or,
         0x97 | 0xb7 | 0xd7 | 0xdf => BinOpKind::Xor,
         0x98 | 0xb8 | 0xe0 => BinOpKind::Shl,
-        0x99 | 0xb9 | 0xe1 => BinOpKind::Shr,
-        0x9a | 0xba | 0xe2 => BinOpKind::Sar,
+        0x99 | 0xb9 | 0xe1 => BinOpKind::Sar,
+        0x9a | 0xba | 0xe2 => BinOpKind::Shr,
         _ => return None,
     })
 }
@@ -719,8 +719,8 @@ pub fn decode_insn_structured(units: &[u16], off: usize) -> Option<(Insn, usize)
                 0xa1 => BinOpKind::Or,
                 0xa2 => BinOpKind::Xor,
                 0xa3 => BinOpKind::Shl,
-                0xa4 => BinOpKind::Shr,
-                _ => BinOpKind::Sar,
+                0xa4 => BinOpKind::Sar,
+                _ => BinOpKind::Shr,
             };
             let lhs = (u16_at(units, off + 1) & 0xff);
             let rhs = (u16_at(units, off + 1) >> 8);
@@ -745,8 +745,8 @@ pub fn decode_insn_structured(units: &[u16], off: usize) -> Option<(Insn, usize)
                 0xb6 => BinOpKind::Or,
                 0xb7 => BinOpKind::Xor,
                 0xb8 => BinOpKind::Shl,
-                0xb9 => BinOpKind::Shr,
-                0xba => BinOpKind::Sar,
+                0xb9 => BinOpKind::Sar,
+                0xba => BinOpKind::Shr,
                 0xbb => BinOpKind::Add,
                 0xbc => BinOpKind::Sub,
                 0xbd => BinOpKind::Mul,
@@ -756,8 +756,8 @@ pub fn decode_insn_structured(units: &[u16], off: usize) -> Option<(Insn, usize)
                 0xc1 => BinOpKind::Or,
                 0xc2 => BinOpKind::Xor,
                 0xc3 => BinOpKind::Shl,
-                0xc4 => BinOpKind::Shr,
-                _ => BinOpKind::Sar,
+                0xc4 => BinOpKind::Sar,
+                _ => BinOpKind::Shr,
             };
             return Some((
                 Insn::Binary2Addr {
