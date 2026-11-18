@@ -196,6 +196,41 @@ fn decodes_all_formats_without_panic() {
 }
 
 #[test]
+fn rejects_huge_table_counts_without_allocating() {
+    let mut data = build_synthetic_dex();
+    put_u32(&mut data, 0x38, u32::MAX);
+    let err = match DexFile::parse(data) {
+        Err(err) => err,
+        Ok(_) => panic!("must reject huge string_ids count"),
+    };
+    assert!(err.message.contains("string_ids"), "{err}");
+
+    let mut data = build_synthetic_dex();
+    put_u32(&mut data, 0x60, u32::MAX);
+    let err = match DexFile::parse(data) {
+        Err(err) => err,
+        Ok(_) => panic!("must reject huge class_defs count"),
+    };
+    assert!(err.message.contains("class_defs"), "{err}");
+}
+
+#[test]
+fn rejects_code_item_with_ins_exceeding_registers() {
+    let data = build_synthetic_dex();
+    let dex = DexFile::parse(data).expect("parse");
+    let cd = dex.classes[0].class_data.as_ref().expect("class data");
+    let code_off = cd.direct_methods[0].code_off;
+    let mut data = dex.data.clone();
+    put_u16(&mut data, code_off as usize, 1);
+    put_u16(&mut data, code_off as usize + 2, 5);
+    let dex = DexFile::parse(data).expect("reparse");
+    let err = dex
+        .code_item(code_off)
+        .expect_err("must reject ins_size > registers_size");
+    assert!(err.message.contains("ins_size"), "{err}");
+}
+
+#[test]
 fn parses_real_classes_dex_when_corpus_set() {
     let Ok(path) = std::env::var("REVX_DEX_CORPUS") else {
         eprintln!("skipping: REVX_DEX_CORPUS not set");

@@ -259,35 +259,47 @@ fn tarjan(cfg: &Cfg) -> Vec<BTreeSet<BlockId>> {
 }
 
 impl Tarjan<'_> {
-    fn visit(&mut self, v: usize) {
-        self.indices[v] = Some(self.index);
-        self.low[v] = self.index;
+    fn visit(&mut self, start: usize) {
+        let mut frames: Vec<(usize, usize)> = vec![(start, 0)];
+        self.indices[start] = Some(self.index);
+        self.low[start] = self.index;
         self.index += 1;
-        self.stack.push(v);
-        self.on_stack[v] = true;
-        let succs = self.cfg.succs.get(v).cloned().unwrap_or_default();
-        for succ in succs {
-            let w = succ.0 as usize;
-            if w >= self.indices.len() {
+        self.stack.push(start);
+        self.on_stack[start] = true;
+        while let Some((v, next_succ)) = frames.pop() {
+            let succs = self.cfg.succs.get(v).cloned().unwrap_or_default();
+            if next_succ < succs.len() {
+                frames.push((v, next_succ + 1));
+                let w = succs[next_succ].0 as usize;
+                if w >= self.indices.len() {
+                    continue;
+                }
+                if self.indices[w].is_none() {
+                    self.indices[w] = Some(self.index);
+                    self.low[w] = self.index;
+                    self.index += 1;
+                    self.stack.push(w);
+                    self.on_stack[w] = true;
+                    frames.push((w, 0));
+                } else if self.on_stack[w] {
+                    self.low[v] = self.low[v].min(self.indices[w].unwrap_or(self.low[v]));
+                }
                 continue;
             }
-            if self.indices[w].is_none() {
-                self.visit(w);
-                self.low[v] = self.low[v].min(self.low[w]);
-            } else if self.on_stack[w] {
-                self.low[v] = self.low[v].min(self.indices[w].unwrap_or(self.low[v]));
+            if let Some(&(parent, _)) = frames.last() {
+                self.low[parent] = self.low[parent].min(self.low[v]);
             }
-        }
-        if self.low[v] == self.indices[v].unwrap_or(u32::MAX) {
-            let mut scc = BTreeSet::new();
-            while let Some(w) = self.stack.pop() {
-                self.on_stack[w] = false;
-                scc.insert(BlockId(w as u32));
-                if w == v {
-                    break;
+            if self.low[v] == self.indices[v].unwrap_or(u32::MAX) {
+                let mut scc = BTreeSet::new();
+                while let Some(w) = self.stack.pop() {
+                    self.on_stack[w] = false;
+                    scc.insert(BlockId(w as u32));
+                    if w == v {
+                        break;
+                    }
                 }
+                self.sccs.push(scc);
             }
-            self.sccs.push(scc);
         }
     }
 }

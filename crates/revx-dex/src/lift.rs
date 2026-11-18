@@ -1275,7 +1275,7 @@ impl<'a> DexMethodLifter<'a> {
             .unwrap_or_default();
 
         let registers = self.ctx.code.registers_size;
-        let ins = self.ctx.code.ins_size;
+        let ins = self.ctx.code.ins_size.min(registers);
         let mut param_symbols: Vec<(u16, String)> = Vec::with_capacity(ins as usize);
         for i in 0..ins {
             let reg = registers - ins + i;
@@ -1339,7 +1339,7 @@ impl<'a> DexMethodLifter<'a> {
 
     fn setup_params(&mut self, is_static: bool, param_types: &[String]) {
         let registers = self.ctx.code.registers_size;
-        let ins = self.ctx.code.ins_size;
+        let ins = self.ctx.code.ins_size.min(registers);
         for i in 0..ins {
             let reg = registers - ins + i;
             let name = if !is_static && i == 0 {
@@ -1413,7 +1413,7 @@ impl<'a> DexMethodLifter<'a> {
                 let Some((insn, size)) = insns.get(&cur_off) else {
                     break;
                 };
-                self.lift_insn(bid, cur_off, insn);
+                self.lift_insn(bid, cur_off, insn, *size);
                 if matches!(
                     insn,
                     Insn::Return { .. } | Insn::Throw { .. } | Insn::Goto { .. }
@@ -1544,7 +1544,7 @@ impl<'a> DexMethodLifter<'a> {
         }
     }
 
-    fn lift_insn(&mut self, block: BlockId, _addr: u32, insn: &Insn) {
+    fn lift_insn(&mut self, block: BlockId, addr: u32, insn: &Insn, insn_size: usize) {
         match insn {
             Insn::Nop => {}
             Insn::Move { dst, src } => {
@@ -1805,7 +1805,9 @@ impl<'a> DexMethodLifter<'a> {
                         args: vec![val],
                     },
                 );
-                let keys: Vec<String> = match &insn {
+                let insn_addr = addr;
+                let insn_width = insn_size as u32;
+                let pairs: Vec<(String, u32)> = match &insn {
                     Insn::PackedSwitch { .. } => {
                         match crate::insns::decode_payload(
                             &self.ctx.code.insns,
@@ -1815,8 +1817,15 @@ impl<'a> DexMethodLifter<'a> {
                                 first_key,
                                 targets,
                                 ..
-                            }) => (0..targets.len() as i32)
-                                .map(|i| (first_key + i).to_string())
+                            }) => targets
+                                .iter()
+                                .enumerate()
+                                .map(|(i, t)| {
+                                    (
+                                        (first_key + i as i32).to_string(),
+                                        insn_addr.wrapping_add(*t as u32),
+                                    )
+                                })
                                 .collect(),
                             _ => vec![],
                         }
@@ -1825,22 +1834,24 @@ impl<'a> DexMethodLifter<'a> {
                         &self.ctx.code.insns,
                         *payload_off as usize,
                     ) {
-                        Some(crate::insns::Payload::SparseSwitch { keys, .. }) => {
-                            keys.iter().map(|k| k.to_string()).collect()
-                        }
+                        Some(crate::insns::Payload::SparseSwitch { keys, targets, .. }) => keys
+                            .iter()
+                            .zip(targets.iter())
+                            .map(|(k, t)| (k.to_string(), insn_addr.wrapping_add(*t as u32)))
+                            .collect(),
                         _ => vec![],
                     },
                 };
-                let succs = self.func.cfg.succs[block.0 as usize].clone();
-                for (i, key) in keys.iter().enumerate() {
-                    if let Some(&target) = succs.get(i) {
+                for (key, target_addr) in pairs {
+                    if let Some(&target) = self.block_ids.get(&target_addr) {
                         self.switch_cases
                             .entry(block)
                             .or_default()
-                            .push((key.clone(), target));
+                            .push((key, target));
                     }
                 }
-                if let Some(&target) = succs.get(keys.len()) {
+                let default_addr = insn_addr.wrapping_add(insn_width);
+                if let Some(&target) = self.block_ids.get(&default_addr) {
                     self.switch_cases
                         .entry(block)
                         .or_default()
