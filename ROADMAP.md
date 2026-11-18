@@ -1,7 +1,7 @@
 # ReVX v1 — 有边界的 DEX 质量路线
 
 长期目标是全面、轻量、高性能的逆向工具，并在明确的专项上超越现有工具。
-这不是当前已经实现的结论。R1–R5 只覆盖 DEX 质量主线，不代表“全文件工具”已经完成。
+这不是当前已经实现的结论。R1–R9 覆盖 DEX 质量主线，R10–R12 覆盖 native（ARM64/x64）质量主线；两者都不代表“全文件工具”已经完成。
 每阶段一个 Issue/PR，以可重复的正确性测试和明确交付物验收；阶段结束后停止，不自动扩展范围。
 
 ## 发布验收原则
@@ -151,6 +151,36 @@ Issue #99。边界：同一条 DEX 管线对同一输入在独立进程里字节
 
 验收见 `crates/revx-dex/tests/output_stability.rs`、`crates/revx-analysis/tests/output_stability.rs` 与 [R11 报告](benches/r11-pseudocode-stability-2026-10.md)。
 
+> 后续修正（#145）：R11 当时未改 native phi 分配，遗留的「phi 按寄存器名集合迭代序分配 id」问题在 native 质量主线中彻底修复——`insert_register_phis` 的两处寄存器集合与 `BlockDefMap::iter_pairs` 的 extra 映射均改为排序后遍历，native phi 编号跨进程确定。`crates/revx-analysis/tests/output_stability.rs` 现对 native 菱形也做跨进程字节相等断言。下方「已知降级」中相应条目已作废。
+
+## R12 — Native（ARM64/x64）反编译质量主线：已交付
+
+Issue #104–#144，PR #105–#145。边界：自研 native SSA 提升与渲染的正确性/结构化/确定性，不包装 Ghidra。以 `-O0`/`-O2` 已知答案样本（clang 编译 + objdump 对照）做语义金标准验收，每项修复配 `arm64_golden_*` 测试。
+
+正确性（P0）：
+- 条件恢复：`subs/adds/ands/tst` 经 `__cmp` 物化标志条件，reaching-def 兜底；`csel/csinv/csneg/csinc/cinc/cneg` 全部条件选择变体提升为 `Select`，`neg/negs` 设标志。
+- 栈帧：统一 `var_sp_/var_fp_` 命名，post-index 偏移修正，提升期按指令地址捕获帧基偏移（`frame_offsets`），跨块 store→load 前传。
+- DWARF：DWARF5 `DW_FORM_addrx` 经 `attr_address` 正确解析（修复 address=0 根因），dSYM 回退，签名带类型。
+- 覆盖率：`total_executable_size` 排除 PAGEZERO，`--profile full` 真正解除 lean 上限。
+
+结构化（P1）：
+- CFG 保留自环回边（不再 `from != to` 丢弃），call 边不进 intra-procedural CFG（`bl` 返回下条指令，非到被调入口的转移）。
+- 循环携带 phi 放置 + `rename_loop_carried_operands`；`propagate_join_phis` 为用而无定义的寄存器补入口隐式定义，建循环不变量汇合 phi。
+- 自环渲染为 `while`，循环体发射命名变量更新（`var_x8/var_x9`），冗余中间 phi 过滤。
+- 地址感知符号解析（`resolve_block_invariant_symbols`）：读指令地址之前的定义，回退前驱出口定义（优先 phi），消除尾声 reload 污染与裸寄存器（main 循环条件、recursive_fib 返回）。
+
+渲染整洁：
+- 变参实参端到端恢复（截断跳过变参、跨块栈实参扫描、`call_stack_slot_offset` 统一窗口）。
+- `argv` 字节偏移按元素下标渲染（`argv[1]` 非 `argv[8]`）。
+- 长表达式 CSE、空 else 折叠、结构化输出中孤立 `// bb` 注释清理。
+
+确定性：
+- native phi 分配确定性排序（见 R11 后续修正），`output_stability` 跨进程字节相等。
+
+验收：`crates/revx-analysis/src/ssa.rs` 内 `arm64_golden_*` 金标准测试 + `tests/output_stability.rs`、`tests/native_region.rs`。每个 PR fmt/clippy/check/test 全 workspace 绿、CI 绿、无 `-O0` 回归。
+
+仍待后续里程碑（不在本主线承诺）：`-O2` switch 跳转表恢复、x64 stripped 函数发现覆盖、Ghidra 桥接深度模式。
+
 ## 已知降级（v1 冻结）
 
 - 两个循环出口都与循环外代码汇合：`unsupported_control_flow`，整方法 legacy。
@@ -158,7 +188,7 @@ Issue #99。边界：同一条 DEX 管线对同一输入在独立进程里字节
 - 多入口循环碰到异常元数据：`loop_exception_intersection`。
 - 拆分预算不够：`budget_exceeded`。
 - 悬空 `goto` 标签：`unknown`。
-- Native SSA 的 phi 仍按寄存器名集合的迭代顺序分配 id。R11 的 ARM64 菱形文本不包含这些 id。
+- ~~Native SSA 的 phi 仍按寄存器名集合的迭代顺序分配 id。~~ **已修复（#145）**：native phi 分配改为确定性排序，跨进程字节稳定，见 R11 后续修正。
 
 ## 已知限制与工程规则
 

@@ -1,12 +1,16 @@
 # ReVX
 
-`revx` is a new standalone Rust reverse-engineering workspace built around three invariants:
+`revx` is a standalone Rust reverse-engineering workspace whose distinguishing bet is **MCP-native, agent-driven analysis**: the same capability surface is exposed to a human CLI and to an LLM agent over MCP, so an agent can open a binary, run analysis, decompile, query xrefs, and build evidence packs as first-class tools — locally, on your machine. It is not trying to out-decompile Ghidra/IDA on raw output quality; its niche is being the reverse-engineering backend an agent can drive end to end.
+
+It is built around three invariants:
 
 - one cross-platform binary for Windows, macOS, and Linux hosts,
 - one workspace authority in `.revx/`,
 - one daemon capability surface shared by CLI and MCP.
 
 This repository is aligned to the ReVX v1 correction plan. It does not treat ad hoc HTTP routes or direct CLI-to-analysis calls as the product contract.
+
+> **Quality vs. memory budget.** The default `REVX_RSS_MB=8` lean mode aggressively truncates analysis (small CFG/decode windows, dropped pseudocode) to fit a tiny memory budget. If decompile output looks empty or wrong, raise the budget before judging quality: `REVX_RSS_MB=512` (or `REVX_FULL_MEM=1`) with `--profile full`. See [Memory and analysis depth](#memory-and-analysis-depth).
 
 ## Current shape
 
@@ -16,7 +20,8 @@ The Rust workspace is split into:
 - `revx-loader`: PE/ELF/Mach-O normalization, strings, relocations, debug hooks
 - `revx-arch-x64`: x86_64 decode and reference extraction
 - `revx-arch-arm64`: arm64 decode and reference extraction
-- `revx-analysis`: cross-arch recovery pipeline prototype using the canonical model
+- `revx-analysis`: cross-arch recovery pipeline (ARM64/x64 SSA lift, region-tree structuring, named pseudocode) using the canonical model; see [ROADMAP.md](ROADMAP.md) R10–R12 for delivered quality milestones
+- `revx-dex`: DEX/APK lift, region-tree structuring, goto census (R1–R9)
 - `revx-workspace`: SQLite authority plus content-addressed artifact store
 - `revx-daemon`: transport-agnostic capability service, local IPC, stdio MCP
 - `revx` binary: ultra-thin CLI (`revx-query` + system SQLite; light query/status/func/xrefs/decompile/disasm)
@@ -40,11 +45,23 @@ x86_64 decode is optional via `revx-analysis` feature `arch-x64`.
 
 Place `revx`, `revx-engine`, and `revx-micro` side by side on `PATH` (or set `REVX_ENGINE`). Light commands stay in-process; heavy commands spawn `revx-engine`. System `sqlite3` (pkg-config) is required for non-bundled builds.
 
-Default analysis targets single-digit MB process growth (`REVX_RSS_MB=8`, 1 job, lean Fast snapshots). Raise only when needed via `REVX_FULL_MEM=1` / `REVX_RSS_MB=512`. Ultra-low: `REVX_MICRO=1`.
+## Memory and analysis depth
+
+Default analysis targets single-digit MB process growth (`REVX_RSS_MB=8`, 1 job, lean Fast snapshots). **Lean mode trades output quality for memory**: it clamps CFG/decode windows and may drop pseudocode. For faithful decompilation, raise the budget and use `--profile full`:
+
+```bash
+REVX_RSS_MB=512 revx analyze /path/to/binary --profile full
+# or
+REVX_FULL_MEM=1 revx analyze /path/to/binary --profile full
+```
+
+Ultra-low memory: `REVX_MICRO=1` (pure-std ELF analyzer, `revx analyze --micro`).
 
 When memory headroom is raised (`REVX_FULL_MEM=1` or `REVX_RSS_MB`/`REVX_RSS_KB` above the 8 MB default), analysis jobs default to `min(4, available cores)`; lean/micro stay at 1. Set `REVX_JOBS` to override explicitly.
 
 Analysis depth caps are tunable per run without recompiling: `REVX_MAX_GLOBAL_REFERENCES` (512), `REVX_MAX_CFG_BLOCKS` (48), `REVX_MAX_CFG_INSTRUCTIONS` (192), `REVX_MAX_SHARED_STRING_MAP` (64), `REVX_MAX_DATA_REF_SCAN_INSTS` (256). An explicit value wins over the lean-mode clamp.
+
+Native decompiler diagnostics (ARM64/x64 SSA): `REVX_REGION_TREE=0` forces linear block emission (disables the region-tree structurer); `REVX_REGION_TRACE=1` logs region-walk adoption/fallback per function. These are debugging aids, not quality knobs.
 
 Benchmarks: `scripts/bench.sh` runs the criterion suite (`cargo bench -p revx-analysis --bench analyze`) in lean and full-memory passes and writes a CSV baseline to `target/bench-results/<stamp>/summary.csv`.
 
