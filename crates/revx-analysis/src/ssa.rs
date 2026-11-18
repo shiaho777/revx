@@ -7739,17 +7739,33 @@ fn resolve_const_operand_depth(func: &SsaFunction, op: &Operand, depth: usize) -
 }
 
 fn operand_is_stack_slot_value(func: &SsaFunction, op: &Operand) -> bool {
+    operand_is_stack_slot_value_inner(func, op, 0, &mut HashSet::new())
+}
+
+fn operand_is_stack_slot_value_inner(
+    func: &SsaFunction,
+    op: &Operand,
+    depth: usize,
+    visited: &mut HashSet<u32>,
+) -> bool {
+    if depth > 24 {
+        return false;
+    }
     let Operand::Value(id) = op else {
         return false;
     };
+    if !visited.insert(id.0) {
+        return false;
+    }
     let Some(inst) = func.values.get(id.0 as usize) else {
         return false;
     };
     match &inst.op {
         SsaOp::Load { addr } => stack_slot_offset(func, addr).is_some(),
-        SsaOp::Copy { src } => operand_is_stack_slot_value(func, src),
+        SsaOp::Copy { src } => operand_is_stack_slot_value_inner(func, src, depth + 1, visited),
         SsaOp::BinOp { lhs, rhs, .. } => {
-            operand_is_stack_slot_value(func, lhs) || operand_is_stack_slot_value(func, rhs)
+            operand_is_stack_slot_value_inner(func, lhs, depth + 1, visited)
+                || operand_is_stack_slot_value_inner(func, rhs, depth + 1, visited)
         }
         _ => false,
     }
@@ -15030,9 +15046,24 @@ fn polish_call_arg_operand(
 }
 
 fn operand_is_value_arithmetic(func: &SsaFunction, operand: &Operand) -> bool {
+    operand_is_value_arithmetic_inner(func, operand, 0, &mut HashSet::new())
+}
+
+fn operand_is_value_arithmetic_inner(
+    func: &SsaFunction,
+    operand: &Operand,
+    depth: usize,
+    visited: &mut HashSet<u32>,
+) -> bool {
+    if depth > 24 {
+        return false;
+    }
     let Operand::Value(id) = operand else {
         return false;
     };
+    if !visited.insert(id.0) {
+        return false;
+    }
     let Some(inst) = func.values.get(id.0 as usize) else {
         return false;
     };
@@ -15042,7 +15073,7 @@ fn operand_is_value_arithmetic(func: &SsaFunction, operand: &Operand) -> bool {
                 && (operand_is_stack_slot_value(func, lhs)
                     || operand_is_stack_slot_value(func, rhs))
         }
-        SsaOp::Copy { src } => operand_is_value_arithmetic(func, src),
+        SsaOp::Copy { src } => operand_is_value_arithmetic_inner(func, src, depth + 1, visited),
         _ => false,
     }
 }
@@ -18819,5 +18850,53 @@ mod review_fix_tests {
             }
             other => panic!("unexpected ops: {other:?}"),
         }
+    }
+
+    #[test]
+    fn stack_slot_walkers_terminate_on_cyclic_values() {
+        let cfg = Cfg::from_blocks(&[(0x1000, vec![0x1000, 0x1004, 0x1008])], &[]);
+        let mut func = SsaFunction::new(cfg);
+        let a = func.new_value_id();
+        let b = func.new_value_id();
+        func.values.push(SsaInstruction {
+            id: a,
+            op: SsaOp::Copy {
+                src: Operand::Value(b),
+            },
+            source_addr: 0x1000,
+            block: BlockId(0),
+        });
+        func.values.push(SsaInstruction {
+            id: b,
+            op: SsaOp::BinOp {
+                kind: BinOpKind::Add,
+                lhs: Operand::Value(a),
+                rhs: Operand::Constant(1),
+            },
+            source_addr: 0x1004,
+            block: BlockId(0),
+        });
+        func.cfg.block_mut(BlockId(0)).insts.push(a);
+        func.cfg.block_mut(BlockId(0)).insts.push(b);
+        assert!(!operand_is_stack_slot_value(&func, &Operand::Value(a)));
+        assert!(!operand_is_value_arithmetic(&func, &Operand::Value(a)));
+        let mut long_chain = SsaFunction::new(Cfg::from_blocks(
+            &[(0x2000, (0..64).map(|i| 0x2000 + i * 4).collect())],
+            &[],
+        ));
+        let mut prev = Operand::Constant(0);
+        for i in 0..64u64 {
+            let id = long_chain.new_value_id();
+            long_chain.values.push(SsaInstruction {
+                id,
+                op: SsaOp::Copy { src: prev },
+                source_addr: 0x2000 + i * 4,
+                block: BlockId(0),
+            });
+            long_chain.cfg.block_mut(BlockId(0)).insts.push(id);
+            prev = Operand::Value(id);
+        }
+        assert!(!operand_is_stack_slot_value(&long_chain, &prev));
+        assert!(!operand_is_value_arithmetic(&long_chain, &prev));
     }
 }
