@@ -58,7 +58,7 @@ const MAX_SSA_INSTS: usize = 128;
 const MAX_SSA_BLOCKS: usize = 32;
 const MAX_LINEAR_SSA_INSTS: usize = 512;
 const MAX_LINEAR_SSA_BLOCKS: usize = 96;
-const MAX_FAST_SSA_INSTS: usize = 48;
+const MAX_FAST_SSA_INSTS: usize = 128;
 const MAX_FAST_PSEUDO_LINES: usize = 48;
 const LIGHT_VAR_RECOVERY_INSTS: usize = 128;
 const MAX_OVERSIZE_WINDOW_BLOCKS: usize = 64;
@@ -1779,7 +1779,9 @@ where
         }
 
         let inst_count = inst_count_pre;
-        let use_ssa = profile == AnalysisProfile::Full
+        let structuring_allowed =
+            (profile == AnalysisProfile::Full || deep) && !resource::micro_mode();
+        let use_ssa = structuring_allowed
             && !blocks.is_empty()
             && inst_count <= ssa_inst_limit(profile)
             && blocks.len() <= ssa_block_limit(profile);
@@ -1788,7 +1790,7 @@ where
             && !use_ssa
             && inst_count <= linear_ssa_inst_limit(profile)
             && blocks.len() <= linear_ssa_block_limit(profile);
-        let use_heavy = profile == AnalysisProfile::Full
+        let use_heavy = structuring_allowed
             && !blocks.is_empty()
             && inst_count <= heavy_inst_limit(profile)
             && blocks.len() <= heavy_block_limit(profile);
@@ -2349,6 +2351,14 @@ fn assign_deep_flags(
         pending[idx].deep = true;
         deep.insert(pending[idx].address);
     }
+    if !resource::lean_mode() && !resource::micro_mode() {
+        for pf in pending.iter_mut() {
+            if !pf.deep && pf.size <= 0x400 {
+                pf.deep = true;
+                deep.insert(pf.address);
+            }
+        }
+    }
     deep
 }
 
@@ -2415,11 +2425,13 @@ fn cfg_inst_limit(profile: AnalysisProfile) -> usize {
 }
 
 fn default_max_function_bytes(architecture: Architecture, profile: AnalysisProfile) -> usize {
-    match (architecture, profile) {
-        (Architecture::Arm64, AnalysisProfile::Full) => FULL_MAX_FUNCTION_BYTES_ARM64,
-        (Architecture::Arm64, _) => DEFAULT_MAX_FUNCTION_BYTES_ARM64,
-        (_, AnalysisProfile::Full) => FULL_MAX_FUNCTION_BYTES_X64,
-        _ => DEFAULT_MAX_FUNCTION_BYTES_X64,
+    let full_window =
+        profile == AnalysisProfile::Full || (!resource::lean_mode() && !resource::micro_mode());
+    match (architecture, full_window) {
+        (Architecture::Arm64, true) => FULL_MAX_FUNCTION_BYTES_ARM64,
+        (Architecture::Arm64, false) => DEFAULT_MAX_FUNCTION_BYTES_ARM64,
+        (_, true) => FULL_MAX_FUNCTION_BYTES_X64,
+        (_, false) => DEFAULT_MAX_FUNCTION_BYTES_X64,
     }
 }
 
