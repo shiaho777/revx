@@ -1917,9 +1917,7 @@ fn handle_mcp_jsonrpc(
         .cloned()
         .unwrap_or(serde_json::Value::Null);
     let Some(method) = request.get("method").and_then(|m| m.as_str()) else {
-        if request.get("id").is_none() {
-            return None;
-        }
+        request.get("id")?;
         return Some(jsonrpc_error(
             request_id,
             -32600,
@@ -5960,7 +5958,10 @@ mod tests {
     fn windows_pipe_name_is_well_formed() {
         let dir = tempdir().expect("tempdir");
         let name = super::windows_pipe_name(dir.path());
-        assert!(name.starts_with(r"\\.\pipe\revx-"), "bad pipe name: {name:?}");
+        assert!(
+            name.starts_with(r"\\.\pipe\revx-"),
+            "bad pipe name: {name:?}"
+        );
         assert!(!name.contains('\n'));
         assert!(!name.contains('\r'));
         let suffix = name.strip_prefix(r"\\.\pipe\revx-").expect("prefix");

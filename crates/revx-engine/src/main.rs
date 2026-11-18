@@ -1906,10 +1906,7 @@ fn resolve_mcp_token(project: &std::path::Path, explicit: Option<String>) -> Res
     if let Ok(existing) = std::fs::read_to_string(&token_path) {
         let existing = existing.trim().to_string();
         if !existing.is_empty() {
-            eprintln!(
-                "revx mcp http token loaded from {}",
-                token_path.display()
-            );
+            eprintln!("revx mcp http token loaded from {}", token_path.display());
             return Ok(existing);
         }
     }
@@ -1951,40 +1948,6 @@ fn write_private_token(path: &std::path::Path, token: &str) -> Result<String> {
             Ok(existing)
         }
         Err(err) => Err(err).with_context(|| format!("failed to create {}", path.display())),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::resolve_mcp_token;
-
-    #[test]
-    fn explicit_token_wins() {
-        let dir = std::env::temp_dir().join(format!("revx-token-test-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).expect("dir");
-        let token = resolve_mcp_token(&dir, Some("explicit".to_string())).expect("token");
-        assert_eq!(token, "explicit");
-        assert!(!dir.join(".revx").join("mcp-token").exists());
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn generated_token_persists_and_reloads() {
-        let dir = std::env::temp_dir().join(format!("revx-token-test-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).expect("dir");
-        let first = resolve_mcp_token(&dir, None).expect("token");
-        assert!(!first.is_empty());
-        let path = dir.join(".revx").join("mcp-token");
-        assert_eq!(std::fs::read_to_string(&path).expect("read"), first);
-        let second = resolve_mcp_token(&dir, None).expect("token");
-        assert_eq!(first, second);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(&path).expect("meta").permissions().mode();
-            assert_eq!(mode & 0o777, 0o600);
-        }
-        std::fs::remove_dir_all(&dir).ok();
     }
 }
 
@@ -2310,5 +2273,39 @@ async fn dispatch_from_cwd(request: CapabilityRequest) -> Result<revx_core::Capa
         send_ipc_request(&workspace_root, request).await
     } else {
         local_service_for_cwd()?.dispatch(request)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_mcp_token;
+
+    #[test]
+    fn explicit_token_wins() {
+        let dir = std::env::temp_dir().join(format!("revx-token-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let token = resolve_mcp_token(&dir, Some("explicit".to_string())).expect("token");
+        assert_eq!(token, "explicit");
+        assert!(!dir.join(".revx").join("mcp-token").exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn generated_token_persists_and_reloads() {
+        let dir = std::env::temp_dir().join(format!("revx-token-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let first = resolve_mcp_token(&dir, None).expect("token");
+        assert!(!first.is_empty());
+        let path = dir.join(".revx").join("mcp-token");
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), first);
+        let second = resolve_mcp_token(&dir, None).expect("token");
+        assert_eq!(first, second);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).expect("meta").permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
