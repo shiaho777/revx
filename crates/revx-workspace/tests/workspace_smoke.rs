@@ -2045,9 +2045,158 @@ fn analyzes_jvm_classes_as_agent_ready_evidence() {
     }));
 }
 
-#[ignore = "depends on host python3 pyc magic; analyzer only supports some versions, tracked in #149"]
+fn marshal_i32(out: &mut Vec<u8>, value: i32) {
+    out.extend_from_slice(&value.to_le_bytes());
+}
+
+fn marshal_str(out: &mut Vec<u8>, tag: u8, value: &str) {
+    out.push(tag);
+    marshal_i32(out, value.len() as i32);
+    out.extend_from_slice(value.as_bytes());
+}
+
+fn marshal_short_str(out: &mut Vec<u8>, tag: u8, value: &str) {
+    out.push(tag);
+    out.push(value.len() as u8);
+    out.extend_from_slice(value.as_bytes());
+}
+
+fn marshal_empty_tuple(out: &mut Vec<u8>) {
+    out.push(b')');
+    out.push(0);
+}
+
+fn marshal_code_object(out: &mut Vec<u8>, name: &str, qualname: Option<&str>, py311_plus: bool) {
+    out.push(b'c');
+    for value in [0i32, 0, 0, 0, 2, 0x40] {
+        marshal_i32(out, value);
+    }
+    marshal_str(out, b's', "\x64\x00\x53\x00");
+    out.push(b')');
+    out.push(3);
+    marshal_str(out, b'u', "https://c2.example.invalid/stage");
+    marshal_str(out, b'u', "/bin/sh");
+    if py311_plus {
+        out.push(b'N');
+    } else {
+        marshal_str(out, b'u', "doc");
+    }
+    out.push(b')');
+    out.push(2);
+    marshal_short_str(out, b'z', "subprocess");
+    marshal_short_str(out, b'z', "socket");
+    marshal_empty_tuple(out);
+    marshal_empty_tuple(out);
+    marshal_empty_tuple(out);
+    marshal_str(out, b'u', "agent.py");
+    marshal_short_str(out, b'z', name);
+    if py311_plus {
+        marshal_short_str(out, b'z', qualname.unwrap_or(name));
+    }
+    marshal_i32(out, 1);
+    marshal_str(out, b's', "");
+    if py311_plus {
+        marshal_str(out, b's', "");
+    }
+}
+
+fn sample_python_pyc(magic: u32, py311_plus: bool) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&magic.to_le_bytes());
+    marshal_i32(&mut out, 0);
+    marshal_i32(&mut out, 1_700_000_000);
+    marshal_i32(&mut out, 256);
+    marshal_code_object(&mut out, "<module>", None, py311_plus);
+    out
+}
+
+fn assert_python_pyc_evidence(pyc_bytes: &[u8], expect_qualname: bool) {
+    let dir = tempdir().unwrap();
+    let ws = Workspace::init(dir.path(), "test", None).unwrap();
+    let pyc_path = dir.path().join("agent.pyc");
+    std::fs::write(&pyc_path, pyc_bytes).unwrap();
+
+    let graph = revx_loader::identify_object_graph(&pyc_path, 1, 16).unwrap();
+    assert_eq!(graph.objects[0].format.as_deref(), Some("python_bytecode"));
+    ws.save_object_graph(&graph).unwrap();
+    let analysis = ws
+        .analyze_object(&pyc_path.display().to_string(), None)
+        .unwrap()
+        .expect("Python bytecode analysis");
+    let pyc = analysis
+        .analyses
+        .iter()
+        .find(|analysis| analysis.analyzer == "python_bytecode")
+        .expect("Python bytecode analyzer");
+    assert_eq!(pyc.status, ObjectAnalysisStatus::Completed);
+    assert_eq!(
+        pyc.details["header"]["hash_based"],
+        serde_json::json!(false)
+    );
+    assert!(
+        pyc.details["names"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|name| name["value"] == "subprocess")
+    );
+    assert!(
+        pyc.details["strings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|string| string["value"] == "https://c2.example.invalid/stage")
+    );
+    let module = &pyc.details["code_objects"][0];
+    assert_eq!(module["name"], serde_json::json!("<module>"));
+    assert_eq!(module["filename"], serde_json::json!("agent.py"));
+    if expect_qualname {
+        assert_eq!(module["qualname"], serde_json::json!("<module>"));
+        assert_eq!(module["exceptiontable_type"], serde_json::json!("bytes"));
+    }
+    for expected in [
+        "python_bytecode_present",
+        "subprocess_reference",
+        "network_api_reference",
+        "url_strings_present",
+        "shell_command_strings",
+    ] {
+        assert!(
+            pyc.details["risk_signals"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|signal| signal.as_str().unwrap() == expected),
+            "missing {expected}"
+        );
+    }
+    assert!(
+        analysis
+            .evidence_ids
+            .iter()
+            .any(|id| id.ends_with(":python_bytecode"))
+    );
+    let evidence = ws.export_evidence_by_subject("agent.pyc", 10).unwrap();
+    assert!(evidence.preview.iter().any(|item| {
+        item.kind == "object_analysis"
+            && item.provenance.source == "python_bytecode"
+            && item.id.ends_with(":python_bytecode")
+    }));
+}
+
 #[test]
 fn analyzes_python_bytecode_as_agent_ready_evidence() {
+    assert_python_pyc_evidence(&sample_python_pyc(0x0a0d_0da7, true), true);
+}
+
+#[test]
+fn analyzes_legacy_layout_python_bytecode() {
+    assert_python_pyc_evidence(&sample_python_pyc(0x0a0d_0d61, false), false);
+}
+
+#[test]
+#[ignore = "optional: compiles with host python3; version-dependent, deterministic coverage lives in the hermetic tests"]
+fn analyzes_host_compiled_python_bytecode() {
     if Command::new("python3").arg("--version").output().is_err() {
         eprintln!("skipping: python3 not available");
         return;
