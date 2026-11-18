@@ -2594,6 +2594,7 @@ const REG_SLOT_COUNT: usize = 35;
 pub struct BlockDefMap {
     slots: [Option<SsaValueId>; REG_SLOT_COUNT],
     extra: HashMap<String, SsaValueId>,
+    history: HashMap<String, Vec<SsaValueId>>,
 }
 
 impl Default for BlockDefMap {
@@ -2601,6 +2602,7 @@ impl Default for BlockDefMap {
         Self {
             slots: [None; REG_SLOT_COUNT],
             extra: HashMap::new(),
+            history: HashMap::new(),
         }
     }
 }
@@ -2610,7 +2612,23 @@ impl BlockDefMap {
         Self {
             slots: [None; REG_SLOT_COUNT],
             extra: HashMap::with_capacity(extra_cap),
+            history: HashMap::new(),
         }
+    }
+
+    fn record_history(&mut self, reg: &str, previous: Option<SsaValueId>, current: SsaValueId) {
+        let Some(previous) = previous else {
+            return;
+        };
+        let entry = self.history.entry(reg.to_string()).or_default();
+        if entry.is_empty() {
+            entry.push(previous);
+        }
+        entry.push(current);
+    }
+
+    pub fn history(&self, reg: &str) -> Option<&[SsaValueId]> {
+        self.history.get(reg).map(|ids| ids.as_slice())
     }
 
     #[inline]
@@ -2695,24 +2713,36 @@ impl BlockDefMap {
 
     #[inline]
     pub fn insert(&mut self, reg: String, id: SsaValueId) -> Option<SsaValueId> {
-        if let Some(slot) = Self::slot_of(&reg) {
-            return self.slots[slot].replace(id);
-        }
-        self.extra.insert(reg, id)
+        let previous = if let Some(slot) = Self::slot_of(&reg) {
+            self.slots[slot].replace(id)
+        } else {
+            self.extra.insert(reg.clone(), id)
+        };
+        self.record_history(&reg, previous, id);
+        previous
     }
 
     #[inline]
     pub fn insert_reg(&mut self, reg: &str, id: SsaValueId) -> Option<SsaValueId> {
         if let Some(slot) = Self::slot_of(reg) {
-            return self.slots[slot].replace(id);
+            let previous = self.slots[slot].replace(id);
+            self.record_history(reg, previous, id);
+            return previous;
         }
         if let Some(s) = normalize_reg_static(reg) {
             if let Some(slot) = Self::slot_of(s) {
-                return self.slots[slot].replace(id);
+                let previous = self.slots[slot].replace(id);
+                self.record_history(s, previous, id);
+                return previous;
             }
-            return self.extra.insert(s.to_string(), id);
+            let previous = self.extra.insert(s.to_string(), id);
+            self.record_history(s, previous, id);
+            return previous;
         }
-        self.extra.insert(normalize_reg(reg), id)
+        let normalized = normalize_reg(reg);
+        let previous = self.extra.insert(normalized.clone(), id);
+        self.record_history(&normalized, previous, id);
+        previous
     }
 
     #[inline]
@@ -6509,6 +6539,22 @@ fn reg_def_before(func: &SsaFunction, reg: &str, block: BlockId, addr: u64) -> O
         }
     }
     let mut best: Option<(u64, SsaValueId)> = None;
+    if let Some(history) = func.block_defs(block).and_then(|m| m.history(reg)) {
+        for &iid in history {
+            let Some(inst) = func.values.get(iid.0 as usize) else {
+                continue;
+            };
+            if inst.source_addr >= addr {
+                continue;
+            }
+            if best.is_none() || inst.source_addr > best.unwrap().0 {
+                best = Some((inst.source_addr, iid));
+            }
+        }
+        if best.is_some() {
+            return best.map(|(_, id)| id);
+        }
+    }
     for &iid in &func.cfg.block(block).insts {
         let Some(inst) = func.values.get(iid.0 as usize) else {
             continue;
@@ -7172,7 +7218,23 @@ fn block_can_fall_through(block: &revx_core::BasicBlock) -> bool {
     let opcode = text.split_whitespace().next().unwrap_or("");
     !matches!(
         opcode,
-        "ret" | "retaa" | "retab" | "eret" | "b" | "br" | "braa" | "brab"
+        "ret"
+            | "retaa"
+            | "retab"
+            | "eret"
+            | "b"
+            | "br"
+            | "braa"
+            | "brab"
+            | "drps"
+            | "jmp"
+            | "retf"
+            | "ud2"
+            | "int3"
+            | "hlt"
+            | "iret"
+            | "iretd"
+            | "iretq"
     )
 }
 
@@ -18639,5 +18701,123 @@ mod loop_dom_tests {
         );
         assert!(dt.dominates(BlockId(1), BlockId(4)));
         assert!(!dt.dominates(BlockId(2), BlockId(4)));
+    }
+}
+
+#[cfg(test)]
+mod review_fix_tests {
+    use super::*;
+
+    fn mk_inst(addr: u64, text: &str) -> revx_core::Instruction {
+        revx_core::Instruction {
+            address: addr,
+            bytes: std::sync::Arc::from("00"),
+            text: std::sync::Arc::from(text),
+        }
+    }
+
+    fn mk_block(address: u64, lines: &[(u64, &str)]) -> revx_core::BasicBlock {
+        revx_core::BasicBlock {
+            address,
+            size: lines.len() as u64 * 4,
+            instructions: lines.iter().map(|(a, t)| mk_inst(*a, t)).collect(),
+        }
+    }
+
+    #[test]
+    fn x64_unconditional_jump_block_has_no_fallthrough() {
+        let blocks = vec![
+            mk_block(0x1000, &[(0x1000, "mov rax, 1"), (0x1003, "jmp 0x2000")]),
+            mk_block(0x2000, &[(0x2000, "ret")]),
+        ];
+        let refs = vec![revx_core::Reference {
+            from: 0x1003,
+            to: 0x2000,
+            kind: revx_core::ReferenceKind::Jump,
+        }];
+        let func = lift_x64_to_ssa(&blocks, &refs, &[]);
+        assert_eq!(
+            func.cfg.succs[0].len(),
+            1,
+            "jmp block must have one successor"
+        );
+        assert_eq!(func.cfg.succs[0][0], BlockId(1));
+        assert!(func.cfg.preds[1].contains(&BlockId(0)));
+    }
+
+    #[test]
+    fn x64_ud2_and_hlt_blocks_do_not_fall_through() {
+        for terminal in ["ud2", "hlt", "int3", "iretq"] {
+            let block = mk_block(0x1000, &[(0x1000, terminal)]);
+            assert!(
+                !block_can_fall_through(&block),
+                "{terminal} must not fall through"
+            );
+        }
+        let conditional = mk_block(0x1000, &[(0x1000, "je 0x2000")]);
+        assert!(block_can_fall_through(&conditional));
+    }
+
+    #[test]
+    fn reg_def_before_picks_latest_mid_block_definition() {
+        let cfg = Cfg::from_blocks(&[(0x1000, vec![0x1000, 0x1004, 0x1008, 0x100c])], &[]);
+        let mut func = SsaFunction::new(cfg);
+        let first = func.define_norm(
+            "x0".to_string(),
+            BlockId(0),
+            SsaOp::Copy {
+                src: Operand::Constant(1),
+            },
+            0x1000,
+        );
+        let second = func.define_norm(
+            "x0".to_string(),
+            BlockId(0),
+            SsaOp::Copy {
+                src: Operand::Constant(2),
+            },
+            0x1008,
+        );
+        func.push_inst(
+            BlockId(0),
+            SsaOp::BinOp {
+                kind: BinOpKind::Add,
+                lhs: Operand::Symbol("x0".to_string()),
+                rhs: Operand::Constant(3),
+            },
+            0x1004,
+        );
+        func.push_inst(
+            BlockId(0),
+            SsaOp::BinOp {
+                kind: BinOpKind::Add,
+                lhs: Operand::Symbol("x0".to_string()),
+                rhs: Operand::Constant(4),
+            },
+            0x100c,
+        );
+        assert_eq!(reg_def_before(&func, "x0", BlockId(0), 0x1004), Some(first));
+        assert_eq!(
+            reg_def_before(&func, "x0", BlockId(0), 0x100c),
+            Some(second)
+        );
+        resolve_block_invariant_symbols(&mut func);
+        let mid = func
+            .values
+            .iter()
+            .find(|v| v.source_addr == 0x1004)
+            .expect("mid inst");
+        let late = func
+            .values
+            .iter()
+            .find(|v| v.source_addr == 0x100c)
+            .expect("late inst");
+        match (&mid.op, &late.op) {
+            (SsaOp::BinOp { lhs: mid_lhs, .. }, SsaOp::BinOp { lhs: late_lhs, .. }) => {
+                assert_eq!(*mid_lhs, Operand::Value(first));
+                assert_eq!(*late_lhs, Operand::Value(second));
+            }
+            other => panic!("unexpected ops: {other:?}"),
+        }
     }
 }

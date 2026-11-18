@@ -8,3 +8,6 @@ authors.workspace = true
 [[bin]]
 name = "revx-micro"
 path = "src/main.rs"
+
+[dev-dependencies]
+tempfile.workspace = true

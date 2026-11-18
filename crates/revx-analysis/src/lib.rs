@@ -3664,15 +3664,22 @@ fn decode_arm64_cfg_with_references(
             }
         }
 
+        let mut kept_all = true;
         for inst in block {
             if instruction_map.len() >= cfg_inst_limit(profile) {
+                kept_all = false;
                 break;
             }
             instruction_map.entry(inst.address).or_insert(inst);
         }
-        all_refs.extend(expanded_refs);
+        all_refs.extend(
+            expanded_refs
+                .into_iter()
+                .filter(|r| instruction_map.contains_key(&r.from)),
+        );
 
-        if has_implicit_fallthrough
+        if kept_all
+            && has_implicit_fallthrough
             && let Some(next) = fallthrough
             && next >= start
             && next < max_end
@@ -3793,14 +3800,21 @@ fn decode_arm64_cfg_with_references(
                 _ => {}
             }
         }
+        let mut kept_all = true;
         for inst in block {
             if instruction_map.len() >= cfg_inst_limit(profile) {
+                kept_all = false;
                 break;
             }
             instruction_map.entry(inst.address).or_insert(inst);
         }
-        all_refs.extend(expanded_refs);
-        if has_implicit_fallthrough
+        all_refs.extend(
+            expanded_refs
+                .into_iter()
+                .filter(|r| instruction_map.contains_key(&r.from)),
+        );
+        if kept_all
+            && has_implicit_fallthrough
             && let Some(next) = fallthrough
             && next >= start
             && next < max_end
@@ -3954,6 +3968,17 @@ fn recover_arm64_pc_rel_jump_table_targets(
                     let base_reg = mem_parts[0].to_ascii_lowercase();
                     if text.starts_with("ldrsw ") {
                         entry_size = 4;
+                    } else if text.starts_with("ldr ") {
+                        let dst_token = text
+                            .split_whitespace()
+                            .nth(1)
+                            .unwrap_or("")
+                            .trim_end_matches(',');
+                        if dst_token.starts_with('x') {
+                            entry_size = 8;
+                        } else {
+                            entry_size = 4;
+                        }
                     }
                     if let Some(page) = find_adrp_page(block, &base_reg) {
                         if let Some(imm) = find_add_imm_to(block, &base_reg) {
@@ -4009,10 +4034,18 @@ fn recover_arm64_pc_rel_jump_table_targets(
     let mut valid_entries = 0usize;
     for i in 0..max_entries {
         let entry_addr = table_base.wrapping_add((i as u64).wrapping_mul(entry_size as u64));
-        let Some(rel) = read_i32_at(code_regions, entry_addr) else {
-            break;
+        let rel = if entry_size == 8 {
+            let Some(value) = read_i64_at(code_regions, entry_addr) else {
+                break;
+            };
+            value
+        } else {
+            let Some(value) = read_i32_at(code_regions, entry_addr) else {
+                break;
+            };
+            value as i64
         };
-        let target = anchor.wrapping_add(rel as i64 as u64);
+        let target = anchor.wrapping_add(rel as u64);
         if target < fn_start || target >= fn_end || target % 4 != 0 {
             if i > 8 && valid_entries == 0 {
                 break;
@@ -4201,6 +4234,21 @@ fn read_i32_at(code_regions: &[CodeRegion], addr: u64) -> Option<i32> {
     None
 }
 
+fn read_i64_at(code_regions: &[CodeRegion], addr: u64) -> Option<i64> {
+    for region in code_regions {
+        if addr >= region.start && addr + 8 <= region.end {
+            let data = region.read_range(addr, addr + 8)?;
+            if data.len() < 8 {
+                return None;
+            }
+            return Some(i64::from_le_bytes([
+                data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
+            ]));
+        }
+    }
+    None
+}
+
 #[cfg(feature = "arch-x64")]
 fn decode_x64_cfg_with_references(
     code_regions: &[CodeRegion],
@@ -4266,15 +4314,21 @@ fn decode_x64_cfg_with_references(
             }
         }
 
+        let mut kept_all = true;
         for inst in block {
             if instruction_map.len() >= cfg_inst_limit(profile) {
+                kept_all = false;
                 break;
             }
             instruction_map.entry(inst.address).or_insert(inst);
         }
-        all_refs.extend(refs);
+        all_refs.extend(
+            refs.into_iter()
+                .filter(|r| instruction_map.contains_key(&r.from)),
+        );
 
-        if has_implicit_fallthrough
+        if kept_all
+            && has_implicit_fallthrough
             && let Some(next) = fallthrough
             && next >= start
             && next < max_end
@@ -4297,7 +4351,8 @@ fn x64_block_has_implicit_fallthrough(block: &[Instruction]) -> bool {
         || text.starts_with("jmp ")
         || text == "int3"
         || text.starts_with("ud2")
-        || text.starts_with("hlt"))
+        || text.starts_with("hlt")
+        || text.starts_with("iret"))
 }
 
 fn arm64_block_has_implicit_fallthrough(block: &[Instruction]) -> bool {
@@ -10551,7 +10606,7 @@ mod tests {
         infer_arm64_stack_arg_bytes, infer_arm64_stack_slot_type, infer_return_type,
         is_string_address, memory_function_cap, next_hard_boundary, polish_jni_argument_names,
         promote_data_reference_kinds, reclassify_string_references, recover_arm64_locals,
-        split_basic_blocks,
+        recover_arm64_pc_rel_jump_table_targets, split_basic_blocks,
     };
     use revx_core::{
         AnalysisProfile, Architecture, BasicBlock, BinaryFormat, BinaryImage, DebugImportSummary,
@@ -10774,6 +10829,58 @@ mod tests {
             super::recover_arm64_pc_rel_jump_table_targets(&block, &code_regions, 0x1000, 0x1300)
                 .expect("base-relative jump table");
         let targets: std::collections::BTreeSet<u64> = refs
+            .iter()
+            .filter(|r| r.kind == ReferenceKind::Jump)
+            .map(|r| r.to)
+            .collect();
+        for case in cases {
+            assert!(targets.contains(&case), "missing {case:#x} in {targets:?}");
+        }
+    }
+
+    #[test]
+    fn arm64_jump_table_with_64bit_entries_is_recovered() {
+        let mut region_data = vec![0u8; 0x300];
+        let table_off = 0x200usize;
+        let base = 0x1000u64 + table_off as u64;
+        let cases = [0x1100u64, 0x1140, 0x1180, 0x11c0];
+        for (i, case) in cases.iter().enumerate() {
+            let rel = (*case as i64) - (base as i64);
+            region_data[table_off + i * 8..table_off + i * 8 + 8]
+                .copy_from_slice(&rel.to_le_bytes());
+        }
+        let region = CodeRegion::from_vec(0x1000, region_data);
+        let code_regions = [region];
+        let block = vec![
+            Instruction {
+                address: 0x1020,
+                bytes: Arc::from("00"),
+                text: Arc::from("adrp x27, $+0x0"),
+            },
+            Instruction {
+                address: 0x1024,
+                bytes: Arc::from("00"),
+                text: Arc::from("add x27, x27, #0x200"),
+            },
+            Instruction {
+                address: 0x1028,
+                bytes: Arc::from("00"),
+                text: Arc::from("ldr x3, [x27, x10, lsl #3]"),
+            },
+            Instruction {
+                address: 0x102c,
+                bytes: Arc::from("00"),
+                text: Arc::from("add x2, x3, x27"),
+            },
+            Instruction {
+                address: 0x1030,
+                bytes: Arc::from("00"),
+                text: Arc::from("br x2"),
+            },
+        ];
+        let refs = recover_arm64_pc_rel_jump_table_targets(&block, &code_regions, 0x1000, 0x1300)
+            .expect("64-bit jump table");
+        let targets: BTreeSet<u64> = refs
             .iter()
             .filter(|r| r.kind == ReferenceKind::Jump)
             .map(|r| r.to)
