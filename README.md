@@ -112,6 +112,10 @@ Large payloads are written into `.revx/artifacts/` as content-addressed blobs. S
   - Windows: named pipe (`\\.\pipe\revx-<hash>`), path marker at `.revx/daemon.pipe`
 - MCP transport default:
   - stdio JSON-RPC surface exposing only high-level tools
+- Optional HTTP MCP transport (`revx-engine mcp http --bind 127.0.0.1:9310`):
+  - requires a bearer token: `--token` or `REVX_MCP_TOKEN`; when neither is set a token is generated into `.revx/mcp-token` (owner-only permissions) and reused on later starts
+  - clients send `Authorization: Bearer <token>` (or `X-Revx-Token`); requests without a valid token get 401, including `/health`
+  - no wildcard CORS: browsers cannot read responses cross-origin; preflight only reflects loopback origins
 
 The high-level MCP tools are:
 
@@ -147,11 +151,16 @@ Local only. Analysis uses **your machine** CPU/RAM.
 {
   "mcpServers": {
     "revx": {
-      "url": "http://127.0.0.1:9310/mcp"
+      "url": "http://127.0.0.1:9310/mcp",
+      "headers": {
+        "Authorization": "Bearer <token from .revx/mcp-token>"
+      }
     }
   }
 }
 ```
+
+The one-click starters print the token and a ready-to-paste client config after launch.
 
 ### One-click start
 

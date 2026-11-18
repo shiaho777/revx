@@ -32,15 +32,45 @@ if (-not (Test-Path (Join-Path $Workspace ".revx"))) {
   & $Engine init $Workspace | Out-Null
 }
 
-try {
-  $health = Invoke-WebRequest -Uri "http://$Bind/mcp/health" -UseBasicParsing -TimeoutSec 1
-  if ($health.StatusCode -eq 200) {
-    Write-Host "[revx] already running: $Url"
-    Write-Host "[revx] engine: $Engine"
-    Write-Host "[revx] workspace: $Workspace"
-    exit 0
+$TokenFile = Join-Path $Workspace ".revx\mcp-token"
+$Token = if ($env:REVX_MCP_TOKEN) { $env:REVX_MCP_TOKEN } else { "" }
+if (-not $Token -and (Test-Path $TokenFile)) {
+  $Token = (Get-Content $TokenFile -Raw).Trim()
+}
+
+function Get-AuthHeaders {
+  if ($script:Token) { return @{ Authorization = "Bearer $($script:Token)" } }
+  return @{}
+}
+
+function Test-Health {
+  try {
+    $health = Invoke-WebRequest -Uri "http://$Bind/mcp/health" -Headers (Get-AuthHeaders) -UseBasicParsing -TimeoutSec 1
+    return ($health.StatusCode -eq 200)
+  } catch { return $false }
+}
+
+function Write-ClientConfig {
+  Write-Host "[revx] codex config:"
+  Write-Host "[mcp_servers.revx]"
+  Write-Host "url = `"$Url`""
+  Write-Host "bearer_token_env_var = `"REVX_MCP_TOKEN`""
+  if ($script:Token) {
+    Write-Host "[revx] token: $($script:Token)"
+    Write-Host "[revx] token file: $TokenFile"
+    Write-Host "[revx] set REVX_MCP_TOKEN=$($script:Token)"
+  } else {
+    Write-Host "[revx] token will be generated at $TokenFile on first start"
   }
-} catch {}
+}
+
+if (Test-Health) {
+  Write-Host "[revx] already running: $Url"
+  Write-Host "[revx] engine: $Engine"
+  Write-Host "[revx] workspace: $Workspace"
+  Write-ClientConfig
+  exit 0
+}
 
 Write-Host "[revx] starting MCP HTTP"
 Write-Host "[revx] engine: $Engine"
@@ -61,16 +91,14 @@ $proc = Start-Process -FilePath $Engine -ArgumentList @("mcp","http","--bind",$B
 $proc.Id | Out-File -Encoding ascii (Join-Path $logDir "mcp-http.pid")
 
 for ($i = 0; $i -lt 20; $i++) {
-  try {
-    $health = Invoke-WebRequest -Uri "http://$Bind/mcp/health" -UseBasicParsing -TimeoutSec 1
-    if ($health.StatusCode -eq 200) {
-      Write-Host "[revx] ready: $Url"
-      Write-Host "[revx] codex config:"
-      Write-Host "[mcp_servers.revx]"
-      Write-Host "url = `"$Url`""
-      exit 0
-    }
-  } catch {}
+  if (-not $script:Token -and (Test-Path $TokenFile)) {
+    $script:Token = (Get-Content $TokenFile -Raw).Trim()
+  }
+  if (Test-Health) {
+    Write-Host "[revx] ready: $Url"
+    Write-ClientConfig
+    exit 0
+  }
   Start-Sleep -Milliseconds 300
 }
 
