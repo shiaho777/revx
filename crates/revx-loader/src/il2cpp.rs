@@ -102,18 +102,57 @@ fn u32_pair(r: &Reader, offset: usize) -> Option<(i32, i32)> {
     Some((a, b))
 }
 
+fn table_span(offset: i32, byte_count: i32, stride: usize, data_len: usize) -> Option<usize> {
+    if offset < 0 || byte_count < 0 {
+        return None;
+    }
+    let offset = offset as usize;
+    if offset > data_len {
+        return None;
+    }
+    let available = (data_len - offset) / stride;
+    Some(((byte_count as usize) / stride).min(available))
+}
+
+fn string_index(string_offset: i32, index: i32) -> i32 {
+    if index < 0 {
+        return -1;
+    }
+    string_offset.checked_add(index).unwrap_or(-1)
+}
+
 fn parse(h: &MetadataHeader, data: &[u8]) -> Option<Il2cppMetadata> {
     let r = Reader { data };
+    if h.string_offset < 0
+        || h.type_definitions_offset < 0
+        || h.fields_offset < 0
+        || h.methods_offset < 0
+    {
+        return None;
+    }
     let type_stride = TYPE_DEF_STRIDE_V242;
     let mut types = Vec::new();
     let mut hints = Vec::new();
-    let type_count = (h.type_definitions_count as usize) / type_stride;
+    let type_count = table_span(
+        h.type_definitions_offset,
+        h.type_definitions_count,
+        type_stride,
+        data.len(),
+    )?;
+    let field_capacity = table_span(h.fields_offset, i32::MAX, FIELD_DEF_STRIDE_V242, data.len())?;
+    let method_capacity = table_span(
+        h.methods_offset,
+        i32::MAX,
+        METHOD_DEF_STRIDE_V242,
+        data.len(),
+    )?;
     for type_index in 0..type_count {
-        let base = h.type_definitions_offset as usize + type_index * type_stride;
+        let base = (h.type_definitions_offset as usize)
+            .checked_add(type_index.checked_mul(type_stride)?)?;
         let Some((name_index, _namespace_index)) = u32_pair(&r, base) else {
             continue;
         };
-        let type_name = r.cstring(h.string_offset + name_index);
+        let type_name = r.cstring(string_index(h.string_offset, name_index));
         if type_name.is_empty() {
             continue;
         }
@@ -127,49 +166,63 @@ fn parse(h: &MetadataHeader, data: &[u8]) -> Option<Il2cppMetadata> {
         });
         let field_start_index = r.i32_at(base.checked_add(0x30)?).unwrap_or(0);
         let field_count = r.i32_at(base.checked_add(0x38)?).unwrap_or(0).max(0);
-        for field_index in 0..field_count as usize {
-            let field_base = h.fields_offset as usize
-                + (field_start_index as usize + field_index) * FIELD_DEF_STRIDE_V242;
-            let Some(field_name_index) = r.i32_at(field_base) else {
-                continue;
-            };
-            let field_name = r.cstring(h.string_offset + field_name_index);
-            if field_name.is_empty() {
-                continue;
+        if field_start_index >= 0 {
+            let remaining = field_capacity.saturating_sub(field_start_index as usize);
+            let field_count = (field_count as usize).min(remaining);
+            for field_index in 0..field_count {
+                let field_base = (h.fields_offset as usize).saturating_add(
+                    (field_start_index as usize)
+                        .checked_add(field_index)?
+                        .checked_mul(FIELD_DEF_STRIDE_V242)?,
+                );
+                let Some(field_name_index) = r.i32_at(field_base) else {
+                    continue;
+                };
+                let field_name = r.cstring(string_index(h.string_offset, field_name_index));
+                if field_name.is_empty() {
+                    continue;
+                }
+                types.push(TypeDef {
+                    id: format!("il2cpp:field:{type_index}:{field_index}"),
+                    name: format!("{type_name}.{field_name}"),
+                    kind: "il2cpp_field".to_string(),
+                    source: TypeSource::Debug,
+                    size: None,
+                    evidence_ids: vec![IL2CPP_EVIDENCE.to_string()],
+                });
             }
-            types.push(TypeDef {
-                id: format!("il2cpp:field:{type_index}:{field_index}"),
-                name: format!("{type_name}.{field_name}"),
-                kind: "il2cpp_field".to_string(),
-                source: TypeSource::Debug,
-                size: None,
-                evidence_ids: vec![IL2CPP_EVIDENCE.to_string()],
-            });
         }
         let method_start_index = r.i32_at(base.checked_add(0x40)?).unwrap_or(0);
         let method_count = r.i32_at(base.checked_add(0x44)?).unwrap_or(0).max(0);
-        for method_index in 0..method_count as usize {
-            let method_base = h.methods_offset as usize
-                + (method_start_index as usize + method_index) * METHOD_DEF_STRIDE_V242;
-            let Some(name_index) = r.i32_at(method_base) else {
-                continue;
-            };
-            let method_name = r.cstring(h.string_offset + name_index);
-            if method_name.is_empty() {
-                continue;
+        if method_start_index >= 0 {
+            let remaining = method_capacity.saturating_sub(method_start_index as usize);
+            let method_count = (method_count as usize).min(remaining);
+            for method_index in 0..method_count {
+                let method_base = (h.methods_offset as usize).saturating_add(
+                    (method_start_index as usize)
+                        .checked_add(method_index)?
+                        .checked_mul(METHOD_DEF_STRIDE_V242)?,
+                );
+                let Some(name_index) = r.i32_at(method_base) else {
+                    continue;
+                };
+                let method_name = r.cstring(string_index(h.string_offset, name_index));
+                if method_name.is_empty() {
+                    continue;
+                }
+                let (param_start, _token) = u32_pair(&r, method_base.checked_add(12)?)?;
+                let _ = param_start;
+                hints.push(DebugFunctionHint {
+                    address: None,
+                    name: format!("{type_name}.{method_name}"),
+                    return_type: None,
+                    calling_convention: Some("il2cpp".to_string()),
+                    arguments: Vec::new(),
+                    locals: Vec::new(),
+                    source_anchor: None,
+                    evidence_ids: vec![format!("{IL2CPP_EVIDENCE}:method")],
+                });
             }
-            let (param_start, _token) = u32_pair(&r, method_base.checked_add(12)?)?;
-            let _ = param_start;
-            hints.push(DebugFunctionHint {
-                address: None,
-                name: format!("{type_name}.{method_name}"),
-                return_type: None,
-                calling_convention: Some("il2cpp".to_string()),
-                arguments: Vec::new(),
-                locals: Vec::new(),
-                source_anchor: None,
-                evidence_ids: vec![format!("{IL2CPP_EVIDENCE}:method")],
-            });
         }
     }
     let _ = (
@@ -369,6 +422,64 @@ mod tests {
         let mut data2 = build_fake_metadata();
         data2[4..8].copy_from_slice(&99i32.to_le_bytes());
         assert!(read_header(&data2).is_none());
+    }
+
+    #[test]
+    fn negative_offsets_reject_metadata() {
+        let mut data = build_fake_metadata();
+        data[0x58..0x5c].copy_from_slice(&(-1i32).to_le_bytes());
+        let header = read_header(&data).expect("header");
+        assert!(parse(&header, &data).is_none());
+        let mut data = build_fake_metadata();
+        data[0x70..0x74].copy_from_slice(&(-1i32).to_le_bytes());
+        let header = read_header(&data).expect("header");
+        assert!(parse(&header, &data).is_none());
+    }
+
+    #[test]
+    fn oversized_counts_are_clamped_to_data() {
+        let mut data = build_fake_metadata();
+        data[0x5c..0x60].copy_from_slice(&i32::MAX.to_le_bytes());
+        let base = 0x4000usize;
+        data[base + 0x38..base + 0x3c].copy_from_slice(&i32::MAX.to_le_bytes());
+        data[base + 0x44..base + 0x48].copy_from_slice(&i32::MAX.to_le_bytes());
+        let header = read_header(&data).expect("header");
+        let metadata = parse(&header, &data).expect("parse");
+        let field_capacity = (data.len() - 0x1000) / FIELD_DEF_STRIDE_V242;
+        let method_capacity = (data.len() - 0x5000) / METHOD_DEF_STRIDE_V242;
+        let field_types = metadata
+            .types
+            .iter()
+            .filter(|t| t.kind == "il2cpp_field")
+            .count();
+        assert!(
+            field_types <= 2 * field_capacity,
+            "fields={field_types} cap={field_capacity}"
+        );
+        assert!(
+            metadata.hints.len() <= 2 * method_capacity,
+            "hints={} cap={method_capacity}",
+            metadata.hints.len()
+        );
+        assert!(field_types < 100_000);
+        assert!(metadata.hints.len() < 100_000);
+    }
+
+    #[test]
+    fn negative_start_indices_skip_tables() {
+        let mut data = build_fake_metadata();
+        let base = 0x4000usize;
+        data[base + 0x30..base + 0x34].copy_from_slice(&(-5i32).to_le_bytes());
+        data[base + 0x40..base + 0x44].copy_from_slice(&(-5i32).to_le_bytes());
+        let header = read_header(&data).expect("header");
+        let metadata = parse(&header, &data).expect("parse");
+        assert!(
+            metadata
+                .types
+                .iter()
+                .all(|t| t.kind != "il2cpp_field" || !t.name.starts_with("Type0."))
+        );
+        assert!(metadata.hints.iter().all(|h| !h.name.starts_with("Type0.")));
     }
 
     #[test]

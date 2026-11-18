@@ -148,6 +148,12 @@ impl<'a> CompoundFile<'a> {
                 header.sector_shift
             )));
         }
+        if header.mini_sector_shift != 6 {
+            return Err(CompoundFileError::new(format!(
+                "unsupported Compound File mini sector shift {}",
+                header.mini_sector_shift
+            )));
+        }
 
         let mut warnings = Vec::new();
         let (fat_sector_ids, difat_sector_ids) = collect_difat(bytes, &header, &mut warnings)?;
@@ -338,7 +344,9 @@ impl<'a> CompoundFile<'a> {
                     "cycle in Compound File mini FAT chain",
                 ));
             }
-            let offset = sector as usize * self.header.mini_sector_size;
+            let offset = (sector as usize)
+                .checked_mul(self.header.mini_sector_size)
+                .ok_or_else(|| CompoundFileError::new("mini sector offset overflows"))?;
             let end = offset
                 .checked_add(self.header.mini_sector_size)
                 .ok_or_else(|| CompoundFileError::new("mini sector range overflows"))?;
@@ -611,6 +619,8 @@ fn parse_directory_entries(
     entries
 }
 
+const MAX_DIRECTORY_DEPTH: usize = 256;
+
 fn assign_directory_paths(entries: &mut [CompoundDirectoryEntry], warnings: &mut Vec<String>) {
     if entries.is_empty() {
         return;
@@ -623,16 +633,39 @@ fn assign_directory_paths(entries: &mut [CompoundDirectoryEntry], warnings: &mut
         return;
     };
     let mut visited = BTreeSet::new();
-    assign_child_paths(entries, child, "", Some(0), &mut visited);
+    let mut depth_warned = false;
+    assign_child_paths(
+        entries,
+        child,
+        "",
+        Some(0),
+        0,
+        &mut visited,
+        warnings,
+        &mut depth_warned,
+    );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn assign_child_paths(
     entries: &mut [CompoundDirectoryEntry],
     child: u32,
     parent_path: &str,
     parent_index: Option<usize>,
+    depth: usize,
     visited: &mut BTreeSet<usize>,
+    warnings: &mut Vec<String>,
+    depth_warned: &mut bool,
 ) {
+    if depth >= MAX_DIRECTORY_DEPTH {
+        if !*depth_warned {
+            warnings.push(format!(
+                "Compound File directory nesting reached depth limit {MAX_DIRECTORY_DEPTH}"
+            ));
+            *depth_warned = true;
+        }
+        return;
+    }
     for index in collect_child_indices(entries, child) {
         if index >= entries.len() || !visited.insert(index) {
             continue;
@@ -650,7 +683,16 @@ fn assign_child_paths(
             CompoundEntryType::Storage | CompoundEntryType::RootStorage
         ) && let Some(grandchild) = entries[index].child
         {
-            assign_child_paths(entries, grandchild, &path, Some(index), visited);
+            assign_child_paths(
+                entries,
+                grandchild,
+                &path,
+                Some(index),
+                depth + 1,
+                visited,
+                warnings,
+                depth_warned,
+            );
         }
     }
 }
@@ -658,27 +700,28 @@ fn assign_child_paths(
 fn collect_child_indices(entries: &[CompoundDirectoryEntry], root: u32) -> Vec<usize> {
     let mut result = Vec::new();
     let mut visited = BTreeSet::new();
-    collect_child_indices_inner(entries, root, &mut visited, &mut result);
+    let mut stack: Vec<(u32, bool)> = vec![(root, false)];
+    while let Some((raw, expanded)) = stack.pop() {
+        let index = raw as usize;
+        if index >= entries.len() {
+            continue;
+        }
+        if expanded {
+            result.push(index);
+            continue;
+        }
+        if !visited.insert(index) {
+            continue;
+        }
+        if let Some(right) = entries[index].right_sibling {
+            stack.push((right, false));
+        }
+        stack.push((raw, true));
+        if let Some(left) = entries[index].left_sibling {
+            stack.push((left, false));
+        }
+    }
     result
-}
-
-fn collect_child_indices_inner(
-    entries: &[CompoundDirectoryEntry],
-    index: u32,
-    visited: &mut BTreeSet<usize>,
-    result: &mut Vec<usize>,
-) {
-    let index = index as usize;
-    if index >= entries.len() || !visited.insert(index) {
-        return;
-    }
-    if let Some(left) = entries[index].left_sibling {
-        collect_child_indices_inner(entries, left, visited, result);
-    }
-    result.push(index);
-    if let Some(right) = entries[index].right_sibling {
-        collect_child_indices_inner(entries, right, visited, result);
-    }
 }
 
 fn decode_directory_name(entry: &[u8]) -> Option<String> {
@@ -749,4 +792,100 @@ fn hex_bytes(bytes: &[u8]) -> String {
         .map(|byte| format!("{byte:02x}"))
         .collect::<Vec<_>>()
         .join("")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn minimal_header() -> Vec<u8> {
+        let mut bytes = vec![0u8; HEADER_SIZE];
+        bytes[0..8].copy_from_slice(COMPOUND_FILE_MAGIC);
+        bytes[28..30].copy_from_slice(&0xfffeu16.to_le_bytes());
+        bytes[30..32].copy_from_slice(&9u16.to_le_bytes());
+        bytes[32..34].copy_from_slice(&6u16.to_le_bytes());
+        for index in 0..DIFAT_HEADER_ENTRIES {
+            let offset = 76 + index * 4;
+            bytes[offset..offset + 4].copy_from_slice(&FREE_SECTOR.to_le_bytes());
+        }
+        bytes
+    }
+
+    #[test]
+    fn rejects_nonstandard_mini_sector_shift() {
+        let mut bytes = minimal_header();
+        bytes[32..34].copy_from_slice(&7u16.to_le_bytes());
+        let err = CompoundFile::parse(&bytes).expect_err("must reject");
+        assert!(err.to_string().contains("mini sector shift"));
+    }
+
+    #[test]
+    fn deep_sibling_chain_does_not_overflow_stack() {
+        let count = 50_000usize;
+        let mut entries: Vec<CompoundDirectoryEntry> = (0..count)
+            .map(|index| CompoundDirectoryEntry {
+                index,
+                name: format!("s{index}"),
+                entry_type: CompoundEntryType::Stream,
+                color: 1,
+                left_sibling: if index + 1 < count {
+                    Some((index + 1) as u32)
+                } else {
+                    None
+                },
+                right_sibling: None,
+                child: None,
+                clsid_hex: String::new(),
+                state_bits: 0,
+                creation_time: None,
+                modified_time: None,
+                start_sector: None,
+                stream_size: 0,
+                path: None,
+                parent_index: None,
+            })
+            .collect();
+        entries[0].entry_type = CompoundEntryType::RootStorage;
+        entries[0].child = Some(1);
+        let mut warnings = Vec::new();
+        assign_directory_paths(&mut entries, &mut warnings);
+        assert_eq!(
+            entries[count - 1].path.as_deref(),
+            Some(&format!("s{}", count - 1)[..])
+        );
+    }
+
+    #[test]
+    fn deep_storage_nesting_is_bounded_with_warning() {
+        let count = MAX_DIRECTORY_DEPTH + 100;
+        let mut entries: Vec<CompoundDirectoryEntry> = (0..count)
+            .map(|index| CompoundDirectoryEntry {
+                index,
+                name: format!("d{index}"),
+                entry_type: CompoundEntryType::Storage,
+                color: 1,
+                left_sibling: None,
+                right_sibling: None,
+                child: if index + 1 < count {
+                    Some((index + 1) as u32)
+                } else {
+                    None
+                },
+                clsid_hex: String::new(),
+                state_bits: 0,
+                creation_time: None,
+                modified_time: None,
+                start_sector: None,
+                stream_size: 0,
+                path: None,
+                parent_index: None,
+            })
+            .collect();
+        entries[0].entry_type = CompoundEntryType::RootStorage;
+        entries[0].child = Some(1);
+        let mut warnings = Vec::new();
+        assign_directory_paths(&mut entries, &mut warnings);
+        assert!(warnings.iter().any(|w| w.contains("depth limit")));
+        assert!(entries[count - 1].path.is_none());
+    }
 }
