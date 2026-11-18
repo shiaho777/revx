@@ -8,31 +8,53 @@ impl Workspace {
         offset: u64,
         max_bytes: usize,
     ) -> Result<ArtifactReadResponse> {
+        use std::io::{Read, Seek, SeekFrom};
         let relative_path = resolve_artifact_relative_path(relative_path, hash_blake3)?;
         validate_artifact_relative_path(&relative_path)?;
         let path = self.root.join(&relative_path);
-        let bytes = fs::read(&path)
+        let mut file = fs::File::open(&path)
             .with_context(|| format!("failed to read artifact {}", relative_path))?;
-        let total_size = bytes.len() as u64;
-        let start = (offset as usize).min(bytes.len());
-        let capped = max_bytes.clamp(1, 1_048_576);
-        let end = start.saturating_add(capped).min(bytes.len());
-        let preview = &bytes[start..end];
-        let hash = blake3::hash(&bytes).to_hex().to_string();
+        let total_size = file.metadata()?.len();
+        let capped = max_bytes.clamp(1, 1_048_576) as u64;
+        let start = offset.min(total_size);
+        file.seek(SeekFrom::Start(start))?;
+        let mut preview = Vec::new();
+        Read::by_ref(&mut file)
+            .take(capped)
+            .read_to_end(&mut preview)?;
+        let end = start.saturating_add(preview.len() as u64);
+        let hash = match relative_path.strip_prefix("artifacts/") {
+            Some(name) if name.len() == 64 && name.chars().all(|ch| ch.is_ascii_hexdigit()) => {
+                name.to_string()
+            }
+            _ => {
+                let mut hasher = blake3::Hasher::new();
+                file.seek(SeekFrom::Start(0))?;
+                let mut chunk = vec![0u8; 64 * 1024];
+                loop {
+                    let n = file.read(&mut chunk)?;
+                    if n == 0 {
+                        break;
+                    }
+                    hasher.update(&chunk[..n]);
+                }
+                hasher.finalize().to_hex().to_string()
+            }
+        };
         let artifact = ArtifactHandle {
             hash_blake3: hash,
             relative_path,
             size: total_size,
-            content_type: artifact_content_type(preview),
+            content_type: artifact_content_type(&preview),
         };
         Ok(ArtifactReadResponse {
             artifact,
             offset,
             total_size,
             returned_size: preview.len(),
-            truncated: end < bytes.len(),
-            preview_hex: hex::encode(preview),
-            preview_text: text_preview(preview),
+            truncated: end < total_size,
+            preview_hex: hex::encode(&preview),
+            preview_text: text_preview(&preview),
         })
     }
 
@@ -44,16 +66,33 @@ impl Workspace {
         let hash = blake3::hash(bytes).to_hex().to_string();
         let relative_path = format!("artifacts/{hash}");
         let path = self.root.join(&relative_path);
-        match fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-        {
-            Ok(mut file) => {
-                file.write_all(bytes)?;
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+        let needs_write = match fs::metadata(&path) {
+            Ok(meta) => meta.len() != bytes.len() as u64,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => true,
             Err(err) => return Err(err.into()),
+        };
+        if needs_write {
+            let artifacts_dir = self.root.join("artifacts");
+            fs::create_dir_all(&artifacts_dir)?;
+            let tmp = artifacts_dir.join(format!(".tmp-{}-{}", std::process::id(), hash));
+            let write_result = (|| -> Result<()> {
+                let mut file = fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .open(&tmp)?;
+                file.write_all(bytes)?;
+                file.sync_all()?;
+                Ok(())
+            })();
+            if let Err(err) = write_result {
+                let _ = fs::remove_file(&tmp);
+                return Err(err);
+            }
+            if let Err(err) = fs::rename(&tmp, &path) {
+                let _ = fs::remove_file(&tmp);
+                return Err(err.into());
+            }
         }
         Ok(ArtifactHandle {
             hash_blake3: hash,

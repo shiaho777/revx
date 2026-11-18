@@ -58,6 +58,40 @@ use mcp_tools::*;
 
 const IBC_CONTINUUM_LEDGER_CACHE: &str = "ibc_continuum_ledger.json";
 
+const MAX_LINE_BYTES: u64 = 16 * 1024 * 1024;
+
+async fn read_line_bounded<R>(reader: &mut R, max: u64) -> Result<Option<String>>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+    let mut limited = reader.take(max + 1);
+    let mut buf = Vec::new();
+    let n = limited.read_until(b'\n', &mut buf).await?;
+    if n == 0 {
+        return Ok(None);
+    }
+    if buf.last() != Some(&b'\n') && n as u64 > max {
+        anyhow::bail!("request line exceeds {max} byte limit");
+    }
+    if buf.last() == Some(&b'\n') {
+        buf.pop();
+    }
+    let line = String::from_utf8(buf).context("request line is not valid UTF-8")?;
+    Ok(Some(line))
+}
+
+fn parse_error_reply(id: Option<String>, message: String) -> CapabilityReply {
+    CapabilityReply {
+        id,
+        response: None,
+        error: Some(CapabilityError {
+            code: "parse_error".to_string(),
+            message,
+        }),
+    }
+}
+
 #[derive(Clone)]
 struct RetainedAnalysis {
     text: String,
@@ -1477,6 +1511,12 @@ impl CapabilityService {
 pub async fn serve_ipc(workspace_root: PathBuf) -> Result<()> {
     let _ = revx_analysis::resource::ensure_process_resource_limits();
     let endpoint = socket_path(&workspace_root);
+    if endpoint_alive(&workspace_root).await {
+        anyhow::bail!(
+            "daemon already running for {}; stop it first",
+            workspace_root.display()
+        );
+    }
     write_daemon_pid(&workspace_root);
     #[cfg(unix)]
     {
@@ -1521,16 +1561,17 @@ pub async fn serve_stdio(workspace_root: PathBuf) -> Result<()> {
     let service = CapabilityService::new(workspace_root);
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
-    let mut reader = BufReader::new(stdin).lines();
+    let mut reader = BufReader::new(stdin);
     let mut writer = tokio::io::BufWriter::new(stdout);
 
-    while let Some(line) = reader.next_line().await? {
+    while let Some(line) = read_line_bounded(&mut reader, MAX_LINE_BYTES).await? {
         if line.trim().is_empty() {
             continue;
         }
-        let envelope: CapabilityEnvelope = serde_json::from_str(&line)
-            .with_context(|| "failed to parse capability envelope from stdio")?;
-        let reply = dispatch_envelope(&service, envelope);
+        let reply = match serde_json::from_str::<CapabilityEnvelope>(&line) {
+            Ok(envelope) => dispatch_envelope(&service, envelope),
+            Err(err) => parse_error_reply(None, format!("invalid capability envelope: {err}")),
+        };
         writer
             .write_all(serde_json::to_string(&reply)?.as_bytes())
             .await?;
@@ -1568,39 +1609,91 @@ pub fn write_daemon_pid(workspace_root: &Path) {
 pub fn stop_daemon(workspace_root: &Path) -> Result<()> {
     let endpoint = socket_path(workspace_root);
     let pid_file = pid_path(workspace_root);
+    let alive = endpoint_alive_blocking(workspace_root);
     let pid_text = std::fs::read_to_string(&pid_file).ok();
     if let Some(raw) = pid_text.as_deref()
         && let Ok(pid) = raw.trim().parse::<u32>()
     {
-        #[cfg(unix)]
-        {
-            use std::io;
-            if signal_process(pid, libc_signal_term()) {
-                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-                while endpoint.exists() && std::time::Instant::now() < deadline {
-                    std::thread::sleep(std::time::Duration::from_millis(100));
-                }
-                if endpoint.exists() {
-                    let _ = signal_process(pid, libc_signal_kill());
+        if alive {
+            #[cfg(unix)]
+            {
+                if signal_process(pid, libc_signal_term()) {
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                    while endpoint_alive_blocking(workspace_root)
+                        && std::time::Instant::now() < deadline
+                    {
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    }
+                    if endpoint_alive_blocking(workspace_root) {
+                        let _ = signal_process(pid, libc_signal_kill());
+                    }
                 }
             }
-            let _ = io::Result::<()>::Ok(());
+            #[cfg(windows)]
+            {
+                let _ = std::process::Command::new("taskkill")
+                    .args(["/PID", &pid.to_string(), "/F"])
+                    .output();
+            }
+            println!("Stopped daemon pid {pid}");
+        } else {
+            println!("No live daemon endpoint; leaving pid {pid} untouched (stale pid file)");
         }
-        #[cfg(windows)]
-        {
-            let _ = std::process::Command::new("taskkill")
-                .args(["/PID", &pid.to_string(), "/F"])
-                .output();
-        }
-        println!("Stopped daemon pid {pid}");
     }
-    if endpoint.exists() {
+    if endpoint.exists() && !endpoint_alive_blocking(workspace_root) {
         std::fs::remove_file(&endpoint)
             .with_context(|| format!("failed to remove {}", endpoint.display()))?;
         println!("Removed daemon socket {}", endpoint.display());
     }
     let _ = std::fs::remove_file(&pid_file);
     Ok(())
+}
+
+pub async fn endpoint_alive(workspace_root: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        tokio::net::UnixStream::connect(socket_path(workspace_root))
+            .await
+            .is_ok()
+    }
+    #[cfg(windows)]
+    {
+        let marker = socket_path(workspace_root);
+        let Ok(raw) = std::fs::read_to_string(&marker) else {
+            return false;
+        };
+        let name = raw.trim();
+        if name.is_empty() {
+            return false;
+        }
+        tokio::net::windows::named_pipe::ClientOptions::new()
+            .open(name)
+            .is_ok()
+    }
+    #[cfg(all(not(unix), not(windows)))]
+    {
+        let _ = workspace_root;
+        tokio::net::TcpStream::connect("127.0.0.1:43179")
+            .await
+            .is_ok()
+    }
+}
+
+fn endpoint_alive_blocking(workspace_root: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        std::os::unix::net::UnixStream::connect(socket_path(workspace_root)).is_ok()
+    }
+    #[cfg(not(unix))]
+    {
+        match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(rt) => rt.block_on(endpoint_alive(workspace_root)),
+            Err(_) => false,
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -1626,11 +1719,7 @@ pub fn windows_pipe_name(workspace_root: &Path) -> String {
         .canonicalize()
         .unwrap_or_else(|_| workspace_root.to_path_buf());
     let digest = blake3::hash(key.to_string_lossy().as_bytes()).to_hex();
-    format!(
-        r"\.\pipe
-evx-{}",
-        &digest[..16]
-    )
+    format!(r"\\.\pipe\revx-{}", &digest[..16])
 }
 
 pub async fn send_ipc_request(
@@ -1680,14 +1769,8 @@ async fn serve_windows_named_pipe(workspace_root: PathBuf, marker: &Path) -> Res
         std::fs::create_dir_all(parent)?;
     }
     let pipe_name = windows_pipe_name(&workspace_root);
-    std::fs::write(
-        marker,
-        format!(
-            "{pipe_name}
-"
-        ),
-    )
-    .with_context(|| format!("failed to write {}", marker.display()))?;
+    std::fs::write(marker, format!("{pipe_name}\n"))
+        .with_context(|| format!("failed to write {}", marker.display()))?;
     let service = CapabilityService::new(workspace_root);
     let mut first = true;
     loop {
@@ -1736,15 +1819,21 @@ pub async fn serve_mcp_stdio(workspace_root: PathBuf) -> Result<()> {
     let service = CapabilityService::new(workspace_root);
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
-    let mut reader = BufReader::new(stdin).lines();
+    let mut reader = BufReader::new(stdin);
     let mut writer = tokio::io::BufWriter::new(stdout);
 
-    while let Some(line) = reader.next_line().await? {
+    while let Some(line) = read_line_bounded(&mut reader, MAX_LINE_BYTES).await? {
         if line.trim().is_empty() {
             continue;
         }
-        let request: serde_json::Value = serde_json::from_str(&line)?;
-        let response = handle_mcp_jsonrpc(&service, request);
+        let response = match serde_json::from_str::<serde_json::Value>(&line) {
+            Ok(request) => handle_mcp_jsonrpc(&service, request),
+            Err(err) => Some(jsonrpc_error(
+                serde_json::Value::Null,
+                -32700,
+                &format!("parse error: {err}"),
+            )),
+        };
         if let Some(response) = response {
             writer
                 .write_all(serde_json::to_string(&response)?.as_bytes())
@@ -1775,13 +1864,15 @@ where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     let (reader, mut writer) = tokio::io::split(stream);
-    let mut lines = BufReader::new(reader).lines();
-    while let Some(line) = lines.next_line().await? {
+    let mut reader = BufReader::new(reader);
+    while let Some(line) = read_line_bounded(&mut reader, MAX_LINE_BYTES).await? {
         if line.trim().is_empty() {
             continue;
         }
-        let envelope: CapabilityEnvelope = serde_json::from_str(&line)?;
-        let reply = dispatch_envelope(&service, envelope);
+        let reply = match serde_json::from_str::<CapabilityEnvelope>(&line) {
+            Ok(envelope) => dispatch_envelope(&service, envelope),
+            Err(err) => parse_error_reply(None, format!("invalid capability envelope: {err}")),
+        };
         writer
             .write_all(serde_json::to_string(&reply)?.as_bytes())
             .await?;
@@ -1804,9 +1895,8 @@ where
         .await?;
     writer.flush().await?;
 
-    let mut lines = BufReader::new(reader).lines();
-    let line = lines
-        .next_line()
+    let mut reader = BufReader::new(reader);
+    let line = read_line_bounded(&mut reader, MAX_LINE_BYTES)
         .await?
         .ok_or_else(|| anyhow::anyhow!("daemon closed connection without reply"))?;
     let reply: CapabilityReply = serde_json::from_str(&line)?;
@@ -1826,7 +1916,15 @@ fn handle_mcp_jsonrpc(
         .get("id")
         .cloned()
         .unwrap_or(serde_json::Value::Null);
-    let method = request.get("method")?.as_str()?.to_string();
+    let Some(method) = request.get("method").and_then(|m| m.as_str()) else {
+        request.get("id")?;
+        return Some(jsonrpc_error(
+            request_id,
+            -32600,
+            "invalid request: missing method",
+        ));
+    };
+    let method = method.to_string();
     let params = request
         .get("params")
         .cloned()
@@ -5855,6 +5953,138 @@ mod tests {
     };
     use revx_workspace::Workspace;
     use tempfile::tempdir;
+
+    #[test]
+    fn windows_pipe_name_is_well_formed() {
+        let dir = tempdir().expect("tempdir");
+        let name = super::windows_pipe_name(dir.path());
+        assert!(
+            name.starts_with(r"\\.\pipe\revx-"),
+            "bad pipe name: {name:?}"
+        );
+        assert!(!name.contains('\n'));
+        assert!(!name.contains('\r'));
+        let suffix = name.strip_prefix(r"\\.\pipe\revx-").expect("prefix");
+        assert_eq!(suffix.len(), 16);
+        assert!(suffix.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(name, super::windows_pipe_name(dir.path()));
+    }
+
+    #[tokio::test]
+    async fn bounded_line_reader_rejects_overlong_line() {
+        let mut input = std::io::Cursor::new(vec![b'a'; 64]);
+        let mut reader = tokio::io::BufReader::new(&mut input);
+        let err = super::read_line_bounded(&mut reader, 32)
+            .await
+            .expect_err("overlong line must fail");
+        assert!(err.to_string().contains("byte limit"));
+    }
+
+    #[tokio::test]
+    async fn bounded_line_reader_keeps_short_lines() {
+        let mut input = std::io::Cursor::new(b"hello\nworld\n".to_vec());
+        let mut reader = tokio::io::BufReader::new(&mut input);
+        assert_eq!(
+            super::read_line_bounded(&mut reader, 32)
+                .await
+                .expect("line")
+                .as_deref(),
+            Some("hello")
+        );
+        assert_eq!(
+            super::read_line_bounded(&mut reader, 32)
+                .await
+                .expect("line")
+                .as_deref(),
+            Some("world")
+        );
+        assert!(
+            super::read_line_bounded(&mut reader, 32)
+                .await
+                .expect("eof")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_socket_request_gets_error_and_connection_survives() {
+        let dir = tempdir().expect("tempdir");
+        Workspace::init(dir.path(), "test", None).expect("init");
+        let service = CapabilityService::new(dir.path().to_path_buf());
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let task = tokio::spawn(super::handle_stream(service, server));
+        let (reader, mut writer) = tokio::io::split(client);
+        let mut reader = tokio::io::BufReader::new(reader);
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        writer.write_all(b"not json\n").await.expect("write");
+        writer.flush().await.expect("flush");
+        let mut line = String::new();
+        reader.read_line(&mut line).await.expect("read");
+        let reply: revx_core::CapabilityReply = serde_json::from_str(&line).expect("reply json");
+        assert!(reply.error.is_some());
+        assert_eq!(reply.error.expect("error").code, "parse_error");
+        let envelope = revx_core::CapabilityEnvelope {
+            id: Some("ok-1".to_string()),
+            request: CapabilityRequest::ProjectStatus(revx_core::ProjectStatusRequest),
+        };
+        writer
+            .write_all(format!("{}\n", serde_json::to_string(&envelope).expect("json")).as_bytes())
+            .await
+            .expect("write");
+        writer.flush().await.expect("flush");
+        let mut line = String::new();
+        reader.read_line(&mut line).await.expect("read");
+        let reply: revx_core::CapabilityReply = serde_json::from_str(&line).expect("reply json");
+        assert!(reply.error.is_none());
+        assert_eq!(reply.id.as_deref(), Some("ok-1"));
+        drop(writer);
+        drop(reader);
+        task.await.expect("join").expect("stream ok");
+    }
+
+    #[test]
+    fn mcp_missing_method_replies_invalid_request() {
+        let dir = tempdir().expect("tempdir");
+        Workspace::init(dir.path(), "test", None).expect("init");
+        let service = CapabilityService::new(dir.path().to_path_buf());
+        let response = super::handle_mcp_jsonrpc(&service, serde_json::json!({"id": 7}))
+            .expect("error response");
+        assert_eq!(response["error"]["code"], -32600);
+        assert_eq!(response["id"], 7);
+        assert!(
+            super::handle_mcp_jsonrpc(&service, serde_json::json!({})).is_none(),
+            "notification without method must stay silent"
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_daemon_leaves_unrelated_pid_alive() {
+        let dir = tempdir().expect("tempdir");
+        Workspace::init(dir.path(), "test", None).expect("init");
+        std::fs::write(super::pid_path(dir.path()), std::process::id().to_string())
+            .expect("pid file");
+        super::stop_daemon(dir.path()).expect("stop");
+        assert!(!super::pid_path(dir.path()).exists());
+    }
+
+    #[tokio::test]
+    async fn serve_ipc_refuses_when_endpoint_alive() {
+        let dir = tempdir().expect("tempdir");
+        Workspace::init(dir.path(), "test", None).expect("init");
+        let endpoint = super::socket_path(dir.path());
+        #[cfg(unix)]
+        {
+            let _listener = tokio::net::UnixListener::bind(&endpoint).expect("bind");
+            let err = super::serve_ipc(dir.path().to_path_buf())
+                .await
+                .expect_err("must refuse second daemon");
+            assert!(err.to_string().contains("already running"));
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = endpoint;
+        }
+    }
 
     #[test]
     fn mcp_response_summary_includes_decompile_text() {

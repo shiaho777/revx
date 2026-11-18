@@ -28,6 +28,7 @@ use std::io::{BufReader, Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+use xz2::read::XzDecoder;
 
 mod artifacts;
 mod pool;
@@ -7567,33 +7568,46 @@ fn is_ole_like_format(format: &str) -> bool {
     matches!(format, "ole" | "doc" | "xls" | "ppt" | "msi" | "msg")
 }
 
+const DEFAULT_MAX_EXPANDED_BYTES: u64 = 256 * 1024 * 1024;
+
+fn max_expanded_bytes() -> u64 {
+    std::env::var("REVX_MAX_EXPANDED_BYTES")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_MAX_EXPANDED_BYTES)
+}
+
+fn read_capped<R: Read>(reader: &mut R, limit: u64) -> Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    reader.take(limit.saturating_add(1)).read_to_end(&mut buf)?;
+    if buf.len() as u64 > limit {
+        anyhow::bail!("expanded payload exceeds byte limit {limit}");
+    }
+    Ok(buf)
+}
+
 fn decompress_by_format(bytes: &[u8], compressed_format: CompressedFormat) -> Result<Vec<u8>> {
-    let mut decompressed = Vec::new();
+    let limit = max_expanded_bytes();
     match compressed_format {
         CompressedFormat::Gzip => {
             let mut decoder = GzDecoder::new(bytes);
-            decoder
-                .read_to_end(&mut decompressed)
-                .context("failed to decompress gzip stream")?;
+            read_capped(&mut decoder, limit).context("failed to decompress gzip stream")
         }
         CompressedFormat::Bzip2 => {
             let mut decoder = BzDecoder::new(bytes);
-            decoder
-                .read_to_end(&mut decompressed)
-                .context("failed to decompress bzip2 stream")?;
+            read_capped(&mut decoder, limit).context("failed to decompress bzip2 stream")
         }
         CompressedFormat::Xz => {
-            anyhow::bail!("xz decompression is not enabled in this build");
+            let mut decoder = XzDecoder::new(bytes);
+            read_capped(&mut decoder, limit).context("failed to decompress xz stream")
         }
         CompressedFormat::Zstd => {
             let mut decoder =
                 ZstdDecoder::new(bytes).context("failed to initialize zstd decoder")?;
-            decoder
-                .read_to_end(&mut decompressed)
-                .context("failed to decompress zstd stream")?;
+            read_capped(&mut decoder, limit).context("failed to decompress zstd stream")
         }
     }
-    Ok(decompressed)
 }
 
 fn object_content_type(object: &UniversalObject) -> String {
@@ -25041,6 +25055,10 @@ fn extract_wasm_module_summary(bytes: &[u8]) -> Result<WasmModuleSummary> {
         offset = body_end;
     }
 
+    let imports = extract_wasm_imports(bytes);
+    let exports = extract_wasm_exports(bytes);
+    let memories = extract_wasm_memories(bytes);
+    let data_segments = extract_wasm_data_segments(bytes);
     let details = serde_json::json!({
         "format": "wasm",
         "encoding": encoding,
@@ -25050,6 +25068,17 @@ fn extract_wasm_module_summary(bytes: &[u8]) -> Result<WasmModuleSummary> {
         "export_count": export_count,
         "function_type_count": function_type_count,
         "defined_function_count": defined_function_count,
+        "counts": {
+            "sections": section_count,
+            "imports": import_count,
+            "exports": export_count,
+            "function_types": function_type_count,
+            "defined_functions": defined_function_count,
+        },
+        "imports": imports,
+        "exports": exports,
+        "memories": memories,
+        "data_segments": data_segments,
         "sections": sections,
         "custom_sections": custom_sections,
         "truncated": truncated,
@@ -25065,6 +25094,279 @@ fn extract_wasm_module_summary(bytes: &[u8]) -> Result<WasmModuleSummary> {
         truncated,
         details,
     })
+}
+
+const WASM_DETAIL_ENTRY_LIMIT: usize = 256;
+const WASM_DATA_PREVIEW_LIMIT: usize = 64;
+
+fn wasm_sections(bytes: &[u8], wanted_id: u8) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    if bytes.len() < 8 || &bytes[0..4] != WASM_HEADER {
+        return out;
+    }
+    let mut offset = 8usize;
+    while offset < bytes.len() {
+        let section_id = bytes[offset];
+        offset += 1;
+        let Ok(size) = read_wasm_leb128(bytes, &mut offset) else {
+            break;
+        };
+        let size = size as usize;
+        if offset.saturating_add(size) > bytes.len() {
+            break;
+        }
+        if section_id == wanted_id {
+            out.push((offset, offset + size));
+        }
+        offset += size;
+    }
+    out
+}
+
+fn read_wasm_name(bytes: &[u8], offset: &mut usize, end: usize) -> Option<String> {
+    let len = read_wasm_leb128(bytes, offset).ok()? as usize;
+    if offset.saturating_add(len) > end {
+        return None;
+    }
+    let name = String::from_utf8_lossy(&bytes[*offset..*offset + len]).into_owned();
+    *offset += len;
+    Some(name)
+}
+
+fn extract_wasm_imports(bytes: &[u8]) -> Vec<serde_json::Value> {
+    let mut out = Vec::new();
+    for (start, end) in wasm_sections(bytes, 2) {
+        let mut local = start;
+        let Ok(count) = read_wasm_leb128(bytes, &mut local) else {
+            continue;
+        };
+        for _ in 0..count.min(WASM_DETAIL_ENTRY_LIMIT as u64) {
+            let Some(module) = read_wasm_name(bytes, &mut local, end) else {
+                break;
+            };
+            let Some(name) = read_wasm_name(bytes, &mut local, end) else {
+                break;
+            };
+            let Some(kind_byte) = bytes.get(local).copied() else {
+                break;
+            };
+            local += 1;
+            let kind = match kind_byte {
+                0 => {
+                    let _ = read_wasm_leb128(bytes, &mut local);
+                    "func"
+                }
+                1 => {
+                    let _ = read_wasm_leb128(bytes, &mut local);
+                    let _ = read_wasm_limits(bytes, &mut local);
+                    "table"
+                }
+                2 => {
+                    let _ = read_wasm_limits(bytes, &mut local);
+                    "memory"
+                }
+                3 => {
+                    let _ = bytes.get(local).copied();
+                    local += 1;
+                    let _ = bytes.get(local).copied();
+                    local += 1;
+                    "global"
+                }
+                _ => "unknown",
+            };
+            out.push(serde_json::json!({
+                "module": module,
+                "name": name,
+                "kind": kind,
+            }));
+            if out.len() >= WASM_DETAIL_ENTRY_LIMIT {
+                return out;
+            }
+        }
+    }
+    out
+}
+
+fn read_wasm_limits(bytes: &[u8], offset: &mut usize) -> Option<(u64, Option<u64>)> {
+    let flags = bytes.get(*offset).copied()?;
+    *offset += 1;
+    let min = read_wasm_leb128(bytes, offset).ok()?;
+    let max = if flags & 1 != 0 {
+        Some(read_wasm_leb128(bytes, offset).ok()?)
+    } else {
+        None
+    };
+    Some((min, max))
+}
+
+fn extract_wasm_exports(bytes: &[u8]) -> Vec<serde_json::Value> {
+    let mut out = Vec::new();
+    for (start, end) in wasm_sections(bytes, 7) {
+        let mut local = start;
+        let Ok(count) = read_wasm_leb128(bytes, &mut local) else {
+            continue;
+        };
+        for _ in 0..count.min(WASM_DETAIL_ENTRY_LIMIT as u64) {
+            let Some(name) = read_wasm_name(bytes, &mut local, end) else {
+                break;
+            };
+            let Some(kind_byte) = bytes.get(local).copied() else {
+                break;
+            };
+            local += 1;
+            let Ok(index) = read_wasm_leb128(bytes, &mut local) else {
+                break;
+            };
+            let kind = match kind_byte {
+                0 => "func",
+                1 => "table",
+                2 => "memory",
+                3 => "global",
+                _ => "unknown",
+            };
+            out.push(serde_json::json!({
+                "name": name,
+                "kind": kind,
+                "index": index,
+            }));
+            if out.len() >= WASM_DETAIL_ENTRY_LIMIT {
+                return out;
+            }
+        }
+    }
+    out
+}
+
+fn extract_wasm_memories(bytes: &[u8]) -> Vec<serde_json::Value> {
+    let mut out = Vec::new();
+    for (start, end) in wasm_sections(bytes, 5) {
+        let mut local = start;
+        let Ok(count) = read_wasm_leb128(bytes, &mut local) else {
+            continue;
+        };
+        for _ in 0..count.min(WASM_DETAIL_ENTRY_LIMIT as u64) {
+            let Some((min, max)) = read_wasm_limits(bytes, &mut local) else {
+                break;
+            };
+            let _ = end;
+            out.push(serde_json::json!({
+                "initial_pages": min,
+                "max_pages": max,
+            }));
+            if out.len() >= WASM_DETAIL_ENTRY_LIMIT {
+                return out;
+            }
+        }
+    }
+    out
+}
+
+fn extract_wasm_data_segments(bytes: &[u8]) -> Vec<serde_json::Value> {
+    let mut out = Vec::new();
+    for (start, end) in wasm_sections(bytes, 11) {
+        let mut local = start;
+        let Ok(count) = read_wasm_leb128(bytes, &mut local) else {
+            continue;
+        };
+        for _ in 0..count.min(WASM_DETAIL_ENTRY_LIMIT as u64) {
+            let Ok(flags) = read_wasm_leb128(bytes, &mut local) else {
+                break;
+            };
+            let mut memory_index = 0u64;
+            let mut offset_value: Option<i64> = None;
+            if flags == 0 {
+                if let Some(value) = read_wasm_const_expr(bytes, &mut local, end) {
+                    offset_value = Some(value);
+                }
+            } else if flags == 2 {
+                let Ok(index) = read_wasm_leb128(bytes, &mut local) else {
+                    break;
+                };
+                memory_index = index;
+                if let Some(value) = read_wasm_const_expr(bytes, &mut local, end) {
+                    offset_value = Some(value);
+                }
+            }
+            let Ok(len) = read_wasm_leb128(bytes, &mut local) else {
+                break;
+            };
+            let len = len as usize;
+            if local.saturating_add(len) > end {
+                break;
+            }
+            let data = &bytes[local..local + len];
+            local += len;
+            let preview = &data[..data.len().min(WASM_DATA_PREVIEW_LIMIT)];
+            let preview_text = String::from_utf8_lossy(preview).into_owned();
+            out.push(serde_json::json!({
+                "memory_index": memory_index,
+                "offset": offset_value,
+                "size": len,
+                "preview_text": preview_text,
+                "preview_hex": hex::encode(preview),
+            }));
+            if out.len() >= WASM_DETAIL_ENTRY_LIMIT {
+                return out;
+            }
+        }
+    }
+    out
+}
+
+fn read_wasm_const_expr(bytes: &[u8], offset: &mut usize, end: usize) -> Option<i64> {
+    let mut value: Option<i64> = None;
+    while *offset < end {
+        let opcode = bytes[*offset];
+        *offset += 1;
+        match opcode {
+            0x41 => {
+                let mut result = 0i64;
+                let mut shift = 0u32;
+                loop {
+                    let byte = bytes.get(*offset).copied()?;
+                    *offset += 1;
+                    result |= i64::from(byte & 0x7f) << shift;
+                    shift += 7;
+                    if byte & 0x80 == 0 {
+                        if shift < 64 && byte & 0x40 != 0 {
+                            result |= -1i64 << shift;
+                        }
+                        break;
+                    }
+                    if shift >= 63 {
+                        return None;
+                    }
+                }
+                value = Some(result);
+            }
+            0x42 => {
+                let mut result = 0i64;
+                let mut shift = 0u32;
+                loop {
+                    let byte = bytes.get(*offset).copied()?;
+                    *offset += 1;
+                    result |= i64::from(byte & 0x7f) << shift;
+                    shift += 7;
+                    if byte & 0x80 == 0 {
+                        if shift < 64 && byte & 0x40 != 0 {
+                            result |= -1i64 << shift;
+                        }
+                        break;
+                    }
+                    if shift >= 63 {
+                        return None;
+                    }
+                }
+                value = Some(result);
+            }
+            0x23 => {
+                let _ = read_wasm_leb128(bytes, offset).ok()?;
+            }
+            0x0b => return value,
+            _ => return None,
+        }
+    }
+    None
 }
 
 fn analyze_object_pdf_document(object: &UniversalObject, bytes: &[u8]) -> ObjectAnalysisSummary {
@@ -25130,13 +25432,30 @@ fn count_ascii_token(bytes: &[u8], token: &[u8]) -> usize {
     count_bytes(bytes, token)
 }
 
+fn count_pdf_page_tokens(bytes: &[u8]) -> usize {
+    let mut count = 0usize;
+    for token in [b"/Type /Page".as_slice(), b"/Type/Page".as_slice()] {
+        let mut start = 0usize;
+        while let Some(pos) = find_bytes(&bytes[start..], token) {
+            let end = start + pos + token.len();
+            let next_is_name_char = bytes
+                .get(end)
+                .is_some_and(|byte| byte.is_ascii_alphanumeric());
+            if !next_is_name_char {
+                count += 1;
+            }
+            start += pos + token.len();
+        }
+    }
+    count
+}
+
 fn extract_pdf_document_summary(bytes: &[u8]) -> Result<PdfDocumentSummary> {
     let risk_signals = scan_pdf_risk_signals(bytes);
     let header = pdf_header_details(bytes);
     let version = header["version"].as_str().unwrap_or("unknown").to_string();
 
-    let page_count =
-        count_ascii_token(bytes, b"/Type /Page") + count_ascii_token(bytes, b"/Type/Page");
+    let page_count = count_pdf_page_tokens(bytes);
     let object_count = count_ascii_token(bytes, b" 0 obj")
         + count_ascii_token(bytes, b"\n0 obj")
         + count_ascii_token(bytes, b"\r0 obj");
@@ -25145,6 +25464,8 @@ fn extract_pdf_document_summary(bytes: &[u8]) -> Result<PdfDocumentSummary> {
     let truncated = risk_signal_count > PDF_RISK_SCAN_LIMIT || bytes.len() > 32 * 1024 * 1024;
     let encrypted = find_bytes(bytes, b"/Encrypt").is_some();
 
+    let has_open_action = find_bytes(bytes, b"/OpenAction").is_some();
+    let interesting_objects = extract_pdf_interesting_objects(bytes);
     let details = serde_json::json!({
         "format": "pdf",
         "parsed": true,
@@ -25154,6 +25475,10 @@ fn extract_pdf_document_summary(bytes: &[u8]) -> Result<PdfDocumentSummary> {
         "object_count": object_count,
         "page_count": page_count,
         "encrypted": encrypted,
+        "catalog": {
+            "has_open_action": has_open_action,
+        },
+        "interesting_objects": interesting_objects,
         "counts": {
             "pages": page_count,
             "objects": object_count,
@@ -25250,6 +25575,61 @@ const PDF_RISK_PATTERNS: &[(&str, &[u8], &str, &str)] = &[
         "Flash media reference",
     ),
 ];
+
+fn extract_pdf_interesting_objects(bytes: &[u8]) -> Vec<serde_json::Value> {
+    const INTERESTING_LIMIT: usize = 64;
+    let mut out = Vec::new();
+    let mut search_from = 0usize;
+    while out.len() < INTERESTING_LIMIT {
+        let Some(pos) = find_bytes(&bytes[search_from..], b"/S /") else {
+            break;
+        };
+        let start = search_from + pos + 4;
+        let mut end = start;
+        while end < bytes.len() && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_') {
+            end += 1;
+        }
+        if end > start {
+            let action = String::from_utf8_lossy(&bytes[start..end]).into_owned();
+            if matches!(
+                action.as_str(),
+                "JavaScript" | "Launch" | "URI" | "SubmitForm" | "GoToR" | "GoToE" | "RichMedia"
+            ) {
+                let object_number = pdf_enclosing_object_number(bytes, start);
+                out.push(serde_json::json!({
+                    "action": action,
+                    "object": object_number,
+                    "offset": start,
+                }));
+            }
+        }
+        search_from = end.max(start + 1);
+    }
+    out
+}
+
+fn pdf_enclosing_object_number(bytes: &[u8], offset: usize) -> Option<u64> {
+    let prefix = &bytes[..offset];
+    let obj_pos = find_bytes_rev(prefix, b" 0 obj")?;
+    let mut start = obj_pos;
+    while start > 0 && prefix[start - 1].is_ascii_digit() {
+        start -= 1;
+    }
+    let digits = &prefix[start..obj_pos];
+    if digits.is_empty() {
+        return None;
+    }
+    String::from_utf8_lossy(digits).parse::<u64>().ok()
+}
+
+fn find_bytes_rev(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    haystack
+        .windows(needle.len())
+        .rposition(|window| window == needle)
+}
 
 fn scan_pdf_risk_signals(bytes: &[u8]) -> Vec<serde_json::Value> {
     let mut signals = Vec::new();

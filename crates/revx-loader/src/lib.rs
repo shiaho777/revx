@@ -38,6 +38,27 @@ use std::path::{Path, PathBuf};
 #[cfg(feature = "containers")]
 use xz2::read::XzDecoder;
 
+const DEFAULT_MAX_EXPANDED_BYTES: u64 = 256 * 1024 * 1024;
+
+#[cfg(feature = "containers")]
+fn max_expanded_bytes() -> u64 {
+    std::env::var("REVX_MAX_EXPANDED_BYTES")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_MAX_EXPANDED_BYTES)
+}
+
+#[cfg(feature = "containers")]
+fn read_capped<R: Read>(reader: &mut R, limit: u64) -> Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    reader.take(limit.saturating_add(1)).read_to_end(&mut buf)?;
+    if buf.len() as u64 > limit {
+        anyhow::bail!("expanded payload exceeds byte limit {limit}");
+    }
+    Ok(buf)
+}
+
 fn advise_mmap_sequential(bytes: &[u8]) {
     if bytes.is_empty() {
         return;
@@ -91,14 +112,12 @@ pub fn load_binary(path: &Path) -> Result<BinaryImage> {
             "revx-macho-thin-{}.bin",
             blake3::hash(&thin).to_hex()
         ));
-        if !cache.exists() {
-            fs::write(&cache, &thin).with_context(|| {
-                format!(
-                    "failed to materialize preferred Mach-O thin slice for {}",
-                    path.display()
-                )
-            })?;
-        }
+        materialize_thin_cache(&cache, &thin).with_context(|| {
+            format!(
+                "failed to materialize preferred Mach-O thin slice for {}",
+                path.display()
+            )
+        })?;
         let mut image = load_binary_from_bytes(&cache, &thin)?;
         image.path = cache.display().to_string();
         if let Some(module) = image.modules.first_mut() {
@@ -114,6 +133,42 @@ pub fn load_binary(path: &Path) -> Result<BinaryImage> {
     let image = load_binary_from_bytes(path, &bytes)?;
     advise_mmap_dontneed(&bytes);
     Ok(image)
+}
+
+fn materialize_thin_cache(cache: &Path, thin: &[u8]) -> Result<()> {
+    use std::io::Write;
+    if let Ok(meta) = fs::symlink_metadata(cache) {
+        if meta.file_type().is_symlink() {
+            anyhow::bail!(
+                "refusing to use symlinked Mach-O thin cache {}",
+                cache.display()
+            );
+        }
+        if meta.is_file() && meta.len() == thin.len() as u64 {
+            return Ok(());
+        }
+    }
+    let file_name = cache
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "revx-macho-thin".to_string());
+    let tmp = cache.with_file_name(format!("{file_name}.tmp-{}", std::process::id()));
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(&tmp)
+        .with_context(|| format!("failed to create {}", tmp.display()))?;
+    file.write_all(thin)?;
+    file.sync_all()?;
+    drop(file);
+    fs::rename(&tmp, cache)
+        .with_context(|| format!("failed to install Mach-O thin cache {}", cache.display()))?;
+    Ok(())
 }
 
 fn load_binary_from_bytes(path: &Path, bytes: &[u8]) -> Result<BinaryImage> {
@@ -699,7 +754,7 @@ fn analyze_zip_container(
             analyzer: "zip_container".to_string(),
             status: ObjectAnalysisStatus::Failed,
             summary: format!("ZIP expansion failed: {err}"),
-            details: serde_json::json!({ "error": err.to_string() }),
+            details: serde_json::json!({ "error": format!("{err:#}") }),
             evidence_ids: vec![format!("analysis:{parent_id}:zip_container")],
         },
     };
@@ -771,8 +826,7 @@ fn expand_zip_container(
             continue;
         }
 
-        let mut entry_bytes = Vec::new();
-        file.read_to_end(&mut entry_bytes)
+        let entry_bytes = read_capped(&mut file, max_expanded_bytes())
             .with_context(|| format!("failed to read ZIP entry {entry_name}"))?;
         let child_id = identify_virtual_file(
             parent_id,
@@ -844,7 +898,7 @@ fn analyze_tar_container(
             analyzer: "tar_container".to_string(),
             status: ObjectAnalysisStatus::Failed,
             summary: format!("TAR expansion failed: {err}"),
-            details: serde_json::json!({ "error": err.to_string() }),
+            details: serde_json::json!({ "error": format!("{err:#}") }),
             evidence_ids: vec![format!("analysis:{parent_id}:tar_container")],
         },
     };
@@ -927,7 +981,7 @@ fn analyze_compressed_container(
                 "{} expansion failed: {err}",
                 compressed_format.display_name()
             ),
-            details: serde_json::json!({ "error": err.to_string() }),
+            details: serde_json::json!({ "error": format!("{err:#}") }),
             evidence_ids: vec![format!(
                 "analysis:{parent_id}:{}",
                 compressed_format.analyzer()
@@ -1537,9 +1591,7 @@ fn expand_tar_container(
             skipped += 1;
             continue;
         }
-        let mut entry_bytes = Vec::new();
-        entry
-            .read_to_end(&mut entry_bytes)
+        let entry_bytes = read_capped(&mut entry, max_expanded_bytes())
             .with_context(|| format!("failed to read TAR entry {entry_path}"))?;
         let child_id = identify_virtual_file(
             parent_id,
@@ -1787,35 +1839,26 @@ fn compressed_tar_format(format: &str) -> Option<CompressedFormat> {
 
 #[cfg(feature = "containers")]
 fn decompress_by_format(bytes: &[u8], compressed_format: CompressedFormat) -> Result<Vec<u8>> {
-    let mut decompressed = Vec::new();
+    let limit = max_expanded_bytes();
     match compressed_format {
         CompressedFormat::Gzip => {
             let mut decoder = GzDecoder::new(bytes);
-            decoder
-                .read_to_end(&mut decompressed)
-                .context("failed to decompress gzip stream")?;
+            read_capped(&mut decoder, limit).context("failed to decompress gzip stream")
         }
         CompressedFormat::Bzip2 => {
             let mut decoder = BzDecoder::new(bytes);
-            decoder
-                .read_to_end(&mut decompressed)
-                .context("failed to decompress bzip2 stream")?;
+            read_capped(&mut decoder, limit).context("failed to decompress bzip2 stream")
         }
         CompressedFormat::Xz => {
             let mut decoder = XzDecoder::new(bytes);
-            decoder
-                .read_to_end(&mut decompressed)
-                .context("failed to decompress xz stream")?;
+            read_capped(&mut decoder, limit).context("failed to decompress xz stream")
         }
         CompressedFormat::Zstd => {
             let mut decoder =
                 ZstdDecoder::new(bytes).context("failed to initialize zstd decoder")?;
-            decoder
-                .read_to_end(&mut decompressed)
-                .context("failed to decompress zstd stream")?;
+            read_capped(&mut decoder, limit).context("failed to decompress zstd stream")
         }
     }
-    Ok(decompressed)
 }
 
 #[cfg(feature = "containers")]
@@ -5574,6 +5617,45 @@ fn resolve_pdb_path(binary_path: &Path, stored_path: &str) -> Option<PathBuf> {
 mod tests {
     use super::*;
     use std::path::Path;
+
+    #[test]
+    fn thin_cache_refuses_symlink_target() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let victim = dir.path().join("victim.bin");
+        fs::write(&victim, b"original").expect("victim");
+        let cache = dir.path().join("cache.bin");
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&victim, &cache).expect("symlink");
+            let err = materialize_thin_cache(&cache, b"replacement").expect_err("must refuse");
+            assert!(err.to_string().contains("symlink"));
+            assert_eq!(fs::read(&victim).expect("read"), b"original");
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = cache;
+        }
+    }
+
+    #[test]
+    fn thin_cache_writes_and_reuses_content() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache = dir.path().join("cache.bin");
+        materialize_thin_cache(&cache, b"slice-bytes").expect("write");
+        assert_eq!(fs::read(&cache).expect("read"), b"slice-bytes");
+        materialize_thin_cache(&cache, b"slice-bytes").expect("reuse");
+        assert_eq!(fs::read(&cache).expect("read"), b"slice-bytes");
+    }
+
+    #[cfg(feature = "containers")]
+    #[test]
+    fn read_capped_enforces_byte_limit() {
+        let mut small = Cursor::new(vec![7u8; 16]);
+        assert_eq!(read_capped(&mut small, 16).expect("ok").len(), 16);
+        let mut bomb = Cursor::new(vec![7u8; 64]);
+        let err = read_capped(&mut bomb, 16).expect_err("must fail");
+        assert!(err.to_string().contains("byte limit"));
+    }
 
     #[test]
     fn macho_entry_and_function_starts_from_bin_ls_slice() {

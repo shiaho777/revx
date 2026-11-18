@@ -498,3 +498,26 @@ fn phi_incomings_follow_the_retargeted_predecessors() {
     assert!(auto.pseudocode.contains("while (true)"));
     assert_ne!(auto.pseudocode, legacy.pseudocode);
 }
+
+#[test]
+fn long_chain_cfg_does_not_overflow_stack() {
+    let n = 20_000u32;
+    let mut ops: Vec<Vec<SsaOp>> = Vec::with_capacity(n as usize);
+    for i in 0..n {
+        if i + 1 < n {
+            ops.push(vec![
+                call("step"),
+                SsaOp::Jump {
+                    target: BlockId(i + 1),
+                },
+            ]);
+        } else {
+            ops.push(vec![call("exit"), SsaOp::Return { value: None }]);
+        }
+    }
+    let (_dex, out) = fixture(ops);
+    let outcome = normalize_loops(&out);
+    assert_eq!(outcome.report.blocks_before, n as usize);
+    assert!(outcome.lift.is_none());
+    assert_eq!(outcome.report.multi_entry_before, 0);
+}

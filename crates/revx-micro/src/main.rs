@@ -45,7 +45,10 @@ fn main() {
         eprintln!("revx-micro analyze <elf>");
         std::process::exit(2);
     }
-    let path = args.next().expect("path");
+    let Some(path) = args.next() else {
+        eprintln!("revx-micro analyze <elf>");
+        std::process::exit(2);
+    };
     if let Err(e) = analyze(Path::new(&path)) {
         eprintln!("error: {e}");
         std::process::exit(1);
@@ -158,7 +161,7 @@ fn analyze(path: &Path) -> Result<(), String> {
         };
         let insts = if arch == "arm64" {
             count_arm64_insts(&window)
-        } else if arch == "x86_64" {
+        } else if arch == "x64" {
             count_x64_insts(&window)
         } else {
             0

@@ -22,6 +22,11 @@ pub async fn serve_mcp_http(
     token: Option<String>,
 ) -> Result<()> {
     let _ = revx_analysis::resource::ensure_process_resource_limits();
+    let token = token.filter(|t| !t.is_empty());
+    anyhow::ensure!(
+        token.is_some(),
+        "HTTP MCP requires a token: pass --token or set REVX_MCP_TOKEN"
+    );
     let state = HttpState {
         service: CapabilityService::new(workspace_root),
         token,
@@ -107,7 +112,8 @@ async fn handle_connection(mut stream: TcpStream, state: HttpState) -> Result<()
     }
 
     if method == "OPTIONS" {
-        write_response(&mut stream, 204, "text/plain", b"", None).await?;
+        let origin = headers.get("origin").map(|s| s.as_str());
+        write_cors_preflight(&mut stream, origin).await?;
         return Ok(());
     }
 
@@ -203,8 +209,6 @@ async fn handle_sse_open(stream: &mut TcpStream, state: &HttpState) -> Result<()
 Content-Type: text/event-stream\r\n\
 Cache-Control: no-cache\r\n\
 Connection: keep-alive\r\n\
-Access-Control-Allow-Origin: *\r\n\
-Access-Control-Expose-Headers: Mcp-Session-Id\r\n\
 Mcp-Session-Id: {session_id}\r\n\
 \r\n"
     );
@@ -305,12 +309,9 @@ async fn dispatch_one(state: &HttpState, request: serde_json::Value) -> Option<s
 }
 
 fn authorized(state: &HttpState, headers: &HashMap<String, String>) -> bool {
-    let Some(expected) = state.token.as_ref() else {
-        return true;
+    let Some(expected) = state.token.as_ref().filter(|t| !t.is_empty()) else {
+        return false;
     };
-    if expected.is_empty() {
-        return true;
-    }
     if headers.get("x-revx-token").is_some_and(|v| v == expected) {
         return true;
     }
@@ -388,6 +389,34 @@ fn find_header_end(buf: &[u8]) -> Option<usize> {
     buf.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4)
 }
 
+fn is_loopback_origin(origin: &str) -> bool {
+    let Some(rest) = origin
+        .strip_prefix("http://")
+        .or_else(|| origin.strip_prefix("https://"))
+    else {
+        return false;
+    };
+    let host = rest.split('/').next().unwrap_or("");
+    let host = host.rsplit_once(':').map(|(h, _)| h).unwrap_or(host);
+    matches!(host, "127.0.0.1" | "localhost" | "[::1]" | "::1")
+}
+
+async fn write_cors_preflight(stream: &mut TcpStream, origin: Option<&str>) -> Result<()> {
+    let mut head = String::from("HTTP/1.1 204 No Content\r\n");
+    if let Some(origin) = origin.filter(|o| is_loopback_origin(o)) {
+        head.push_str(&format!(
+            "Access-Control-Allow-Origin: {origin}\r\n\
+Vary: Origin\r\n\
+Access-Control-Allow-Headers: Content-Type, Authorization, X-Revx-Token, Mcp-Session-Id, Accept\r\n\
+Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
+        ));
+    }
+    head.push_str("Content-Length: 0\r\nConnection: close\r\n\r\n");
+    stream.write_all(head.as_bytes()).await?;
+    stream.flush().await?;
+    Ok(())
+}
+
 async fn write_response(
     stream: &mut TcpStream,
     status: u16,
@@ -409,10 +438,6 @@ async fn write_response(
         "HTTP/1.1 {status} {reason}\r\n\
 Content-Type: {content_type}\r\n\
 Content-Length: {}\r\n\
-Access-Control-Allow-Origin: *\r\n\
-Access-Control-Allow-Headers: Content-Type, Authorization, X-Revx-Token, Mcp-Session-Id, Accept\r\n\
-Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n\
-Access-Control-Expose-Headers: Mcp-Session-Id\r\n\
 Connection: close\r\n",
         body.len()
     );
@@ -426,4 +451,67 @@ Connection: close\r\n",
     }
     stream.flush().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{HttpState, authorized};
+    use crate::CapabilityService;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use tempfile::tempdir;
+    use tokio::sync::Mutex;
+
+    fn http_state(token: Option<&str>) -> HttpState {
+        let dir = tempdir().expect("tempdir");
+        HttpState {
+            service: CapabilityService::new(dir.path().to_path_buf()),
+            token: token.map(str::to_string),
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    #[test]
+    fn no_token_denies_every_request() {
+        let state = http_state(None);
+        assert!(!authorized(&state, &HashMap::new()));
+        let empty = http_state(Some(""));
+        assert!(!authorized(&empty, &HashMap::new()));
+    }
+
+    #[test]
+    fn token_accepts_bearer_and_custom_header() {
+        let state = http_state(Some("secret"));
+        let mut headers = HashMap::new();
+        headers.insert("authorization".to_string(), "Bearer secret".to_string());
+        assert!(authorized(&state, &headers));
+        let mut headers = HashMap::new();
+        headers.insert("x-revx-token".to_string(), "secret".to_string());
+        assert!(authorized(&state, &headers));
+        let mut headers = HashMap::new();
+        headers.insert("authorization".to_string(), "Bearer wrong".to_string());
+        assert!(!authorized(&state, &headers));
+    }
+
+    #[test]
+    fn cors_only_reflects_loopback_origins() {
+        assert!(super::is_loopback_origin("http://127.0.0.1:5173"));
+        assert!(super::is_loopback_origin("http://localhost:3000"));
+        assert!(super::is_loopback_origin("https://[::1]:8443"));
+        assert!(!super::is_loopback_origin("https://evil.example"));
+        assert!(!super::is_loopback_origin("http://127.0.0.1.evil.example"));
+        assert!(!super::is_loopback_origin("null"));
+        assert!(!super::is_loopback_origin("http://192.168.1.5"));
+    }
+
+    #[tokio::test]
+    async fn serve_without_token_refuses_to_start() {
+        let dir = tempdir().expect("tempdir");
+        revx_workspace::Workspace::init(dir.path(), "test", None).expect("init");
+        let addr: std::net::SocketAddr = "127.0.0.1:0".parse().expect("addr");
+        let err = super::serve_mcp_http(dir.path().to_path_buf(), addr, None)
+            .await
+            .expect_err("must require token");
+        assert!(err.to_string().contains("token"));
+    }
 }

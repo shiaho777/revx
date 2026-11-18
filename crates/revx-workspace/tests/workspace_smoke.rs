@@ -1223,7 +1223,6 @@ fn materializes_and_searches_virtual_bzip2_payload_as_artifact() {
     assert_eq!(text.matches[0].display_name, "config.json");
 }
 
-#[ignore = "pre-existing failure, tracked in #25"]
 #[test]
 fn materializes_virtual_xz_payload_as_artifact() {
     let dir = tempdir().unwrap();
@@ -2046,7 +2045,7 @@ fn analyzes_jvm_classes_as_agent_ready_evidence() {
     }));
 }
 
-#[ignore = "depends on host python3 pyc magic; analyzer only supports some versions, see #25"]
+#[ignore = "depends on host python3 pyc magic; analyzer only supports some versions, tracked in #149"]
 #[test]
 fn analyzes_python_bytecode_as_agent_ready_evidence() {
     if Command::new("python3").arg("--version").output().is_err() {
@@ -3161,7 +3160,6 @@ fn analyzes_sqlite_schema_as_structured_object_evidence() {
     }));
 }
 
-#[ignore = "pre-existing failure, tracked in #25"]
 #[test]
 fn analyzes_wasm_module_as_structured_object_evidence() {
     let dir = tempdir().unwrap();
@@ -3240,7 +3238,6 @@ fn analyzes_wasm_module_as_structured_object_evidence() {
     }));
 }
 
-#[ignore = "pre-existing failure, tracked in #25"]
 #[test]
 fn analyzes_pdf_document_as_structured_object_evidence() {
     let dir = tempdir().unwrap();
@@ -3852,16 +3849,39 @@ fn analyzes_and_materializes_ole_compound_streams() {
     }));
 }
 
-#[ignore = "pre-existing failure, tracked in #25"]
 #[test]
 fn persists_functions_for_lookup() {
+    if std::env::var_os("REVX_PERSIST_CHILD").is_some() {
+        persists_functions_for_lookup_body();
+        return;
+    }
+    let exe = std::env::current_exe().unwrap();
+    let output = std::process::Command::new(exe)
+        .args([
+            "--exact",
+            "persists_functions_for_lookup",
+            "--test-threads=1",
+        ])
+        .env("REVX_PERSIST_CHILD", "1")
+        .env("REVX_FULL_MEM", "1")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "child failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn persists_functions_for_lookup_body() {
     let dir = tempdir().unwrap();
     let ws = Workspace::init(dir.path(), "test", None).unwrap();
     let binary_id = "binary-1".to_string();
     let bundle = sample_bundle(&binary_id, "/tmp/test.bin");
     let function = bundle.functions[0].clone();
 
-    ws.save_analysis(bundle, AnalysisProfile::Fast).unwrap();
+    ws.save_analysis(bundle, AnalysisProfile::Full).unwrap();
     let functions = ws.list_functions().unwrap();
     assert_eq!(functions.len(), 1);
     assert_eq!(functions[0].address, function.address);
@@ -3947,13 +3967,36 @@ fn function_evidence_ids_resolve_without_full_subject_scan() {
     assert!(ids.iter().any(|id| id == "fn:binary-2:401000"));
 }
 
-#[ignore = "pre-existing failure, tracked in #25"]
 #[test]
 fn evidence_search_matches_kind_details_and_provenance() {
+    if std::env::var_os("REVX_EVIDENCE_CHILD").is_some() {
+        evidence_search_matches_kind_details_and_provenance_body();
+        return;
+    }
+    let exe = std::env::current_exe().unwrap();
+    let output = std::process::Command::new(exe)
+        .args([
+            "--exact",
+            "evidence_search_matches_kind_details_and_provenance",
+            "--test-threads=1",
+        ])
+        .env("REVX_EVIDENCE_CHILD", "1")
+        .env("REVX_FULL_MEM", "1")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "child failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn evidence_search_matches_kind_details_and_provenance_body() {
     let dir = tempdir().unwrap();
     let ws = Workspace::init(dir.path(), "test", None).unwrap();
     let bundle = sample_bundle("binary-5", "/tmp/test-evidence-search.bin");
-    ws.save_analysis(bundle, AnalysisProfile::Fast).unwrap();
+    ws.save_analysis(bundle, AnalysisProfile::Full).unwrap();
 
     let debug = ws
         .export_evidence_by_subject("loader_debug_import", 10)

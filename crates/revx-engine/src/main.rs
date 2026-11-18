@@ -1888,12 +1888,67 @@ async fn cmd_mcp_http(
     let addr: std::net::SocketAddr = bind
         .parse()
         .with_context(|| format!("invalid --bind {bind}"))?;
-    let token = token.or_else(|| {
-        std::env::var("REVX_MCP_TOKEN")
-            .ok()
-            .filter(|s| !s.is_empty())
-    });
-    serve_mcp_http(project, addr, token).await
+    let token = resolve_mcp_token(&project, token)?;
+    serve_mcp_http(project, addr, Some(token)).await
+}
+
+fn resolve_mcp_token(project: &std::path::Path, explicit: Option<String>) -> Result<String> {
+    if let Some(token) = explicit.filter(|t| !t.is_empty()) {
+        return Ok(token);
+    }
+    if let Some(token) = std::env::var("REVX_MCP_TOKEN")
+        .ok()
+        .filter(|t| !t.is_empty())
+    {
+        return Ok(token);
+    }
+    let token_path = project.join(".revx").join("mcp-token");
+    if let Ok(existing) = std::fs::read_to_string(&token_path) {
+        let existing = existing.trim().to_string();
+        if !existing.is_empty() {
+            eprintln!("revx mcp http token loaded from {}", token_path.display());
+            return Ok(existing);
+        }
+    }
+    let token = format!(
+        "{}{}",
+        uuid::Uuid::new_v4().simple(),
+        uuid::Uuid::new_v4().simple()
+    );
+    std::fs::create_dir_all(token_path.parent().context("missing .revx parent")?)?;
+    let token = write_private_token(&token_path, &token)?;
+    eprintln!(
+        "revx mcp http token saved to {} (send as Authorization: Bearer <token> or X-Revx-Token)",
+        token_path.display()
+    );
+    Ok(token)
+}
+
+fn write_private_token(path: &std::path::Path, token: &str) -> Result<String> {
+    use std::io::Write;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    match options.open(path) {
+        Ok(mut file) => {
+            file.write_all(token.as_bytes())?;
+            Ok(token.to_string())
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            let existing = std::fs::read_to_string(path)
+                .with_context(|| format!("failed to read {}", path.display()))?;
+            let existing = existing.trim().to_string();
+            if existing.is_empty() {
+                anyhow::bail!("token file {} is empty", path.display());
+            }
+            Ok(existing)
+        }
+        Err(err) => Err(err).with_context(|| format!("failed to create {}", path.display())),
+    }
 }
 
 fn cmd_mcp_doctor(workspace: Option<PathBuf>) -> Result<()> {
@@ -2218,5 +2273,39 @@ async fn dispatch_from_cwd(request: CapabilityRequest) -> Result<revx_core::Capa
         send_ipc_request(&workspace_root, request).await
     } else {
         local_service_for_cwd()?.dispatch(request)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_mcp_token;
+
+    #[test]
+    fn explicit_token_wins() {
+        let dir = std::env::temp_dir().join(format!("revx-token-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let token = resolve_mcp_token(&dir, Some("explicit".to_string())).expect("token");
+        assert_eq!(token, "explicit");
+        assert!(!dir.join(".revx").join("mcp-token").exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn generated_token_persists_and_reloads() {
+        let dir = std::env::temp_dir().join(format!("revx-token-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let first = resolve_mcp_token(&dir, None).expect("token");
+        assert!(!first.is_empty());
+        let path = dir.join(".revx").join("mcp-token");
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), first);
+        let second = resolve_mcp_token(&dir, None).expect("token");
+        assert_eq!(first, second);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).expect("meta").permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

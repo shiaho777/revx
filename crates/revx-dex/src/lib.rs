@@ -69,6 +69,18 @@ fn err<T>(offset: usize, message: impl Into<String>) -> Result<T> {
     })
 }
 
+fn check_table(off: u32, count: u32, entry_size: usize, data_len: usize, name: &str) -> Result<()> {
+    let off = off as usize;
+    let count = count as usize;
+    let end = count
+        .checked_mul(entry_size)
+        .and_then(|bytes| off.checked_add(bytes));
+    match end {
+        Some(end) if end <= data_len => Ok(()),
+        _ => err(off, format!("{name} table exceeds file bounds")),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DexHeader {
     pub version: u32,
@@ -327,6 +339,48 @@ impl DexFile {
         if header.file_size as usize > data.len() {
             return err(0x20, "declared file size exceeds actual size");
         }
+        check_table(
+            header.string_ids_off,
+            header.string_ids_size,
+            4,
+            data.len(),
+            "string_ids",
+        )?;
+        check_table(
+            header.type_ids_off,
+            header.type_ids_size,
+            4,
+            data.len(),
+            "type_ids",
+        )?;
+        check_table(
+            header.proto_ids_off,
+            header.proto_ids_size,
+            12,
+            data.len(),
+            "proto_ids",
+        )?;
+        check_table(
+            header.field_ids_off,
+            header.field_ids_size,
+            8,
+            data.len(),
+            "field_ids",
+        )?;
+        check_table(
+            header.method_ids_off,
+            header.method_ids_size,
+            8,
+            data.len(),
+            "method_ids",
+        )?;
+        check_table(
+            header.class_defs_off,
+            header.class_defs_size,
+            32,
+            data.len(),
+            "class_defs",
+        )?;
 
         let mut strings = Vec::with_capacity(header.string_ids_size as usize);
         for i in 0..header.string_ids_size {
@@ -476,6 +530,12 @@ impl DexFile {
         let (virtual_methods_size, p) = r.uleb128_at(pos)?;
         pos = p;
 
+        let remaining = r.data.len().saturating_sub(pos);
+        let static_fields_size = static_fields_size.min(remaining as u32);
+        let instance_fields_size = instance_fields_size.min(remaining as u32);
+        let direct_methods_size = direct_methods_size.min(remaining as u32);
+        let virtual_methods_size = virtual_methods_size.min(remaining as u32);
+
         let mut static_fields = Vec::with_capacity(static_fields_size as usize);
         let mut idx = 0u32;
         for _ in 0..static_fields_size {
@@ -551,10 +611,20 @@ impl DexFile {
         let off = code_off as usize;
         let registers_size = r.u16_at(off)?;
         let ins_size = r.u16_at(off + 2)?;
+        if ins_size > registers_size {
+            return err(off + 2, "ins_size exceeds registers_size");
+        }
         let outs_size = r.u16_at(off + 4)?;
         let tries_size = r.u16_at(off + 6)?;
         let debug_info_off = r.u32_at(off + 8)?;
         let insns_size = r.u32_at(off + 12)?;
+        let insns_end = insns_size
+            .checked_mul(2)
+            .and_then(|bytes| (off + 16).checked_add(bytes as usize));
+        match insns_end {
+            Some(end) if end <= self.data.len() => {}
+            _ => return err(off + 12, "code insns exceed file bounds"),
+        }
         let mut insns = Vec::with_capacity(insns_size as usize);
         for i in 0..insns_size {
             insns.push(r.u16_at(off + 16 + i as usize * 2)?);

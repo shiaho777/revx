@@ -964,6 +964,9 @@ dependencies = [
 [[package]]
 name = "revx-micro"
 version = "0.1.0"
+dependencies = [
+ "tempfile",
+]
 
 [[package]]
 name = "revx-query"

@@ -1750,3 +1750,70 @@ fn profiles_unknown_binary_blobs() {
             .collect::<Vec<_>>()
     );
 }
+
+#[test]
+#[cfg(feature = "containers")]
+fn gzip_bomb_is_rejected_by_byte_cap() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let archive_path = dir.path().join("bomb.json.gz");
+    {
+        let file = std::fs::File::create(&archive_path).expect("create");
+        let mut encoder = flate2::write::GzEncoder::new(file, flate2::Compression::default());
+        let chunk = vec![b'A'; 64 * 1024];
+        for _ in 0..64 {
+            encoder.write_all(&chunk).expect("write");
+        }
+        encoder.finish().expect("finish");
+    }
+    unsafe { std::env::set_var("REVX_MAX_EXPANDED_BYTES", "65536") };
+    let graph = revx_loader::identify_object_graph(&archive_path, 1, 16).expect("load");
+    unsafe { std::env::remove_var("REVX_MAX_EXPANDED_BYTES") };
+    let root = graph
+        .objects
+        .iter()
+        .find(|object| object.id == graph.root_id)
+        .expect("root");
+    let analysis = root
+        .analyses
+        .iter()
+        .find(|analysis| analysis.analyzer == "gzip_container")
+        .expect("gzip analysis");
+    assert_eq!(analysis.status, revx_core::ObjectAnalysisStatus::Failed);
+    let error = analysis.details["error"].as_str().unwrap_or_default();
+    assert!(error.contains("byte limit"), "error={error}");
+    assert_eq!(graph.edges.len(), 0);
+}
+
+#[test]
+#[cfg(feature = "containers")]
+fn zip_bomb_entry_is_rejected_by_byte_cap() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let archive_path = dir.path().join("bomb.zip");
+    {
+        let file = std::fs::File::create(&archive_path).expect("create");
+        let mut zip = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default();
+        zip.start_file("big.bin", options).expect("start");
+        let chunk = vec![b'A'; 64 * 1024];
+        for _ in 0..64 {
+            zip.write_all(&chunk).expect("write");
+        }
+        zip.finish().expect("finish");
+    }
+    unsafe { std::env::set_var("REVX_MAX_EXPANDED_BYTES", "65536") };
+    let graph = revx_loader::identify_object_graph(&archive_path, 1, 16).expect("load");
+    unsafe { std::env::remove_var("REVX_MAX_EXPANDED_BYTES") };
+    let root = graph
+        .objects
+        .iter()
+        .find(|object| object.id == graph.root_id)
+        .expect("root");
+    let analysis = root
+        .analyses
+        .iter()
+        .find(|analysis| analysis.analyzer == "zip_container")
+        .expect("zip analysis");
+    assert_eq!(analysis.status, revx_core::ObjectAnalysisStatus::Failed);
+    let error = analysis.details["error"].as_str().unwrap_or_default();
+    assert!(error.contains("byte limit"), "error={error}");
+}
