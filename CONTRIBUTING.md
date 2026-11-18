@@ -20,12 +20,32 @@ Coding agents should follow the same loop in [AGENTS.md](AGENTS.md) (Delivery se
 
 ## Local checks
 
+Run the **same gate CI runs** before pushing (workflow `ci`, job `test`). A subset passing locally does not mean CI will pass:
+
 ```bash
-cargo check -p revx-core -p revx-analysis -p revx-loader -p revx-daemon -p revx-engine
-cargo test -p revx-analysis --test parity_suite --test corpus_smoke --test corpus_golden
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo check --workspace --all-targets
+cargo test --workspace --all-targets
+cargo test -p revx-loader -p revx-workspace -p revx-daemon --features revx-loader/containers
 ```
 
-System `libsqlite3` / `pkg-config` is required for non-bundled SQLite builds (same as CI).
+Notes:
+- Clippy treats warnings as errors (`-D warnings`); dead code and lint nits fail the gate.
+- The full-workspace test run includes the cross-process `output_stability` suites (DEX and native). If you touch phi allocation, renaming, or rendering order, run them repeatedly — a single green run can hide `HashMap`-iteration nondeterminism.
+- `corpus_smoke` / `corpus_golden` only run in CI when `REVX_CORPUS_DIR` is set; they are optional locally and require an external corpus that is not in the repo.
+- System `libsqlite3` / `pkg-config` is required for non-bundled SQLite builds (same as CI).
+
+### macOS toolchain caveat
+
+If a broken/absent Swift toolchain hijacks the default `cc`/`ar`, pin the system toolchain and avoid full-LTO release rebuilds (they can exhaust memory):
+
+```bash
+CC=/usr/bin/clang AR=/usr/bin/ar RUSTFLAGS="-C linker=/usr/bin/clang" \
+  CARGO_PROFILE_RELEASE_LTO=false cargo build -p revx-engine --release --features revx-engine/full-loader -j 2
+```
+
+Use the same `CC`/`AR`/`RUSTFLAGS` prefix for test/clippy builds when the default linker fails.
 
 ## Branch protection (recommended)
 
